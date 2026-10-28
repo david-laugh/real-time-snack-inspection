@@ -131,7 +131,6 @@ tr.selected td { background: rgba(108,92,231,.1); }
           <th>면적</th>
           <th>둘레</th>
           <th>Defect Score</th>
-          <th>E2E Latency</th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
@@ -186,7 +185,6 @@ function render() {
       <td>${d.area != null ? Math.round(d.area).toLocaleString() : '-'}</td>
       <td>${d.perimeter != null ? Math.round(d.perimeter).toLocaleString() : '-'}</td>
       <td>${d.defect_score != null ? (d.defect_score * 100).toFixed(1) + '%' : '-'}</td>
-      <td style="color:var(--text2); font-size:12px;">${d.e2e_latency_ms ? d.e2e_latency_ms + 'ms' : '-'}</td>
     </tr>`;
   }).join('');
 }
@@ -257,10 +255,6 @@ function showDetail(idx) {
       <div class="detail-field">
         <div class="fl">Inference Latency</div>
         <div class="fv">${d.inference_latency_ms ? d.inference_latency_ms + ' ms' : '-'}</div>
-      </div>
-      <div class="detail-field">
-        <div class="fl">E2E Latency</div>
-        <div class="fv" style="color:var(--info);">${d.e2e_latency_ms ? d.e2e_latency_ms + ' ms' : '-'}</div>
       </div>
       <div class="detail-field wide">
         <div class="fl">Container</div>

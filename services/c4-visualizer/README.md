@@ -162,7 +162,7 @@ C3 Inference에서 detection 결과를 수신합니다.
 | `trace_id` | string | O | 파이프라인 추적 ID (C1에서 발급) |
 | `session_id` | string | O | 세션 ID |
 | `frame_id` | int | O | 프레임 번호 (순차 증가) |
-| `captured_at_ms` | int | O | C1 캡처 시각 (Unix ms) — E2E latency 계산 기준 |
+| `captured_at_ms` | int | O | C1 캡처 시각 (Unix ms) |
 | `inference_container_id` | string | O | C3 replica 식별자 (예: `c3-inference-1`) |
 | `inference_started_at_ms` | int | O | C3 추론 시작 시각 (Unix ms) |
 | `inference_finished_at_ms` | int | O | C3 추론 종료 시각 (Unix ms) |
@@ -185,13 +185,12 @@ C3 Inference에서 detection 결과를 수신합니다.
 ```
 
 **처리 흐름:**
-1. E2E latency 계산: `현재시각(ms) - captured_at_ms`
-2. 각 detection마다:
+1. 각 detection마다:
    - bbox에서 area, perimeter 계산
    - circularity 산출 → pass/fail 판정
    - `InspectionStore`에 기록
    - WebSocket으로 `inspection_result` 이벤트 브로드캐스트
-3. 전체 통계 재계산 → WebSocket으로 `stats` 이벤트 브로드캐스트
+2. 전체 통계 재계산 → WebSocket으로 `stats` 이벤트 브로드캐스트
 
 ---
 
@@ -245,7 +244,6 @@ C3 Inference에서 detection 결과를 수신합니다.
     "perimeter": 520.0,
     "defect_score": 0.02,
     "inference_latency_ms": 45.0,
-    "e2e_latency_ms": 82.0,
     "container_id": "c3-inference-1",
     "timestamp": 1730000000.123
   }
@@ -280,7 +278,7 @@ C3 Inference에서 detection 결과를 수신합니다.
 
 ```
 item_id, trace_id, frame_id, status, circularity, area, perimeter,
-defect_score, inference_latency_ms, e2e_latency_ms, container_id, timestamp
+defect_score, inference_latency_ms, container_id, timestamp
 ```
 
 ---
@@ -318,7 +316,6 @@ defect_score, inference_latency_ms, e2e_latency_ms, container_id, timestamp
     "perimeter": 520.0,
     "defect_score": 0.02,
     "inference_latency_ms": 45.0,
-    "e2e_latency_ms": 82,
     "container_id": "c3-inference-1",
     "frame_id": 42,
     "bbox": [100, 100, 230, 230],
@@ -439,7 +436,7 @@ docker compose --profile scale-out up --build
 | **상단 통계 카드 (4개)** | 총 검사, 양품, 불량, 불량률 |
 | **성능 카드 (1개)** | 처리 FPS |
 | **카메라 피드** | 원본 이미지 + canvas bbox overlay (pass=녹색, fail=빨간색) |
-| **검사 결과 피드** | 최근 60건 실시간 스크롤 목록 (아이템 ID, 원형도, latency) |
+| **검사 결과 피드** | 최근 60건 실시간 스크롤 목록 (아이템 ID, 원형도) |
 | **양품률 도넛 차트** | SVG 기반 pass/fail 비율 시각화 |
 | **원형도 분포 차트** | 20구간 히스토그램 + 0.85 임계선 |
 

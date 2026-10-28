@@ -5,7 +5,6 @@ Port 8003 | POST /results (C3 → C4) | WS /ws/dashboard | GET / (UI)
 
 import json
 import math
-import time
 import logging
 from pathlib import Path
 
@@ -47,9 +46,6 @@ def compute_circularity(area: float, perimeter: float) -> float:
 @app.post("/results")
 async def receive_result(result: DetectionResult):
     """C3 Inference → C4: detection-result 수신."""
-    now_ms = int(time.time() * 1000)
-    e2e = now_ms - result.captured_at_ms
-
     for det in result.detections:
         bbox = det.bbox
         w = abs(bbox[2] - bbox[0])
@@ -70,7 +66,6 @@ async def receive_result(result: DetectionResult):
             perimeter=perimeter,
             defect_score=det.defect_score,
             inference_latency_ms=result.inference_latency_ms,
-            e2e_latency_ms=e2e,
             container_id=result.inference_container_id,
         )
         store.add(rec)
@@ -85,7 +80,6 @@ async def receive_result(result: DetectionResult):
                 "perimeter": round(perimeter, 1),
                 "defect_score": round(det.defect_score, 4),
                 "inference_latency_ms": round(result.inference_latency_ms, 1),
-                "e2e_latency_ms": e2e,
                 "container_id": result.inference_container_id,
                 "frame_id": result.frame_id,
                 "bbox": det.bbox,

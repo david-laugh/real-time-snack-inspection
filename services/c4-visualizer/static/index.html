@@ -332,7 +332,7 @@ function renderFeed() {
       <div class="feed-dot ${ok ? 'pass' : 'fail'}">${ok ? '✅' : '❌'}</div>
       <div class="feed-info">
         <div class="id">${d.item_id}</div>
-        <div class="detail">원형도 ${d.circularity.toFixed(3)} · ${d.e2e_latency_ms}ms</div>
+        <div class="detail">원형도 ${d.circularity.toFixed(3)}</div>
       </div>
       <div class="feed-badge ${ok ? 'fb-pass' : 'fb-fail'}">${ok ? '정상' : '불량'}</div>
     </div>`;

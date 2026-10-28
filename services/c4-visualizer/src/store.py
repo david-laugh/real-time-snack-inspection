@@ -21,7 +21,6 @@ class InspectionRecord:
     perimeter: float | None = None
     defect_score: float = 0.0
     inference_latency_ms: float = 0.0
-    e2e_latency_ms: float = 0.0
     container_id: str = ""
     timestamp: float = 0.0
 
@@ -54,7 +53,6 @@ class InspectionStore:
                 "perimeter": r.perimeter,
                 "defect_score": round(r.defect_score, 4),
                 "inference_latency_ms": round(r.inference_latency_ms, 1),
-                "e2e_latency_ms": round(r.e2e_latency_ms, 1),
                 "container_id": r.container_id,
                 "timestamp": round(r.timestamp, 3),
             })
@@ -68,7 +66,7 @@ class InspectionStore:
         fields = [
             "item_id", "trace_id", "frame_id", "status", "circularity",
             "area", "perimeter", "defect_score", "inference_latency_ms",
-            "e2e_latency_ms", "container_id", "timestamp",
+            "container_id", "timestamp",
         ]
         writer = csv.DictWriter(buf, fieldnames=fields)
         writer.writeheader()
@@ -83,7 +81,6 @@ class InspectionStore:
                 "perimeter": r.perimeter,
                 "defect_score": round(r.defect_score, 4),
                 "inference_latency_ms": round(r.inference_latency_ms, 1),
-                "e2e_latency_ms": round(r.e2e_latency_ms, 1),
                 "container_id": r.container_id,
                 "timestamp": round(r.timestamp, 3),
             })
