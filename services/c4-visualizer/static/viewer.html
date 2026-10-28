@@ -62,49 +62,6 @@ tr.selected td { background: rgba(108,92,231,.1); }
 .sb-pass { background: rgba(0,184,148,.12); color: var(--pass); }
 .sb-fail { background: rgba(225,112,85,.12); color: var(--fail); }
 
-.circ-val { font-family: 'Consolas', monospace; font-weight: 600; }
-.circ-val.high { color: var(--pass); }
-.circ-val.low { color: var(--fail); }
-
-.detail-panel {
-  position: fixed; right: -420px; top: 0; bottom: 0; width: 420px;
-  background: var(--surface); border-left: 1px solid var(--border);
-  transition: right .25s ease; z-index: 10; overflow-y: auto;
-  box-shadow: -4px 0 20px rgba(0,0,0,.3);
-}
-.detail-panel.open { right: 0; }
-.detail-close {
-  position: absolute; top: 12px; right: 12px;
-  width: 32px; height: 32px; border-radius: 8px; border: none;
-  background: var(--surface2); color: var(--text); font-size: 16px;
-  cursor: pointer; display: flex; align-items: center; justify-content: center;
-}
-.detail-close:hover { background: var(--border); }
-.detail-body { padding: 20px; }
-.detail-body h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; }
-
-.detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.detail-field {
-  background: var(--surface2); border-radius: 8px; padding: 12px 14px;
-}
-.detail-field.wide { grid-column: 1 / -1; }
-.detail-field .fl { font-size: 11px; color: var(--text2); margin-bottom: 3px; }
-.detail-field .fv { font-size: 15px; font-weight: 600; }
-.detail-field .fv.pass { color: var(--pass); }
-.detail-field .fv.fail { color: var(--fail); }
-
-.circ-gauge { margin: 16px 0; text-align: center; }
-.gauge-bar-wrap {
-  height: 12px; background: var(--surface2); border-radius: 6px;
-  position: relative; overflow: hidden; margin: 8px 0 4px;
-}
-.gauge-fill { height: 100%; border-radius: 6px; transition: width .3s; }
-.gauge-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--text2); }
-.gauge-marker {
-  position: absolute; top: -2px; bottom: -2px; width: 2px;
-  background: #fff; opacity: .7;
-}
-
 .empty-state { text-align: center; padding: 60px; color: var(--text2); font-size: 14px; }
 </style>
 </head>

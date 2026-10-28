@@ -123,3 +123,28 @@ class MetricsTests(unittest.TestCase):
             update(0,0,0,97)
             m.sample_drop_window()
         self.assertIsNone(m.get_stats()['drop_window'])
+
+
+class PipelineViewTests(unittest.TestCase):
+    def test_replica_breakdown_uses_c3_container_and_latency(self):
+        m = PipelineMetrics()
+        for i, (container, total) in enumerate([('c3-inference-1', 40), ('c3-inference-2', 50),
+                                                ('c3-inference-1', 42)]):
+            m.record(result(i, inference_container_id=container,
+                            latency_breakdown_ms={'c3_total': total, 'c3_queue': 0, 'c3_service': total}), 1120)
+        replicas = m.get_stats()['c3_replicas']
+        self.assertEqual(replicas['c3-inference-1']['frames'], 2)
+        self.assertEqual(replicas['c3-inference-2']['frames'], 1)
+        self.assertEqual(replicas['c3-inference-2']['c3_total_p50_ms'], 50)
+
+    def test_upstream_display_fields_pass_through(self):
+        m = PipelineMetrics()
+        m.update_c1({'counters': {'received': 10, 'dropped': 1}, 'input_fps': 29.5, 'sessions': 1})
+        m.update_c2({'events': {'dropped_stale': 2, 'dropped_old': 0, 'forwarded': 7, 'error': 1, 'timeout': 0},
+                     'inflight': 2, 'max_inflight': 3, 'c4_sent': 7, 'c4_skipped': 0, 'c4_error': 0})
+        stats = m.get_stats()
+        self.assertEqual((stats['c1_metrics']['input_fps'], stats['c1_metrics']['sessions']), (29.5, 1))
+        self.assertEqual((stats['c2_metrics']['inflight'], stats['c2_metrics']['max_inflight']), (2, 3))
+        self.assertEqual(stats['c2_metrics']['c4_sent'], 7)
+        m.update_c1({'counters': {'received': 10, 'dropped': 1}})  # older C1 without extras
+        self.assertIsNone(m.get_stats()['c1_metrics']['input_fps'])
