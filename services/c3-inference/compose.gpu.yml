@@ -1,0 +1,20 @@
+# GPU override for the C3 replicas (requires NVIDIA Container Toolkit).
+#
+#   docker compose -f docker-compose.yml -f services/c3-inference/compose.gpu.yml up -d
+#   docker compose -f docker-compose.yml -f services/c3-inference/compose.gpu.yml --profile scale-out up -d
+#
+# All replicas reserve the SAME single GPU (device 0). They share its compute and
+# VRAM; see services/c3-inference/README.md "Single-GPU scale-out".
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            device_ids: ["0"]
+            capabilities: [gpu]
+
+services:
+  c3-inference-1: *gpu
+  c3-inference-2: *gpu
+  c3-inference-3: *gpu

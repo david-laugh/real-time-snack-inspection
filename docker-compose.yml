@@ -27,9 +27,11 @@ x-c3-inference: &c3-inference
     - ./services/c3-inference/models:/app/models:ro
   expose:
     - "${C3_PORT:-8002}"
-  # TODO(Member C): placeholder. Replace with inference server entrypoint.
-  command: ["sleep", "infinity"]
-  # TODO(Member C): enable GPU once NVIDIA Container Toolkit is set up.
+  # FastAPI inference server (see services/c3-inference/README.md).
+  # Without .env it starts with C3_PREDICTOR=sam2 and the default SAM2.1 tiny checkpoint path.
+  command: ["python", "-m", "src"]
+  # GPU: use the override file instead of editing this block:
+  #   docker compose -f docker-compose.yml -f services/c3-inference/compose.gpu.yml up -d
   # deploy:
   #   resources:
   #     reservations:
