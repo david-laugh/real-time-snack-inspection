@@ -46,12 +46,13 @@ services:
     image: pocket-smart-factory/c1-gateway:dev
     environment:
       SERVICE_NAME: c1-gateway
+      C1_DOWNSTREAM: ${C1_DOWNSTREAM:-http://c2-preprocessing:8001/preprocess}
     ports:
       - "${C1_PORT:-8000}:8000"
+    volumes:
+      - ./benchmark/results:/app/results
     depends_on:
       - c2-preprocessing
-    # TODO(Member A): placeholder. Replace with FastAPI WebSocket server entrypoint.
-    command: ["sleep", "infinity"]
 
   c2-preprocessing:
     <<: *common-service
