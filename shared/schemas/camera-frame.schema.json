@@ -1,0 +1,88 @@
+
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pocket-smart-factory/schemas/camera-frame.schema.json",
+  "title": "CameraFrame",
+  "description": "C2 Preprocessing -> C4 Visualizer. Resized JPEG frame and prompts.",
+  "type": "object",
+  "required": [
+    "trace_id",
+    "session_id",
+    "frame_id",
+    "gateway_received_at_ms",
+    "preprocess_started_at_ms",
+    "preprocess_finished_at_ms",
+    "width",
+    "height",
+    "prompts",
+    "image_b64"
+  ],
+  "properties": {
+    "trace_id": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "frame_id": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "gateway_received_at_ms": {
+      "type": "integer",
+      "description": "C1 received timestamp in epoch milliseconds."
+    },
+    "preprocess_started_at_ms": {
+      "type": "integer",
+      "description": "C2 preprocessing start timestamp in epoch milliseconds."
+    },
+    "preprocess_finished_at_ms": {
+      "type": "integer",
+      "description": "C2 preprocessing finish timestamp in epoch milliseconds."
+    },
+    "width": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "height": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "prompts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/prompt"
+      }
+    },
+    "image_b64": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "description": "Resized JPEG image shared with C3."
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "prompt": {
+      "type": "object",
+      "required": ["candidate_id", "type", "bbox"],
+      "properties": {
+        "candidate_id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["box"]
+        },
+        "bbox": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 4,
+          "maxItems": 4
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
