@@ -81,10 +81,13 @@ def detect_frame(bgr: np.ndarray, settings: Settings, session_id: str,
         diameter = detect.estimate_diameter(mask)
         if tracker is not None:
             diameter = tracker.update(session_id, diameter)
+    if diameter is None:                  # 쿠키가 안 보이고 이전 추정값도 없음
+        return resized, Detection([], scale, None, None)
+    # 지름은 주황 마스크만으로 추정하므로 ROI와 독립적이다. ROI 커널 크기를 정하려고 먼저 구한다.
     roi = resolve_roi(settings, scale)
     if roi == "auto":
-        roi = detect.find_stage_roi(resized)
-    boxes = [] if diameter is None else detect.filter_candidates(resized, mask, diameter, roi=roi)
+        roi = detect.find_stage_roi(resized, detect.stage_roi_kernel(diameter))
+    boxes = detect.filter_candidates(resized, mask, diameter, roi=roi)
     return resized, Detection(boxes, scale, diameter, roi)
 
 

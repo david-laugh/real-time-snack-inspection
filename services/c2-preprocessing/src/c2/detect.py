@@ -6,6 +6,9 @@ reference/c2_bbox_detect.py에서 그대로 옮긴 모듈. 임계값과 판정 �
 build_mask / estimate_diameter / filter_candidates로 나눴을 뿐, detect_candidates의 결과는 원본과 동일하다
 (tests/test_detect.py에서 원본과 비교).
 
+추가된 것: find_stage_roi의 close 커널 크기 인자(기본 25 = 원본). 서비스 경로(pipeline.detect_frame)는
+stage_roi_kernel()로 커널을 쿠키 지름에 비례시켜 해상도와 무관하게 같은 ROI를 얻는다.
+
 출력 bbox 형식은 processed-frame 스키마와 같은 [x1, y1, x2, y2] (입력 이미지 기준 pixel)
 """
 import cv2
@@ -19,13 +22,22 @@ MIN_AREA_RATIO = 0.2      # 정상 쿠키 면적 대비 최소 면적 (라인 �
 MAX_AREA_RATIO = 2.0      # 이보다 크면 쿠키가 아님 (페이지 테두리 등)
 MAX_ASPECT = 2.5          # 가로/세로 비가 이보다 길쭉하면 제외 (화면 위아래 노란 띠 등)
 EDGE_MARGIN = 2           # 화면 가장자리에 걸친 쿠키 판정 여유(px)
+ROI_CLOSE_KERNEL = 25     # find_stage_roi close 커널(px). 폰 원본(쿠키 지름 약 170px)에서 검증된 값
+ROI_KERNEL_REF_DIAMETER = 170.0
 
 
-def find_stage_roi(bgr):
+def stage_roi_kernel(expected_diameter_px):
+    """find_stage_roi의 close 커널 크기를 쿠키 지름에 비례시킨다 (지름 170 -> 25, 검증 기준과 같은 비율).
+    커널을 고정 px로 두면 저해상도 입력(리사이즈 또는 640x480 스트림)에서 화면 가장자리의 좁은 밝은 띠까지 메워
+    ROI가 프레임 끝까지 늘어나고, 경계에 걸친 쿠키가 제외되지 않는다 (tests/test_phone_frames.py)."""
+    return max(3, round(expected_diameter_px * ROI_CLOSE_KERNEL / ROI_KERNEL_REF_DIAMETER))
+
+
+def find_stage_roi(bgr, close_kernel=ROI_CLOSE_KERNEL):
     """컨베이어 화면(어두운 무채색 영역)의 바깥 사각형 [x1, y1, x2, y2]. 폰 촬영 시 화면 밖 쿠키 잘림 판정용."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     dark = cv2.inRange(hsv, (0, 0, 0), (180, 70, 190))   # 폰 촬영 시 벨트가 V 95~150까지 밝아짐, 흰 페이지는 V 255
-    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((close_kernel, close_kernel), np.uint8))
     cs, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cs:
         return None

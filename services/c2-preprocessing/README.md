@@ -33,8 +33,9 @@ Header 전파: `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`
    - HSV 임계값 → morphology open/close → 외곽 contour → bbox
    - 면적 필터(기대 쿠키 면적의 0.2~2.0배), 가로세로비 ≤ 2.5
    - ROI 경계(또는 화면 가장자리)에 닿은 쿠키는 잘린 것으로 보고 제외
+   - ROI auto의 close 커널은 쿠키 지름에 비례시킨다(`max(3, round(지름 × 25 / 170))`). 해상도(리사이즈, 640×480 스트림 등)와 상관없이 같은 ROI를 얻기 위해서다
    - ROI는 **crop하지 않고 판정에만** 쓴다 (좌표 복원 필드가 생기기 전까지. [`PROPOSALS.md`](PROPOSALS.md) P1)
-5. 쿠키 지름: 기본은 프레임마다 자동 추정(정상 쿠키 면적 중앙값). `session_id`별로 EMA(α=0.2) 평활화하고, 추정에 실패한 프레임은 이전 값을 쓴다
+5. 쿠키 지름(ROI 계산보다 먼저 구함): 기본은 프레임마다 자동 추정(정상 쿠키 면적 중앙값). `session_id`별로 EMA(α=0.2) 평활화하고, 추정에 실패한 프레임은 이전 값을 쓴다
 6. 리사이즈된 이미지를 다시 인코딩해 `image_b64`에 넣고, 스키마에 정의된 필드만으로 processed-frame을 만든다. 출력도 스키마로 검증한 뒤 `/infer`로 전달한다
 
 `prompts[].bbox`는 **전처리(리사이즈) 후 이미지 기준 `[x1, y1, x2, y2]` pixel**이다.
@@ -94,6 +95,7 @@ docker run --rm -v "$PWD:/repo:ro" -w /repo/services/c2-preprocessing \
 | `test_detect.py` | reference와 동일 결과, fixture 정확도(recall 1.0, 평균 IoU ≥ 0.95), 0.5배/1.8배/90도 회전 불변성, 1024 리사이즈 파이프라인, EMA |
 | `test_preprocess_api.py` | `/infer` mock. 전송 메시지의 스키마 통과, 공통 필드·헤더 전파, 오류 코드 |
 | `test_latency.py` | 프레임당 처리 시간 (목표 < 33 ms) |
+| `test_phone_frames.py` | 폰 촬영 프레임 5장의 기대 개수와 위치 (원본, 1024 리사이즈, 576/720px 저해상도 입력) |
 | `test_schema_sync.py` | `schemas/` 사본이 `shared/schemas` 원본과 같은지 |
 
 ## 디렉터리
@@ -120,4 +122,4 @@ PROPOSALS.md   공유 파일(스키마/compose/.env) 변경 제안
 - [ ] 이미지 전송 방식 확정 후 `codec.py` 반영 (`raw_bgr` / `raw_rgb` 지원 포함)
 - [ ] `scale` / `crop_offset` / `expected_diameter_px` 스키마 반영 후 출력에 추가, ROI crop 도입 (PROPOSALS P1, P2)
 - [ ] `/preprocess` 비동기(202) + drop 카운트 여부 결정 (PROPOSALS P3)
-- [ ] 폰 촬영 프레임 fixture 추가 (현재 fixture는 시뮬레이터 PNG 1장)
+- [x] 폰 촬영 프레임 fixture 추가 (`tests/fixtures/phone/`, 5장)
