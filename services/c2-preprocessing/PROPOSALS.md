@@ -20,7 +20,7 @@ C2(Member B)가 직접 수정할 수 없는 파일(`shared/schemas/`, `docker-co
 |---|---|---|
 | 프레임 이미지 전송 방식 | **frame-envelope JSON 안의 `image_b64`(base64 JPEG)** + 헤더 `X-Trace-Id` / `X-Frame-Id` / `X-Session-Id` | C1 PR #1(`feature/c1-gateway`)이 이 방식으로 구현했다. C2는 같은 방식으로 받고(`codec.decode_frame`), C3로도 같은 방식으로 보낸다(`processed-frame.image_b64`, JPEG q90) |
 | C1 → C2 전송 프로토콜 | **MQTT** (`mqtt-broker:1883`, 토픽 `psf/v1/frames/+`, QoS 0). 본문은 기존과 같은 frame-envelope JSON(`image_b64` JPEG) | 팀 결정. C2 → C3는 HTTP `/infer` 유지. P3 참고 |
-| C2 → C4 리사이즈 프레임 전송 | `POST http://c4-visualizer:8003/api/camera/frame`, body `{trace_id, session_id, frame_id, width, height, prompts, image_b64}` | C4(Member D)와 합의. C4는 trace_id로 이 이미지와 C3 결과를 짝지어 그린다. P1, P8 참고 |
+| C2 → C4 리사이즈 프레임 전송 | `POST http://c4-visualizer:8003/api/camera/frame`, body `{trace_id, session_id, frame_id, gateway_received_at_ms, preprocess_started_at_ms, preprocess_finished_at_ms, width, height, prompts, image_b64}` (10개 필드) | C4(Member D)와 합의. C4는 trace_id로 이 이미지와 C3 결과를 짝지어 그린다. P1, P8 참고 |
 
 - 스키마의 `image_b64` 설명에 있는 "TODO: transport is not decided" 문구는 owner가 정리해 주길 요청한다 (`shared/schemas/` 소유자).
 - `raw_bgr` / `raw_rgb`는 현재 보내는 쪽이 없으므로 C2는 계속 422로 거절한다. 필요해지면 `codec.py`에 추가한다.
@@ -189,13 +189,16 @@ C3 → C4(detection-result)만 있다. 문서와 스키마 owner가 다음을 �
 |---|---|---|---|
 | 2b | C2 → C4 | `POST http://c4-visualizer:8003/api/camera/frame` | `camera-frame` (신규) |
 
-**camera-frame (C2 → C4)**: C3로 보내는 processed-frame의 일부. 필드를 추가하거나 빼지 않는다.
+**camera-frame (C2 → C4)**: C3로 보내는 processed-frame의 일부 + `gateway_received_at_ms`. 아래 10개 필드이며, 추가하거나 빼지 않는다.
 
 | Field | Type | 설명 |
 |---|---|---|
 | `trace_id` | string | processed-frame과 같음. C4는 이 값으로 C3 결과와 짝을 짓는다 |
 | `session_id` | string | 〃 |
 | `frame_id` | integer | 〃 |
+| `gateway_received_at_ms` | integer | 입력 frame-envelope 값 그대로 (C1 수신 시각, **C1 시계**) |
+| `preprocess_started_at_ms` | integer | processed-frame과 같음 (C2 처리 시작, **C2 시계**) |
+| `preprocess_finished_at_ms` | integer | processed-frame과 같음 (C2 처리 종료, **C2 시계**) |
 | `width` / `height` | integer | 리사이즈된 이미지 크기 (= C3 결과 좌표계) |
 | `prompts` | prompt[] | processed-frame의 prompts 그대로. 0개여도 보낸다 |
 | `image_b64` | string | processed-frame과 **같은 JPEG** (재인코딩 없음) |
@@ -207,6 +210,9 @@ C3 → C4(detection-result)만 있다. 문서와 스키마 owner가 다음을 �
 - best-effort다. C4가 느리거나 꺼져 있으면 C2는 보내지 않거나(`c4_skipped`, 동시 전송 한도 `C2_C4_MAX_INFLIGHT` 초과)
   실패로 기록(`c4_error`)할 뿐 재시도하지 않는다. 따라서 C4에는 C3 결과는 있는데 이미지가 없는 프레임이 생길 수 있다.
 - 헤더 `X-Trace-Id` / `X-Frame-Id` / `X-Session-Id`를 함께 보낸다(본문 필드와 같은 값).
+- 시각 필드로 C4는 C3 결과를 기다리지 않고도 C1 latency(`preprocess_started_at_ms - gateway_received_at_ms`)와
+  C2 latency(`preprocess_finished_at_ms - preprocess_started_at_ms`)를 계산할 수 있다. 다만 C1 latency는 서로 다른 서비스의
+  시계를 비교하므로, 서비스들이 다른 호스트에서 돌면 시계 차이가 그대로 오차가 된다(api-contract의 "시계 동기화" 미결정 사항과 같은 문제).
 
 `shared/schemas/camera-frame.schema.json`도 만들기를 제안한다(`additionalProperties: false`, prompt는 processed-frame의 `$defs/prompt` 재사용).
 그러면 C4가 입력을 검증할 수 있고, C2 테스트도 가짜 C4(`dev/fake_c4.py`) 대신 스키마로 검증할 수 있다.

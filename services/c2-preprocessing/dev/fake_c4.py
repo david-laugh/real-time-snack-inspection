@@ -1,7 +1,10 @@
 """개발용 가짜 C4 프레임 수신 서버 (POST /api/camera/frame).
 
 C2가 C4로 보내는 리사이즈 프레임을 C4와 합의한 형식대로 검증하고 기록만 한다.
-  body: {trace_id, session_id, frame_id, width, height, prompts, image_b64}  -- 정확히 이 7개 필드
+  body: {trace_id, session_id, frame_id, gateway_received_at_ms, preprocess_started_at_ms,
+         preprocess_finished_at_ms, width, height, prompts, image_b64}   -- 정확히 이 10개 필드
+  - *_at_ms는 정수(epoch ms), preprocess_started <= preprocess_finished (둘 다 C2 시계).
+    gateway_received_at_ms(C1 시계)와의 순서는 서비스 간 시계 차이가 있을 수 있어 검사하지 않는다
   - image_b64가 JPEG로 디코딩되고, 디코딩한 크기가 width x height와 같아야 한다
 통과하면 200, 위반이면 422. --delay-ms로 느린 C4를, 서버를 띄우지 않는 것으로 꺼진 C4를 흉내 낸다.
 
@@ -23,7 +26,9 @@ from fastapi.responses import JSONResponse
 
 log = logging.getLogger("fake-c4")
 
-C4_FIELDS = {"trace_id", "session_id", "frame_id", "width", "height", "prompts", "image_b64"}
+C4_FIELDS = {"trace_id", "session_id", "frame_id", "gateway_received_at_ms", "preprocess_started_at_ms",
+             "preprocess_finished_at_ms", "width", "height", "prompts", "image_b64"}
+TIME_FIELDS = ("gateway_received_at_ms", "preprocess_started_at_ms", "preprocess_finished_at_ms")
 
 
 def check_frame(body) -> list[str]:
@@ -37,6 +42,11 @@ def check_frame(body) -> list[str]:
         return errs
     if not isinstance(body["prompts"], list):
         errs.append("prompts is not a list")
+    times = [body[k] for k in TIME_FIELDS]
+    if not all(isinstance(t, int) and not isinstance(t, bool) for t in times):
+        errs.append(f"{', '.join(TIME_FIELDS)} must be integers (epoch ms)")
+    elif not times[1] <= times[2]:
+        errs.append(f"timestamps out of order: {dict(zip(TIME_FIELDS, times))}")
     try:
         raw = base64.b64decode(body["image_b64"], validate=True)
     except (binascii.Error, ValueError, TypeError):
