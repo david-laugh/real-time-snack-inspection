@@ -3,6 +3,8 @@
 경량 컨테이너 용도 — SQLite 불필요, 메모리에서 최근 N건만 유지.
 """
 
+import csv
+import io
 import math
 import time
 from collections import deque
@@ -73,6 +75,32 @@ class InspectionStore:
 
     def get_defects(self, limit: int = 50) -> list[dict]:
         return [r for r in self.get_recent(limit * 3) if r["status"] == "fail"][:limit]
+
+    def export_csv(self) -> str:
+        buf = io.StringIO()
+        fields = [
+            "item_id", "trace_id", "frame_id", "status", "circularity",
+            "area", "perimeter", "defect_score", "inference_latency_ms",
+            "e2e_latency_ms", "container_id", "timestamp",
+        ]
+        writer = csv.DictWriter(buf, fieldnames=fields)
+        writer.writeheader()
+        for r in self._records:
+            writer.writerow({
+                "item_id": r.item_id,
+                "trace_id": r.trace_id,
+                "frame_id": r.frame_id,
+                "status": r.status,
+                "circularity": round(r.circularity, 4),
+                "area": r.area,
+                "perimeter": r.perimeter,
+                "defect_score": round(r.defect_score, 4),
+                "inference_latency_ms": round(r.inference_latency_ms, 1),
+                "e2e_latency_ms": round(r.e2e_latency_ms, 1),
+                "container_id": r.container_id,
+                "timestamp": round(r.timestamp, 3),
+            })
+        return buf.getvalue()
 
     def get_stats(self) -> dict:
         pass_count = self._total - self._fail_count

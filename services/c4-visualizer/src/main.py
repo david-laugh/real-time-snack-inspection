@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from src.models import DetectionResult
@@ -117,6 +117,17 @@ async def list_inspections(limit: int = 50):
 @app.get("/api/defects")
 async def list_defects(limit: int = 50):
     return store.get_defects(limit)
+
+
+@app.get("/api/export/csv")
+async def export_csv():
+    """검사 결과를 CSV로 다운로드."""
+    csv_data = store.export_csv()
+    return Response(
+        content=csv_data,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=inspection-results.csv"},
+    )
 
 
 @app.get("/healthz")
