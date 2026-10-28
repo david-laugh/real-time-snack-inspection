@@ -1,0 +1,11 @@
+# C3 SAM2 Inference dependencies
+# TODO(Member C): uncomment and pin versions when implementation starts.
+# torch / torchvision come from the PyTorch + CUDA base image (see Dockerfile).
+# SAM2 is installed from source (see Dockerfile).
+# fastapi
+# uvicorn[standard]
+# numpy
+# opencv-python-headless
+# pycocotools        # mask RLE encoding (candidate)
+# pydantic
+# pynvml             # GPU utilization / VRAM metrics (candidate)

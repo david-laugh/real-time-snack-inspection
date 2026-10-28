@@ -1,0 +1,8 @@
+# C2 Preprocessing dependencies
+# TODO(Member B): uncomment and pin versions when implementation starts.
+# fastapi
+# uvicorn[standard]
+# opencv-python-headless
+# numpy
+# httpx
+# pydantic

@@ -1,0 +1,8 @@
+# C4 Visualizer dependencies
+# TODO(Member D): uncomment and pin versions when implementation starts.
+# Dashboard framework is not decided yet (FastAPI + WebSocket + static UI / Streamlit / Grafana etc.)
+# fastapi
+# uvicorn[standard]
+# opencv-python-headless
+# numpy
+# pydantic

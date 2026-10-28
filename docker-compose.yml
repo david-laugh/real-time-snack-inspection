@@ -1,0 +1,115 @@
+# pocket-smart-factory — Docker Compose skeleton
+#
+# Baseline  : docker compose up
+#             -> c1, c2, nginx-inference-lb, c3-inference-1, c4
+# Scale-out : docker compose --profile scale-out up
+#             -> baseline + c3-inference-2, c3-inference-3
+#
+# NOTE: application source code does not exist yet.
+#       C1~C4 containers are kept alive with `sleep infinity` as placeholders.
+#       Replace `command` with the real entrypoint once each service is implemented.
+
+x-common-service: &common-service
+  env_file:
+    - path: .env
+      required: false
+  networks:
+    - smart-factory-net
+  restart: unless-stopped
+
+x-c3-inference: &c3-inference
+  <<: *common-service
+  build:
+    context: ./services/c3-inference
+  image: pocket-smart-factory/c3-inference:dev
+  volumes:
+    # Model weights are NOT in git. Place checkpoints here locally.
+    - ./services/c3-inference/models:/app/models:ro
+  expose:
+    - "${C3_PORT:-8002}"
+  # TODO(Member C): placeholder. Replace with inference server entrypoint.
+  command: ["sleep", "infinity"]
+  # TODO(Member C): enable GPU once NVIDIA Container Toolkit is set up.
+  # deploy:
+  #   resources:
+  #     reservations:
+  #       devices:
+  #         - driver: nvidia
+  #           count: 1
+  #           capabilities: [gpu]
+
+services:
+  c1-gateway:
+    <<: *common-service
+    build:
+      context: ./services/c1-gateway
+    image: pocket-smart-factory/c1-gateway:dev
+    environment:
+      SERVICE_NAME: c1-gateway
+    ports:
+      - "${C1_PORT:-8000}:8000"
+    depends_on:
+      - c2-preprocessing
+    # TODO(Member A): placeholder. Replace with FastAPI WebSocket server entrypoint.
+    command: ["sleep", "infinity"]
+
+  c2-preprocessing:
+    <<: *common-service
+    build:
+      context: ./services/c2-preprocessing
+    image: pocket-smart-factory/c2-preprocessing:dev
+    environment:
+      SERVICE_NAME: c2-preprocessing
+    expose:
+      - "${C2_PORT:-8001}"
+    depends_on:
+      - nginx-inference-lb
+    # TODO(Member B): placeholder. Replace with preprocessing server entrypoint.
+    command: ["sleep", "infinity"]
+
+  nginx-inference-lb:
+    <<: *common-service
+    build:
+      context: ./infra/nginx
+    image: pocket-smart-factory/nginx-inference-lb:dev
+    ports:
+      - "${NGINX_LB_PORT:-8080}:8080"
+    depends_on:
+      - c3-inference-1
+
+  c3-inference-1:
+    <<: *c3-inference
+    environment:
+      SERVICE_NAME: c3-inference
+      INFERENCE_CONTAINER_ID: c3-inference-1
+
+  c3-inference-2:
+    <<: *c3-inference
+    profiles: ["scale-out"]
+    environment:
+      SERVICE_NAME: c3-inference
+      INFERENCE_CONTAINER_ID: c3-inference-2
+
+  c3-inference-3:
+    <<: *c3-inference
+    profiles: ["scale-out"]
+    environment:
+      SERVICE_NAME: c3-inference
+      INFERENCE_CONTAINER_ID: c3-inference-3
+
+  c4-visualizer:
+    <<: *common-service
+    build:
+      context: ./services/c4-visualizer
+    image: pocket-smart-factory/c4-visualizer:dev
+    environment:
+      SERVICE_NAME: c4-visualizer
+    ports:
+      - "${C4_PORT:-8003}:8003"
+    # TODO(Member D): placeholder. Replace with visualizer/dashboard server entrypoint.
+    command: ["sleep", "infinity"]
+
+networks:
+  smart-factory-net:
+    name: smart-factory-net
+    driver: bridge

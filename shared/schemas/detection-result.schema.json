@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pocket-smart-factory/schemas/detection-result.schema.json",
+  "title": "DetectionResult",
+  "description": "C3 SAM2 Inference -> C4 Visualizer. Segmentation + defect decision per tracked object.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "trace_id",
+    "session_id",
+    "frame_id",
+    "captured_at_ms",
+    "inference_container_id",
+    "inference_started_at_ms",
+    "inference_finished_at_ms",
+    "inference_latency_ms",
+    "detections"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "examples": ["1.0.0"]
+    },
+    "trace_id": {
+      "type": "string",
+      "description": "Propagated unchanged from ProcessedFrame."
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Propagated unchanged from ProcessedFrame."
+    },
+    "frame_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Propagated unchanged from ProcessedFrame."
+    },
+    "captured_at_ms": {
+      "type": "integer",
+      "description": "Propagated unchanged from ProcessedFrame. Used by C4 for end-to-end latency."
+    },
+    "inference_container_id": {
+      "type": "string",
+      "description": "Which C3 replica produced this result (from env INFERENCE_CONTAINER_ID).",
+      "examples": ["c3-inference-1"]
+    },
+    "inference_started_at_ms": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when C3 started inference."
+    },
+    "inference_finished_at_ms": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when C3 finished inference."
+    },
+    "inference_latency_ms": {
+      "type": "number",
+      "minimum": 0,
+      "description": "inference_finished_at_ms - inference_started_at_ms (or a higher-resolution measurement)."
+    },
+    "detections": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/detection" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "bbox": {
+      "type": "array",
+      "description": "[x1, y1, x2, y2] in pixel coordinates of the preprocessed image.",
+      "items": { "type": "number" },
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "mask": {
+      "type": "object",
+      "description": "Segmentation mask. TODO: finalize encoding.",
+      "required": ["encoding", "data"],
+      "properties": {
+        "encoding": {
+          "type": "string",
+          "enum": ["rle", "polygon", "png_b64"]
+        },
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 },
+        "data": {
+          "description": "Encoded mask data. Shape depends on encoding (RLE counts / polygon points / base64 PNG)."
+        }
+      },
+      "additionalProperties": false
+    },
+    "detection": {
+      "type": "object",
+      "required": ["object_id", "bbox", "status", "defect_type", "defect_score", "mask"],
+      "properties": {
+        "object_id": {
+          "type": "string",
+          "description": "SAM2 tracking object id, stable across frames within a session."
+        },
+        "bbox": { "$ref": "#/$defs/bbox" },
+        "status": {
+          "type": "string",
+          "enum": ["normal", "defect", "unknown"]
+        },
+        "defect_type": {
+          "type": ["string", "null"],
+          "description": "null when status != defect. TODO: finalize defect taxonomy (e.g. broken, crack, burnt, missing_part)."
+        },
+        "defect_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Defect confidence in [0, 1]."
+        },
+        "mask": {
+          "oneOf": [
+            { "$ref": "#/$defs/mask" },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

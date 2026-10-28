@@ -1,0 +1,7 @@
+# C1 Gateway dependencies
+# TODO(Member A): uncomment and pin versions when implementation starts.
+# fastapi
+# uvicorn[standard]
+# websockets
+# httpx
+# pydantic
