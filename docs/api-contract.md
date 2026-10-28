@@ -7,11 +7,11 @@ JSON Schema 원본: [`shared/schemas/`](../shared/schemas/) (draft 2020-12). 이
 | # | Producer → Consumer | Endpoint (예정) | Schema |
 |---|---|---|---|
 | 0 | Mobile/Simulator → C1 | `WS ws://c1-gateway:8000/ws/stream` | TBD (encoded frame) |
-| 1 | C1 → C2 | `POST http://c2-preprocessing:8001/preprocess` | `frame-envelope` |
+| 1 | C1 → C2 | MQTT publish `psf/v1/frames/{session_id}` (QoS 0) | `frame-envelope` |
 | 2 | C2 → Nginx → C3 | `POST http://nginx-inference-lb:8080/infer` | `processed-frame` |
 | 3 | C3 → C4 | `POST http://c4-visualizer:8003/results` | `detection-result` |
 
-전파 HTTP header: `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id` (Nginx access log에서 추적용)
+전파 HTTP header: `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id` (HTTP 구간, Nginx access log에서 추적용). MQTT 구간(C1 → C2)에는 header가 없으며 같은 값이 payload에 들어 있다.
 
 ## 공통 필드 (모든 메시지)
 
@@ -35,7 +35,17 @@ JSON Schema 원본: [`shared/schemas/`](../shared/schemas/) (draft 2020-12). 이
 | `gateway_received_at_ms` | integer | C1 수신 시각 |
 | `image_b64` | string (optional) | TODO: 이미지 전송 방식 미정 |
 
-## 2. processed-frame (C2 → C3)
+## 1a. C1 → C2 MQTT 전송
+
+C1 → C2 구간만 MQTT를 쓴다. C2 → Nginx → C3, C3 → C4는 HTTP를 유지한다(Nginx 로드밸런싱 기반 Scale-out).
+
+브로커는 compose 서비스 `mqtt-broker`(eclipse-mosquitto:2, 내부 포트 1883)이다. C1은 프레임마다 `psf/v1/frames/{session_id}`에 frame-envelope JSON을 발행하고, C2는 `psf/v1/frames/+`를 구독한다. 페이로드는 HTTP 시절 본문과 같은 frame-envelope JSON(`image_b64` JPEG 포함)이며 스키마 검증도 그대로 쓴다. QoS 0, retain 없음. MQTT에는 HTTP 헤더가 없으므로 `trace_id` 등은 JSON 본문에서만 읽는다.
+
+속도 조절은 C2가 맡는다. C1은 받은 프레임을 즉시 발행하고(C1 이벤트 로그 `published`), C2가 세션별 최신 프레임 1장만 처리하면서 오래된 프레임은 버리고 `dropped`로 기록한다(C2 이벤트 `forwarded` / `dropped` / `error`). Frame Drop Rate는 두 로그를 `trace_id`로 조인해 계산한다.
+
+C1 latency(`preprocess_started_at_ms - gateway_received_at_ms`)에는 브로커 경유 시간과 C2 대기 시간이 포함된다. frame-envelope 필드는 변경 없음.
+
+## 2. processed-frame (C2 → C3)## 2. processed-frame (C2 → C3)
 
 | Field | Type | 설명 |
 |---|---|---|
@@ -91,3 +101,4 @@ TODO: 정의는 구현 시 팀 합의로 확정한다.
 | Version | 날짜 | 변경 |
 |---|---|---|
 | 1.0.0 | 2026-10-28 | 초기 skeleton |
+| 1.1.0 (제안) | 2026-10-28 | C1 → C2 전송을 MQTT로 변경 (frame-envelope 필드 변경 없음, 드롭은 C2 담당) |
