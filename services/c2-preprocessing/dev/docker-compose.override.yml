@@ -1,0 +1,49 @@
+# 로컬 통합 테스트용 compose override 예시: (발행) -> mqtt-broker -> C2 -> fake /infer
+# C3 없이 C2 MQTT 경로만 확인한다. 실제 compose 변경은 C1 담당(Member A)이 한다.
+#
+# repo root에서:
+#   docker compose -f docker-compose.yml -f services/c2-preprocessing/dev/docker-compose.override.yml \
+#     up -d --no-deps mqtt-broker fake-infer c2-preprocessing
+#   curl localhost:8001/healthz          # mqtt.connected: true
+#   curl localhost:8001/stats
+#   docker compose logs -f fake-infer
+#   (호스트에서 발행할 때는 localhost:11883)
+# C1까지 붙이려면 c1-gateway도 같이 올린다(C1의 MQTT 발행 설정은 C1 README 참고).
+#
+# 정리:
+#   docker compose -f docker-compose.yml -f services/c2-preprocessing/dev/docker-compose.override.yml \
+#     rm -sf mqtt-broker fake-infer c2-preprocessing
+
+services:
+  mqtt-broker:
+    image: eclipse-mosquitto:2.0.20
+    volumes:
+      - ./services/c2-preprocessing/dev/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    ports:
+      # 호스트에서 테스트 발행용. 다른 브로커와 겹치지 않게 1883 대신 11883 (C2_DEV_MQTT_HOST_PORT로 변경)
+      - "${C2_DEV_MQTT_HOST_PORT:-11883}:1883"
+    networks:
+      - smart-factory-net
+    restart: unless-stopped
+
+  fake-infer:
+    image: pocket-smart-factory/c2-preprocessing:dev
+    command: ["python", "dev/fake_infer.py", "--port", "8080", "--delay-ms", "0"]
+    volumes:
+      - ./services/c2-preprocessing/dev:/app/dev:ro
+    networks:
+      - smart-factory-net
+
+  c2-preprocessing:
+    # 이미지 CMD(uvicorn)를 쓰도록 base의 `sleep infinity`를 덮어쓴다
+    command: ["uvicorn", "c2.app:app", "--app-dir", "src", "--host", "0.0.0.0", "--port", "8001"]
+    environment:
+      C2_MQTT_HOST: mqtt-broker
+      C2_MQTT_TOPIC: psf/v1/frames/+
+      C2_INFER_URL: http://fake-infer:8080/infer      # 실제 구성: http://nginx-inference-lb:8080/infer
+      C2_MAX_INFLIGHT: "4"
+      C2_EVENT_LOG: /app/results/c2_events.csv
+    volumes:
+      - ./benchmark/results:/app/results
+    ports:
+      - "8001:8001"            # 디버깅용 /healthz, /stats, POST /preprocess

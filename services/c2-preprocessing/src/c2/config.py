@@ -38,12 +38,30 @@ class Settings(BaseSettings):
     # C1의 C2 대기 타임아웃(C1_TIMEOUT=5s)보다 짧아야 C3 지연이 C1에서 timeout이 아니라 C2의 502로 기록된다.
     infer_timeout_s: float = 3.0
 
+    # ---- C1 -> C2 MQTT 수신 ----
+    mqtt_enabled: bool = True
+    mqtt_host: str = "mqtt-broker"
+    mqtt_port: int = 1883
+    mqtt_topic: str = "psf/v1/frames/+"
+    mqtt_qos: int = 0
+    mqtt_keepalive_s: int = 30
+    mqtt_client_id: Optional[str] = None      # 비우면 c2-preprocessing-<hostname>
+    mqtt_reconnect_min_s: float = 1.0
+    mqtt_reconnect_max_s: float = 10.0
+
+    # 동시에 처리·전달하는 프레임 수(워커 수). C3 복제본 수 이상 권장.
+    max_inflight: int = 4
+    # captured_at_ms 기준으로 이보다 오래된 프레임은 버린다. 0이면 끔.
+    max_frame_age_ms: int = 500
+    # 프레임별 이벤트 CSV 경로. 비우면 기록 안 함.
+    event_log: Optional[str] = None
+
     output_image_format: Literal["jpeg", "png"] = "jpeg"
     jpeg_quality: int = 90
 
     validate_output: bool = True
 
-    @field_validator("expected_diameter_px", mode="before")
+    @field_validator("expected_diameter_px", "mqtt_client_id", "event_log", mode="before")
     @classmethod
     def _empty_is_none(cls, v):
         return None if v == "" else v

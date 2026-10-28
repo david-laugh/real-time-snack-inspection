@@ -7,7 +7,7 @@ C2(Member B)가 직접 수정할 수 없는 파일(`shared/schemas/`, `docker-co
 |---|---|---|---|---|
 | P1 | `processed-frame`, `detection-result` | `scale`, `crop_offset` 필드 추가 | C3(C), C4(D) | 제안 |
 | P2 | `processed-frame` | `expected_diameter_px` 필드 추가 | C3(C) | 제안 |
-| P3 | C1↔C2↔C3 전달 방식 | `/preprocess` 즉시 202 + 백그라운드 전달 + drop | C1(A), C3(C) | 논의 필요 |
+| P3 | C1↔C2↔C3 전달 방식 | 동기 HTTP 때문에 C3 동시 처리가 C1_MAX_INFLIGHT로 제한됨 | C1(A), C3(C) | **해결됨** (MQTT 전환) |
 | P4 | `docker-compose.yml` | c2 `command` 교체 / healthcheck | A | 제안 |
 | P5 | `.env.example` | `C2_RESIZE_WIDTH/HEIGHT` → `C2_RESIZE_LONG_SIDE` 등 | A | 제안 |
 | P6 | 스키마 공유 방식 | 서비스 이미지 안에서 `shared/schemas` 접근 | A | 제안 |
@@ -18,6 +18,7 @@ C2(Member B)가 직접 수정할 수 없는 파일(`shared/schemas/`, `docker-co
 | 항목 | 결정 | 근거 |
 |---|---|---|
 | 프레임 이미지 전송 방식 | **frame-envelope JSON 안의 `image_b64`(base64 JPEG)** + 헤더 `X-Trace-Id` / `X-Frame-Id` / `X-Session-Id` | C1 PR #1(`feature/c1-gateway`)이 이 방식으로 구현했다. C2는 같은 방식으로 받고(`codec.decode_frame`), C3로도 같은 방식으로 보낸다(`processed-frame.image_b64`, JPEG q90) |
+| C1 → C2 전송 프로토콜 | **MQTT** (`mqtt-broker:1883`, 토픽 `psf/v1/frames/+`, QoS 0). 본문은 기존과 같은 frame-envelope JSON(`image_b64` JPEG) | 팀 결정. C2 → C3는 HTTP `/infer` 유지. P3 참고 |
 
 - 스키마의 `image_b64` 설명에 있는 "TODO: transport is not decided" 문구는 owner가 정리해 주길 요청한다 (`shared/schemas/` 소유자).
 - `raw_bgr` / `raw_rgb`는 현재 보내는 쪽이 없으므로 C2는 계속 422로 거절한다. 필요해지면 `codec.py`에 추가한다.
@@ -81,47 +82,37 @@ C3가 직접 다시 추정하면 로직이 중복되고, 두 서비스의 기준
 
 ---
 
-## P3. `/preprocess` 응답 방식: 동기 → 즉시 202 + 백그라운드 전달 (Member A/C와 논의 필요)
+## P3. C1 → C2 전달 방식 — ✅ MQTT 전환으로 해결됨 (C2가 동시 처리 수를 직접 관리)
 
-### 문제
-현재 C2는 `/infer`(C3) 응답을 **기다린 뒤** C1에 응답한다. 그래서 C1이 보는 `/preprocess` 응답 시간은
-C2 처리 시간(~6–25 ms)에 Nginx 대기 시간과 C3 SAM2 추론 시간을 더한 값이 된다.
-C1이 프레임을 순차로 보내면 SAM2 추론이 33 ms를 넘는 순간 **C1이 30fps를 따라가지 못하고**, 지연이 C1 쪽에 쌓인다.
-그러면 병목 측정에서 C3의 병목이 C1의 지연처럼 보인다.
+### 원래 문제 (기록)
+C2가 `/infer`(C3) 응답을 기다린 뒤 C1에 HTTP로 응답하는 구조였다. 이 구조에서는 C1의 `C1_MAX_INFLIGHT=2`가 곧
+C3에 동시에 들어가는 요청 수의 상한이 되어, C3 복제본을 늘려도 처리량이 늘지 않았다. scale-out 실험의 의미가 없어지는 문제였다.
+대안으로 (a) `C1_MAX_INFLIGHT` 상향, (b) C2 즉시 202 + 백그라운드 전달을 제안했다.
 
-**C1 PR #1로 확인된 근거:** C1은 C2로 동시에 나가 있는 요청을 `C1_MAX_INFLIGHT=2`(기본값)개로 제한하고,
-각 요청은 C2 응답을 받을 때까지 슬롯을 차지한다. C2가 `/infer` 응답을 기다리는 현재 구조에서는
-**C3 복제본을 3개로 늘려도 C3에 동시에 들어가는 요청은 최대 2개**다. 처리량 상한은 `2 / (C2 처리 + C3 추론 시간)`이 되고,
-scale-out 실험(C3 x1/x2/x3)에서 x2와 x3의 차이가 나타나지 않는다. 이 실험이 프로젝트의 핵심 측정 항목이다.
+### 결정과 구현 (`feature/c2-mqtt`)
+팀 결정으로 C1 → C2를 **MQTT**(브로커 `mqtt-broker:1883`, 토픽 `psf/v1/frames/+`, QoS 0, 본문은 기존 frame-envelope JSON)로 바꿨다.
+C2 → C3는 기존 HTTP(`nginx-inference-lb:8080/infer`)를 유지한다.
 
-해결안
-- **(a) `C1_MAX_INFLIGHT`를 C3 복제본 수보다 크게** 설정한다(예: 복제본 수 × 2). 코드 변경 없이 바로 적용할 수 있다.
-  다만 C1의 inflight가 사실상 C3 큐 길이가 되므로, scale-out 구성마다 값을 맞춰야 한다.
-- **(b) C2 즉시 202 응답 + 백그라운드 전달** (아래 제안). C1과 C3가 분리되어 C1 설정이 C3 구성에 의존하지 않는다.
+- C1은 발행만 하고 C2 응답을 기다리지 않는다. C1과 C3의 처리 속도가 분리된다.
+- C2가 동시 처리 수를 직접 관리한다. 워커 `C2_MAX_INFLIGHT`(기본 4, C3 복제본 수 이상 권장)개가 C3로 동시에 요청을 보낸다.
+- 처리보다 빨리 들어오면 세션별 최신 1장만 보관하고 나머지는 `dropped_stale`로 버린다. `captured_at_ms` 기준
+  `C2_MAX_FRAME_AGE_MS`(500)를 넘은 프레임은 `dropped_old`로 버린다. 그래서 지연이 쌓이지 않는다.
+- 프레임별 이벤트(`forwarded` / `dropped_stale` / `dropped_old` / `error` / `timeout`)는 `C2_EVENT_LOG` CSV와 `GET /stats`로 확인한다.
+  Frame Drop Rate는 C1 이벤트와 C2 이벤트를 `trace_id`로 조인해 단계별로 나눠 계산할 수 있다.
+- HTTP `POST /preprocess`는 테스트·디버깅용으로 남겼다. MQTT와 같은 처리 함수(`handle_frame`)를 쓴다.
 
-당장의 벤치마크는 (a)로 진행하고, 구조 개선은 (b)로 하는 것을 권장한다.
-
-### 제안 (b)
-1. C2는 검증과 전처리를 마치면 C1에 **즉시 `202 Accepted`**를 반환한다.
-2. `/infer` 전달은 백그라운드 task로 처리한다.
-3. 동시 전달 수 한도(예: `C2_MAX_INFLIGHT`, C3 replica 수 × 2)를 초과하면 새 프레임은 **drop**하고 `202` 대신 `429`(또는 `202` + `dropped:true`)로 응답한다.
-4. drop 수와 `/infer` 실패 수를 카운트해서 `GET /metrics`(또는 로그)로 노출한다. Frame Drop Rate 측정(`docs/bottleneck-test-plan.md`)에 쓴다.
-
-장단점
-- C1 응답 시간이 C3와 분리되어, C1/C2/C3 각 단계의 병목을 따로 볼 수 있다.
-- 대신 C2가 C3 실패를 C1에 동기적으로 알려줄 수 없다. 실패는 카운터와 로그로만 확인한다.
-- drop 정책을 어디에 둘지(C1 backpressure vs C2 drop) A와 합의가 필요하다. 한도는 C3 처리량에 맞춰 C와 정해야 한다.
-
-### 현재 구현
-동기 방식으로 구현했다. `/infer` 전달은 `src/c2/app.py`의 `forward_to_infer()` 하나로 분리해 두었으므로,
-비동기로 바꿀 때는 이 함수와 응답 코드만 바꾸면 된다.
+### 남은 합의 사항 (Member A)
+- 토픽 마지막 레벨(`+`)의 의미(세션 id 권장). C2는 본문의 `session_id`로 세션을 구분하므로 어느 쪽이든 동작한다.
+- 운영 브로커의 인증·ACL 여부. 현재 dev 설정은 `allow_anonymous true`다.
+- 벤치마크 구성별 `C2_MAX_INFLIGHT` 값 (C3 x1/x2/x3). Member C와 함께 정한다.
 
 ---
 
 ## P4. `docker-compose.yml`의 c2 entrypoint 교체 (Member A)
 
-C1 PR #1은 c1의 `command`만 제거하고 c2는 건드리지 않는다. 이 항목은 C1 PR이 머지된 뒤
-`feature/c2-preprocessing`을 rebase해서 처리할 예정이다. 다른 부분과 충돌하지 않도록 c2 블록만 수정한다.
+C1 PR #1은 머지됐지만 c2의 `command`는 아직 `sleep infinity`다. MQTT 전환에 따라 compose는 C1 담당(Member A)이
+수정하기로 했다. 필요한 설정(브로커 서비스, C2 환경변수, 이벤트 로그 볼륨)은 `README.md`의 "compose 설정 예시"와
+`dev/docker-compose.override.yml`에 정리했다.
 
 이미지 CMD는 이미 uvicorn이고(`Dockerfile`), HEALTHCHECK도 들어 있다.
 compose의 `command: ["sleep", "infinity"]`가 CMD를 덮어쓰므로 제거하거나 아래처럼 교체해야 한다.

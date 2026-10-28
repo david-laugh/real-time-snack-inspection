@@ -3,18 +3,24 @@
 **Owner:** Member B
 
 ## 역할
+- C1이 MQTT로 발행한 프레임(frame-envelope)을 구독해 수신
 - OpenCV 기반 resize(긴 변 기준) + 컨베이어 영역(ROI) 판정
 - 과자 후보 bbox 생성 → SAM2 prompt(`prompts[]`)로 변환
 - `processed-frame` 메시지를 Nginx Inference LB(`/infer`)로 전달
 
 ## Interface
-| 방향 | Endpoint | Payload |
+| 방향 | 프로토콜 / Endpoint | Payload |
 |---|---|---|
-| C1 → C2 | `POST /preprocess` | [`frame-envelope.schema.json`](../../shared/schemas/frame-envelope.schema.json) |
-| C2 → Nginx | `POST http://nginx-inference-lb:8080/infer` | [`processed-frame.schema.json`](../../shared/schemas/processed-frame.schema.json) |
-| — | `GET /healthz` | `{"status": "ok"}` |
+| C1 → C2 | **MQTT** 구독 `psf/v1/frames/+` (QoS 0, 브로커 `mqtt-broker:1883`) | [`frame-envelope`](../../shared/schemas/frame-envelope.schema.json) JSON (`image_b64` JPEG) |
+| C2 → Nginx | HTTP `POST http://nginx-inference-lb:8080/infer` | [`processed-frame`](../../shared/schemas/processed-frame.schema.json) JSON |
+| (디버깅) → C2 | HTTP `POST /preprocess` | frame-envelope JSON. MQTT와 같은 처리 함수를 쓰며 `/infer` 결과까지 기다린다 |
+| — | `GET /healthz` | `{"status": "ok" \| "degraded", "mqtt": {"connected": …}}` |
+| — | `GET /stats` | 이벤트 누적 수, MQTT 수신 수, 처리 중(`inflight`)·대기(`pending_sessions`) 수 |
 
-Header 전파: `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`
+- MQTT에는 HTTP 헤더가 없으므로 `trace_id` / `frame_id` / `session_id`는 본문에서 읽는다. `/infer`로 보낼 때는
+  `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id` 헤더로 전파한다.
+- 토픽의 마지막 레벨(`+`)은 C1과 합의 중이며, C2는 세션 구분에 토픽이 아니라 본문의 `session_id`를 쓴다.
+- `/healthz`는 MQTT가 끊겨도 HTTP 200을 반환한다(`status: degraded`). 컨테이너 재시작 대신 자동 재접속(1~10초 간격)에 맡긴다.
 
 `POST /preprocess` 응답
 | 코드 | 의미 |
@@ -23,7 +29,31 @@ Header 전파: `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`
 | 422 | frame-envelope 스키마 위반, `image_b64` 누락·디코딩 실패, 미지원 `format`(`raw_*`) |
 | 502 | `/infer` 타임아웃, 연결 실패, 4xx/5xx |
 
-현재는 `/infer` 응답을 기다린 뒤 응답하는 동기 방식이다. 비동기(202) 전환 제안은 [`PROPOSALS.md`](PROPOSALS.md) P3 참고.
+### MQTT 수신과 속도 조절
+```
+paho 네트워크 스레드: 수신 → JSON 파싱만 → 이벤트 루프로 전달
+이벤트 루프: FrameSlots (세션별 최신 1장만 보관)
+            ├ 같은 세션의 새 프레임이 오면 보관 중이던 것은 버림 → dropped_stale
+            └ captured_at_ms 기준 C2_MAX_FRAME_AGE_MS(500) 초과 → dropped_old (보관할 때, 꺼낼 때 모두 확인)
+워커 C2_MAX_INFLIGHT(4)개: 꺼내기 → 전처리(스레드풀) → /infer 전달 → forwarded / error / timeout
+```
+- 들어오는 속도가 처리 속도보다 빠르면 큐가 쌓이지 않고 오래된 프레임부터 버려진다. 따라서 지연이 누적되지 않는다.
+  (30fps 발행 + `/infer` 200ms 지연 테스트: 90프레임 중 약 58개 전달, 32개 dropped_stale, 도착 시점 나이 최대 72ms)
+- `C2_MAX_INFLIGHT`는 C3 복제본 수 이상으로 둔다. 이 값이 C3로 동시에 들어가는 요청 수의 상한이다.
+- `captured_at_ms`는 C1이 서버 시계 기준으로 보정해 보낸다(`/cam`의 시계 차이 측정). 보정되지 않은 클라이언트 시계를 쓰면
+  나이 판정이 틀어지므로, 그런 경우에는 `C2_MAX_FRAME_AGE_MS=0`으로 끈다.
+
+### 이벤트 로그 (`C2_EVENT_LOG`)
+프레임마다 한 줄씩 CSV로 남긴다. 컬럼은 C1의 `c1_events.csv`와 맞췄다:
+`trace_id, session_id, frame_id, captured_at_ms, gateway_received_at_ms, source(mqtt|http), event, event_at_ms, preprocess_ms, infer_rtt_ms, detail`
+
+| event | 의미 |
+|---|---|
+| `forwarded` | `/infer` 전달 성공 |
+| `dropped_stale` | 처리 전에 같은 세션의 새 프레임이 와서 버림 |
+| `dropped_old` | `captured_at_ms` 기준 `C2_MAX_FRAME_AGE_MS` 초과 |
+| `error` | 잘못된 메시지(JSON·스키마·디코딩) 또는 `/infer` 실패(연결 실패, 4xx/5xx) |
+| `timeout` | `/infer` 타임아웃(`C2_INFER_TIMEOUT_S`) |
 
 ## 처리 흐름
 1. 입력을 frame-envelope 스키마로 검증
@@ -60,6 +90,16 @@ Header 전파: `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`
 | `C2_OUTPUT_IMAGE_FORMAT` | `jpeg` | C3로 보낼 이미지 포맷 (`jpeg` / `png`) |
 | `C2_JPEG_QUALITY` | `90` | |
 | `C2_VALIDATE_OUTPUT` | `true` | 출력 processed-frame 스키마 검증 |
+| `C2_MQTT_ENABLED` | `true` | MQTT 수신 사용 여부 (`false`면 HTTP `/preprocess`만) |
+| `C2_MQTT_HOST` / `C2_MQTT_PORT` | `mqtt-broker` / `1883` | 브로커 주소 |
+| `C2_MQTT_TOPIC` | `psf/v1/frames/+` | 구독 토픽 |
+| `C2_MQTT_QOS` | `0` | |
+| `C2_MQTT_CLIENT_ID` | (빈 값) | 비우면 `c2-preprocessing-<hostname>` |
+| `C2_MQTT_KEEPALIVE_S` | `30` | |
+| `C2_MQTT_RECONNECT_MIN_S` / `_MAX_S` | `1` / `10` | 재접속 대기 시간 범위 |
+| `C2_MAX_INFLIGHT` | `4` | 워커 수 = 동시 처리·전달 수. C3 복제본 수 이상 권장 |
+| `C2_MAX_FRAME_AGE_MS` | `500` | 이보다 오래된 프레임은 버림(`captured_at_ms` 기준). `0`이면 끔 |
+| `C2_EVENT_LOG` | (빈 값) | 프레임 이벤트 CSV 경로. 비우면 기록 안 함 |
 | `LOG_LEVEL` | `INFO` | `DEBUG`이면 프레임별 지름·배율·ROI를 로그로 남긴다 |
 
 **쿠키 지름은 촬영 세팅마다 다르다.** 예를 들어 시뮬레이터 PNG(1045×450)에서는 약 **78px**,
@@ -72,54 +112,77 @@ Header 전파: `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`
 ```bash
 cd services/c2-preprocessing
 docker build -t pocket-smart-factory/c2-preprocessing:dev .
-docker run --rm -p 8001:8001 pocket-smart-factory/c2-preprocessing:dev
+docker run --rm -p 8001:8001 -e C2_MQTT_HOST=<broker> pocket-smart-factory/c2-preprocessing:dev
 curl http://localhost:8001/healthz
 ```
-compose에서는 `command: ["sleep", "infinity"]`가 이미지 CMD를 덮어쓴다. 교체 제안은 [`PROPOSALS.md`](PROPOSALS.md) P4 참고.
 
-### 로컬
-```bash
-cd services/c2-preprocessing
-python -m venv .venv && . .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements-dev.txt
-uvicorn c2.app:app --app-dir src --port 8001
+### compose 설정 예시 (compose 파일은 Member A가 수정)
+현재 `docker-compose.yml`의 c2는 `command: ["sleep", "infinity"]`이고, MQTT 브로커 서비스가 없다. 필요한 설정은 다음과 같다.
+```yaml
+  mqtt-broker:
+    image: eclipse-mosquitto:2.0.20
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro   # 예시 경로. 내용은 dev/mosquitto.conf 참고
+    networks: [smart-factory-net]
+
+  c2-preprocessing:
+    # command 줄 삭제 (이미지 CMD = uvicorn :8001)
+    environment:
+      SERVICE_NAME: c2-preprocessing
+      C2_MQTT_HOST: mqtt-broker
+      C2_MQTT_TOPIC: psf/v1/frames/+
+      C2_MAX_INFLIGHT: "4"                     # C3 복제본 수 이상
+      C2_EVENT_LOG: /app/results/c2_events.csv
+    volumes:
+      - ./benchmark/results:/app/results
+    depends_on:
+      - mqtt-broker
+      - nginx-inference-lb
 ```
+`depends_on`은 시작 순서만 정한다. 브로커가 늦게 떠도 C2가 자동으로 재접속한다.
 
-### C3 없이 C1 → C2 통합 테스트 (가짜 `/infer`)
-`dev/fake_infer.py`는 Nginx/C3 대역이다. processed-frame을 받아 스키마를 검증하고 로그만 남긴다.
-통과하면 200, 위반이면 422로 응답한다. 추론과 C4 전달은 하지 않는다. 프레임마다 `prompts` 수, C2 처리 시간,
-촬영부터 `/infer` 도착까지의 시간, 헤더 전파 여부를 로그로 남긴다. `GET /stats`로 누적 수를 볼 수 있다.
+### 로컬 통합 테스트: (발행) → MQTT → C2 → 가짜 `/infer`
+`dev/fake_infer.py`는 Nginx/C3 대역이다. processed-frame을 받아 스키마를 검증하고 로그만 남긴다
+(통과하면 200, 위반이면 422, `--delay-ms`로 C3 추론 시간을 흉내 낼 수 있다). `GET /stats`는 받은 수와
+도착 시점의 프레임 나이(`now - captured_at_ms`)를 보여준다.
 
-로컬 (프로세스 3개)
+compose override 예시 [`dev/docker-compose.override.yml`](dev/docker-compose.override.yml): mqtt-broker + fake-infer + C2 (repo root에서)
 ```bash
-# 1) 가짜 /infer
-python dev/fake_infer.py --port 8080                 # --delay-ms 80 : C3 추론 시간 흉내
-# 2) C2
-C2_INFER_URL=http://localhost:8080/infer uvicorn c2.app:app --app-dir src --port 8001
-# 3) C1 (feature/c1-gateway)
-python ../c1-gateway/src/c1_gateway.py serve --downstream http://localhost:8001/preprocess
-#    -> 폰 /cam 또는 c1_gateway.py loadgen으로 프레임 송출
-curl http://localhost:8080/stats
+docker build -t pocket-smart-factory/c2-preprocessing:dev services/c2-preprocessing
+docker compose -f docker-compose.yml -f services/c2-preprocessing/dev/docker-compose.override.yml \
+  up -d --no-deps mqtt-broker fake-infer c2-preprocessing
+curl localhost:8001/healthz                          # mqtt.connected: true
+# 호스트에서 발행: localhost:11883, 토픽 psf/v1/frames/<session>  (C1을 붙이면 C1이 발행)
+curl localhost:8001/stats
+docker compose -f docker-compose.yml -f services/c2-preprocessing/dev/docker-compose.override.yml logs -f fake-infer
 ```
+브로커의 호스트 포트는 다른 MQTT 브로커와 겹치지 않도록 1883이 아니라 **11883**이다(`C2_DEV_MQTT_HOST_PORT`).
 
-Docker (compose 네트워크 `smart-factory-net` 사용, repo root에서)
+로컬 프로세스로 띄울 때
 ```bash
-docker compose up -d c1-gateway                      # 네트워크 생성 + C1 (C1 PR 머지 후)
-docker run -d --rm --name fake-infer --network smart-factory-net   -v "$PWD/services/c2-preprocessing/dev:/app/dev:ro"   pocket-smart-factory/c2-preprocessing:dev python dev/fake_infer.py --port 8080
-docker run -d --rm --name c2-preprocessing --network smart-factory-net   -e C2_INFER_URL=http://fake-infer:8080/infer pocket-smart-factory/c2-preprocessing:dev
-docker logs -f fake-infer
+docker run -d --rm --name c2-dev-mosquitto -p 11883:1883 \
+  -v "$PWD/dev/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2.0.20
+python dev/fake_infer.py --port 8080 --delay-ms 0
+C2_MQTT_HOST=localhost C2_MQTT_PORT=11883 C2_INFER_URL=http://localhost:8080/infer \
+  uvicorn c2.app:app --app-dir src --port 8001
 ```
-compose의 c2 `command`가 아직 `sleep infinity`라서(PROPOSALS P4) C2는 `docker run`으로 직접 띄운다. 이미지 CMD가 uvicorn이고, C1은 `c2-preprocessing` 이름으로 C2를 찾는다.
 
 ### 테스트
+MQTT 통합 테스트(`test_mqtt_integration.py`)는 실제 mosquitto가 필요하다. 브로커 주소는
+`C2_TEST_MQTT_HOST` / `C2_TEST_MQTT_PORT`(기본 `127.0.0.1:18830`)이고, 접속할 수 없으면 skip된다.
 ```bash
 cd services/c2-preprocessing
-pytest            # 처리 시간 출력까지 보려면 pytest -s
+docker run -d --rm --name c2-test-mosquitto -p 18830:1883 \
+  -v "$PWD/dev/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2.0.20
+pytest -rs        # 처리 시간·30fps 결과까지 보려면 pytest -s
 
-# Python 3.11 컨테이너 안에서 (repo root에서 실행, shared/ 동기화 검사 포함)
-docker run --rm -v "$PWD:/repo:ro" -w /repo/services/c2-preprocessing \
-  pocket-smart-factory/c2-preprocessing:dev \
-  sh -c "pip install -q pytest==8.3.4 && python -m pytest -p no:cacheprovider -s"
+# Python 3.11 컨테이너 안에서 (repo root에서 실행)
+docker network create c2-test-net
+docker run -d --rm --name mqtt-test-broker --network c2-test-net \
+  -v "$PWD/services/c2-preprocessing/dev/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2.0.20
+docker run --rm --network c2-test-net -e C2_TEST_MQTT_HOST=mqtt-test-broker -e C2_TEST_MQTT_PORT=1883 \
+  -v "$PWD:/repo:ro" -w /repo/services/c2-preprocessing pocket-smart-factory/c2-preprocessing:dev \
+  sh -c "pip install -q pytest==8.3.4 && python -m pytest -p no:cacheprovider -rs"
 ```
 | 테스트 | 내용 |
 |---|---|
@@ -128,13 +191,17 @@ docker run --rm -v "$PWD:/repo:ro" -w /repo/services/c2-preprocessing \
 | `test_latency.py` | 프레임당 처리 시간 (목표 < 33 ms) |
 | `test_phone_frames.py` | 폰 촬영 프레임 5장의 기대 개수와 위치 (원본, 1024 리사이즈, 576/720px 저해상도 입력) |
 | `test_concurrency.py` | 처리 중에도 이벤트 루프 응답, 동시 요청 병렬 처리, EMA 스레드 안전성, 워밍업 |
+| `test_frame_slots.py` | 세션별 최신 1장 보관, `dropped_stale` / `dropped_old`, 이벤트 CSV |
+| `test_mqtt_integration.py` | 실제 mosquitto: 발행 → 수신 → 가짜 `/infer` 도착, 30fps + `/infer` 200ms에서 지연 누적 없음·drop 기록, 오래된/잘못된 메시지, 연결 끊김 후 재접속 |
 | `test_fake_infer.py` | 가짜 `/infer` 검증 동작, C2 → 가짜 `/infer` 연결 |
 | `test_schema_sync.py` | `schemas/` 사본이 `shared/schemas` 원본과 같은지 |
 
 ## 디렉터리
 ```
 src/c2/
-  app.py       FastAPI 앱, /infer 전달(forward_to_infer)
+  app.py       FastAPI 앱, 공통 처리 handle_frame(), /infer 전달(forward_to_infer), MQTT 워커
+  mqtt_ingest.py  MQTT 구독·재접속(paho-mqtt), 세션별 최신 1장 보관(FrameSlots)
+  events.py    프레임 이벤트 CSV, 누적 카운터
   config.py    환경변수 설정
   pipeline.py  resize → 검출 → processed-frame 생성, 세션별 지름 EMA
   detect.py    검출 로직 (reference에서 이식)
@@ -142,7 +209,7 @@ src/c2/
   schemas.py   jsonschema 검증
 schemas/       shared/schemas 사본 (컨테이너용)
 reference/     검증용 원본 스크립트 (이미지에 포함 안 함)
-dev/           개발 도구: fake_infer.py (가짜 /infer)
+dev/           개발 도구: fake_infer.py (가짜 /infer), mosquitto.conf, docker-compose.override.yml
 tests/         pytest + fixtures
 PROPOSALS.md   공유 파일(스키마/compose/.env) 변경 제안
 ```
@@ -157,5 +224,6 @@ PROPOSALS.md   공유 파일(스키마/compose/.env) 변경 제안
 - [ ] `raw_bgr` / `raw_rgb` 지원 (보내는 쪽이 생기면)
 - [ ] `/cam` 기본 해상도 상향 (PROPOSALS P7)
 - [ ] `scale` / `crop_offset` / `expected_diameter_px` 스키마 반영 후 출력에 추가, ROI crop 도입 (PROPOSALS P1, P2)
-- [ ] `/preprocess` 비동기(202) + drop 카운트 여부 결정 (PROPOSALS P3)
+- [x] C1 → C2 MQTT 전환, 세션별 최신 1장 + 나이 기준 drop, 이벤트 CSV (PROPOSALS P3 해결)
+- [ ] MQTT 토픽 구조·인증 C1과 확정 (`psf/v1/frames/+`의 `+` 의미, 운영 브로커 인증)
 - [x] 폰 촬영 프레임 fixture 추가 (`tests/fixtures/phone/`, 5장)
