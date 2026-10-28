@@ -16,16 +16,16 @@ Client → C1 (WS /ws/stream?s=<session_id>)
     → {"type":"pong","t0":..,"server_ms":..}  (클라이언트가 시계 오프셋 보정에 사용)
 
 C1 → C2 (C1_TRANSPORT=mqtt, 기본 전송 방식)
-  publish  {MQTT_TOPIC_PREFIX}/frames/{session_id}   QoS 0, payload = frame-envelope JSON (image_b64 포함)
-  C2 → C1 publish {MQTT_TOPIC_PREFIX}/acks           QoS 0, payload = frame-ack JSON
-  C1은 ack(status ok/error)를 받으면 그 프레임을 완료로 보고, C1_TIMEOUT 안에 ack가 없으면 timeout 처리.
-  동시에 ack를 기다리는 프레임은 C1_MAX_INFLIGHT개로 제한한다.
+  publish  {MQTT_TOPIC_PREFIX}/frames/{session_id}   QoS 0, retain 없음, payload = frame-envelope JSON
+  C1은 받은 프레임을 즉시 발행한다(event: published). 밀린 프레임 드롭은 C2가 세션별 최신 1장만
+  처리하는 방식으로 담당한다. (실험용 옵션 C1_MQTT_ACK=1: C2가 {prefix}/acks로 ack를 보내면
+  C1이 C1_MAX_INFLIGHT 기준으로 흐름 제어. C2가 ack를 지원할 때만 사용)
 
 C1 → C2 (C1_TRANSPORT=http, 예비)
   POST {C1_DOWNSTREAM} JSON frame-envelope, 헤더 X-Trace-Id / X-Frame-Id / X-Session-Id. 2xx = 완료.
 
 환경 변수 (.env): C1_PORT, C1_TRANSPORT(echo|http|mqtt), C1_DOWNSTREAM, MQTT_HOST, MQTT_PORT,
-  MQTT_TOPIC_PREFIX, C1_PUBLIC_URL, C1_MAX_INFLIGHT, C1_TIMEOUT, C1_TOKEN, C1_DASHBOARD_URL,
+  MQTT_TOPIC_PREFIX, C1_MQTT_ACK, C1_PUBLIC_URL, C1_MAX_INFLIGHT, C1_TIMEOUT, C1_TOKEN, C1_DASHBOARD_URL,
   C1_EVENT_LOG, SCHEMA_VERSION, LOG_LEVEL
 """
 
@@ -226,14 +226,16 @@ class Gateway:
     """
     ingest()     세션별 '최신 1장' 슬롯에 넣는다. 아직 안 보낸 프레임을 덮어쓰면 dropped.
     dispatcher() C2가 처리 중인 프레임이 max_inflight 미만일 때만 슬롯에서 꺼내 보낸다.
-    완료 판정: http는 C2의 2xx 응답, mqtt는 C2가 보낸 ack. 둘 다 C2가 C3 결과까지 받은 뒤 오므로
+    완료 판정: http는 C2의 2xx 응답, mqtt+ack는 C2가 보낸 ack. 둘 다 C2가 C3 결과까지 받은 뒤 오므로
     max_inflight가 파이프라인 전체의 동시 처리 상한이 된다 (C3 복제 수 + 1 권장).
+    mqtt 기본(ack 없음): 슬롯/창을 쓰지 않고 받은 즉시 발행한다. 드롭은 C2가 담당한다.
     """
 
     def __init__(self, a):
         self.a = a
         self.transport = a.transport
         self.echo = self.transport == "echo"
+        self.fire = self.transport == "mqtt" and not a.mqtt_ack     # 즉시 발행 모드
         self.pending = collections.OrderedDict()   # session_id -> Frame
         self.sessions = {}                         # session_id -> next frame_id
         self.awaiting = {}                         # trace_id -> (Frame, t0)  (mqtt ack 대기)
@@ -267,10 +269,12 @@ class Gateway:
         elif self.transport == "mqtt":
             p = self.a.topic_prefix.rstrip("/")
             self.frame_topic = p + "/frames/{}"
+            subs = [] if self.fire else [p + "/acks"]
             self.mq = MqttLink(self.a.mqtt_host, self.a.mqtt_port, f"c1-gateway-{secrets.token_hex(3)}",
-                               subscriptions=[p + "/acks"], on_message=self.on_ack)
-            self.tasks.append(asyncio.create_task(self.janitor()))
-        if not self.echo:
+                               subscriptions=subs, on_message=self.on_ack)
+            if not self.fire:
+                self.tasks.append(asyncio.create_task(self.janitor()))
+        if not self.echo and not self.fire:
             self.tasks.append(asyncio.create_task(self.dispatcher()))
 
     async def stop(self):
@@ -308,6 +312,17 @@ class Gateway:
             self.c["forwarded"] += 1
             self.fw_t.append(received)
             self.log.write(env, "echo")
+            return
+        if self.fire:
+            err = self.mq.publish(self.frame_topic.format(session), self.body_of(f))
+            if err:
+                self.c["error"] += 1
+                self.last_error = err
+                self.log.write(env, "error", detail=err)
+            else:
+                self.c["forwarded"] += 1
+                self.fw_t.append(now_ms())
+                self.log.write(env, "published")
             return
         old = self.pending.get(session)
         if old is not None:
@@ -431,7 +446,7 @@ class Gateway:
             return None
         return {"connected": self.mq.connected, "broker": f"{self.a.mqtt_host}:{self.a.mqtt_port}",
                 "frame_topic": self.frame_topic.format("<session_id>"),
-                "ack_topic": self.a.topic_prefix.rstrip("/") + "/acks", "last_error": self.mq.last_error}
+                "ack": not self.fire, "last_error": self.mq.last_error}
 
     def stats(self):
         t = now_ms()
@@ -454,7 +469,8 @@ class Gateway:
             "sessions": len(self.sessions), "viewers": len(self.viewers),
             "input_fps": fps(self.rx_t), "forwarded_fps": fps(self.fw_t),
             "drop_rate_c1": round(self.c["dropped"] / rx, 4) if rx else 0.0,
-            "inflight": self.inflight if not self.echo else 0, "max_inflight": self.a.max_inflight,
+            "inflight": 0 if (self.echo or self.fire) else self.inflight,
+            "max_inflight": None if (self.echo or self.fire) else self.a.max_inflight,
             "c1_queue_wait_ms": pct(self.wait), "c2_rtt_ms": pct(self.rtt),
             "client_clock_gap_ms": pct(self.skew),
             "counters": dict(self.c), "last_error": self.last_error,
@@ -591,7 +607,8 @@ def cmd_serve(a):
     scheme = "https" if a.ssl_certfile else "http"
     target = {"echo": "echo (C2로 보내지 않음)",
               "http": f"http → {a.downstream}",
-              "mqtt": f"mqtt → {a.mqtt_host}:{a.mqtt_port} {a.topic_prefix.rstrip('/')}/frames/<session>"}[a.transport]
+              "mqtt": f"mqtt → {a.mqtt_host}:{a.mqtt_port} {a.topic_prefix.rstrip('/')}/frames/<session>"
+                      + (" (ack 흐름 제어)" if a.mqtt_ack else " (즉시 발행)")}[a.transport]
     print(f"[C1] transport: {target}")
     print(f"[C1] status: {scheme}://{lan_ip()}:{a.port}/   stream: /ws/stream")
     if a.public_url:
@@ -612,7 +629,7 @@ class StubWorker:
     def __init__(self, a):
         self.a = a
         self.sem = asyncio.Semaphore(a.workers)
-        self.st = collections.Counter(ok=0, bad=0, saved=0)
+        self.st = collections.Counter(ok=0, bad=0, saved=0, dropped=0)
         self.last_image = None
         self.client = None
         if a.save_dir:
@@ -671,39 +688,56 @@ def cmd_stub(a):
 
 
 def stub_mqtt(a, head):
+    """C2 제안 방식 흉내: 세션별 최신 1장만 보관, workers개가 처리, 덮어쓴 프레임은 dropped.
+    --ack 이면 처리 후 {prefix}/acks로 ack 발행 (C1 --mqtt-ack 실험용)."""
     prefix = a.topic_prefix.rstrip("/")
 
     async def main():
         worker = StubWorker(a)
-        link = None
+        latest = collections.OrderedDict()          # session_id -> (topic, env)
+        ready = asyncio.Event()
 
-        async def process(topic, payload):
+        def on_message(topic, payload):
             try:
                 env = json.loads(payload)
             except ValueError:
                 worker.st["bad"] += 1
                 print("[stub C2] JSON 파싱 실패", file=sys.stderr)
                 return
-            ack, _ = await worker.handle(env)
-            if isinstance(env, dict) and topic.rsplit("/", 1)[-1] != env.get("session_id"):
-                print(f"[stub C2] 경고: 토픽 세션({topic})과 envelope session_id 불일치", file=sys.stderr)
-            if ack.get("trace_id"):
-                link.publish(prefix + "/acks", json.dumps(ack))
+            session = topic.rsplit("/", 1)[-1]
+            if isinstance(env, dict) and session != env.get("session_id"):
+                print(f"[stub C2] 경고: 토픽 세션({session})과 envelope session_id 불일치", file=sys.stderr)
+            if session in latest:
+                worker.st["dropped"] += 1
+            latest[session] = env
+            latest.move_to_end(session)
+            ready.set()
 
-        def on_message(topic, payload):
-            asyncio.create_task(process(topic, payload))
+        async def run_worker():
+            while True:
+                while not latest:
+                    ready.clear()
+                    await ready.wait()
+                _, env = latest.popitem(last=False)
+                ack, _ = await worker.handle(env)
+                if a.ack and ack.get("trace_id"):
+                    link.publish(prefix + "/acks", json.dumps(ack))
 
         link = MqttLink(a.mqtt_host, a.mqtt_port, f"c2-stub-{secrets.token_hex(3)}",
                         subscriptions=[prefix + "/frames/+"], on_message=on_message)
-        print(f"[stub C2] mqtt {a.mqtt_host}:{a.mqtt_port}  sub {prefix}/frames/+  ack → {prefix}/acks  {head}")
+        for _ in range(a.workers):
+            asyncio.create_task(run_worker())
+        print(f"[stub C2] mqtt {a.mqtt_host}:{a.mqtt_port}  sub {prefix}/frames/+"
+              + (f"  ack → {prefix}/acks" if a.ack else "  (ack 없음, 세션별 최신 1장 처리)") + f"  {head}")
         last = None
         while True:
             await asyncio.sleep(2)
-            s = (link.connected, worker.st["ok"], worker.st["bad"], worker.st["saved"])
-            if s != last:
+            st = worker.st
+            cur = (link.connected, st["ok"], st["bad"], st["dropped"], st["saved"])
+            if cur != last:
                 state = "연결됨" if link.connected else f"연결 안 됨 {link.last_error}"
-                print(f"[stub C2] {state}  ok={s[1]} bad={s[2]} saved={s[3]}")
-                last = s
+                print(f"[stub C2] {state}  처리 ok={cur[1]} 불량 bad={cur[2]} 드롭 dropped={cur[3]} 저장 saved={cur[4]}")
+                last = cur
 
     try:
         asyncio.run(main())
@@ -914,7 +948,7 @@ function connect(){
 function stats(s){
   $('s-ses').textContent=s.sessions; $('s-in').textContent=s.input_fps+' fps'; $('s-fw').textContent=s.forwarded_fps+' fps';
   $('s-drop').textContent=(s.drop_rate_c1*100).toFixed(1)+'%'; $('s-wait').textContent=ms(s.c1_queue_wait_ms);
-  $('s-rtt').textContent=ms(s.c2_rtt_ms); $('s-inf').textContent=s.inflight+' / '+s.max_inflight;
+  $('s-rtt').textContent=ms(s.c2_rtt_ms); $('s-inf').textContent=s.max_inflight==null?'–':s.inflight+' / '+s.max_inflight;
   $('s-skew').textContent=s.client_clock_gap_ms.p50==null?'–':s.client_clock_gap_ms.p50+' ms';
   $('err').textContent=s.last_error?'최근 오류: '+s.last_error:'';
   if(s.mqtt&&$('mq')){ $('mq').textContent=s.mqtt.connected?'연결됨':'연결 안 됨'; $('mq').style.color=s.mqtt.connected?'#3d7a57':'#c0412b'; }
@@ -1031,9 +1065,11 @@ def main():
                    help="http 전송 시 C2 엔드포인트 (예: http://c2-preprocessing:8001/preprocess)")
     s.add_argument("--public-url", default=env("C1_PUBLIC_URL", ""), help="QR에 넣을 외부 HTTPS 주소")
     s.add_argument("--max-inflight", type=int, default=int(env("C1_MAX_INFLIGHT", 2)),
-                   help="C2로 동시에 나가 있을 요청 수. C2가 C3 응답까지 기다리므로 C3 복제 수 + 1 권장")
+                   help="http / mqtt-ack 모드에서 동시에 처리 중일 프레임 수 (C3 복제 수 + 1 권장)")
     s.add_argument("--timeout", type=float, default=float(env("C1_TIMEOUT", 5.0)), help="C2 응답/ack 대기(초)")
     add_mqtt_args(s)
+    s.add_argument("--mqtt-ack", action="store_true", default=env("C1_MQTT_ACK", "0") == "1",
+                   help="실험용: C2의 ack를 기다리며 max-inflight로 흐름 제어 (기본: 즉시 발행)")
     s.add_argument("--token", default=env("C1_TOKEN", ""), help="스트림 접속 토큰, 'auto'면 자동 생성")
     s.add_argument("--dashboard-url", default=env("C1_DASHBOARD_URL", ""), help="상태 페이지에 걸 C4 주소")
     s.add_argument("--event-log", default=env("C1_EVENT_LOG", ""), help="프레임 이벤트 CSV 경로")
@@ -1045,6 +1081,7 @@ def main():
 
     t = sub.add_parser("stub", help="가짜 C2 (MQTT 구독 또는 HTTP /preprocess)")
     t.add_argument("--transport", default="mqtt", choices=["mqtt", "http"])
+    t.add_argument("--ack", action="store_true", help="mqtt: 처리 후 ack 발행 (C1 --mqtt-ack 실험용)")
     t.add_argument("--host", default="0.0.0.0", help="http 스텁 바인드 주소")
     t.add_argument("--port", type=int, default=8001, help="http 스텁 포트")
     add_mqtt_args(t)

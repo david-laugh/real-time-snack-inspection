@@ -10,7 +10,7 @@
 
 ```bash
 pip install -r requirements.txt
-python src/c1_gateway.py stub --save-dir check_frames        # 가짜 C2: MQTT 구독, 검증 후 ack
+python src/c1_gateway.py stub --save-dir check_frames        # 가짜 C2: MQTT 구독, 세션별 최신 1장 처리
 python src/c1_gateway.py serve --transport mqtt               # C1: localhost:1883으로 발행
 python src/c1_gateway.py loadgen --fps 30 --duration 20 --reset
 ```
@@ -25,7 +25,9 @@ Compose에서는 `C1_TRANSPORT=mqtt`, `MQTT_HOST=mqtt-broker`로 뜬다. 상태 
 
 **Client → C1** `WS /ws/stream?s=<session_id>&t=<token>`. 바이너리 메시지 하나가 프레임 하나이며, 앞 8바이트는 big-endian uint64 `captured_at_ms`, 나머지는 JPEG이다. 8바이트 없이 JPEG만 보내도 되고 그때 `captured_at_ms`는 C1 수신 시각으로 채운다. 텍스트 메시지 `{"type":"ping","t0":<client_ms>}`를 보내면 `{"type":"pong","t0":..,"server_ms":..}`로 답하므로, 클라이언트는 이걸로 시계 오프셋을 보정해 `captured_at_ms`를 서버 시계 기준으로 보낼 수 있다(`/cam` 페이지는 5초마다 보정한다). 접속 직후 C1은 `{"type":"hello","session_id":..}`를 보낸다.
 
-**C1 → C2 (MQTT, 기본)** C1은 `{MQTT_TOPIC_PREFIX}/frames/{session_id}`(기본 `psf/v1/frames/...`)에 [`frame-envelope`](../../shared/schemas/frame-envelope.schema.json) JSON을 QoS 0으로 발행한다. 이미지는 `image_b64`(JPEG)이고 `source_width`/`source_height`는 그 JPEG의 실제 크기다. C2는 `psf/v1/frames/+`를 구독하고, 프레임 처리가 끝나면 `psf/v1/acks`에 [`frame-ack`](../../shared/schemas/frame-ack.schema.json)(`trace_id`, `session_id`, `frame_id`, `status`)을 발행한다. 자세한 규칙은 [`docs/api-contract.md`](../../docs/api-contract.md)의 1a절에 있다.
+**C1 → C2 (MQTT, 기본)** C1은 `{MQTT_TOPIC_PREFIX}/frames/{session_id}`(기본 `psf/v1/frames/...`)에 [`frame-envelope`](../../shared/schemas/frame-envelope.schema.json) JSON을 QoS 0, retain 없이 발행한다. 이미지는 `image_b64`(JPEG)이고 `source_width`/`source_height`는 그 JPEG의 실제 크기다. C2는 `psf/v1/frames/+`를 구독한다. C1은 받은 프레임을 즉시 발행하고 밀린 프레임 드롭은 C2가 담당한다. 자세한 규칙은 [`docs/api-contract.md`](../../docs/api-contract.md)의 1a절에 있다.
+
+실험용으로 `C1_MQTT_ACK=1`(`--mqtt-ack`)을 켜면, C2가 `{prefix}/acks`에 `{trace_id, session_id, frame_id, status}`를 보낼 때 C1이 아래 Backpressure 정책으로 흐름을 제어한다. C2가 ack를 지원할 때만 의미가 있으며 기본은 꺼져 있다(`stub --ack`로 흉내 낼 수 있다).
 
 **C1 → C2 (HTTP, 예비)** `C1_TRANSPORT=http`이면 `POST {C1_DOWNSTREAM}`으로 같은 JSON을 보내고 헤더 `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`를 붙인다. 2xx 응답이 ack 역할을 한다.
 
@@ -35,13 +37,15 @@ Compose에서는 `C1_TRANSPORT=mqtt`, `MQTT_HOST=mqtt-broker`로 뜬다. 상태 
 
 ## Backpressure 정책
 
+MQTT 기본 모드에서는 C1이 드롭하지 않고 C2가 세션별 최신 1장 정책으로 드롭한다. 아래는 HTTP 모드와 MQTT ack 실험 모드에서의 C1 정책이다.
+
 C1은 세션마다 아직 보내지 않은 최신 프레임 1장만 보관한다. 새 프레임이 오면 보관 중이던 프레임은 버리고(`dropped`) 새 것으로 바꾼다. ack를 기다리는 프레임은 `C1_MAX_INFLIGHT`개로 제한하고, `C1_TIMEOUT` 안에 ack가 없으면 timeout으로 기록하고 다음 프레임으로 넘어간다. C2가 C3 결과까지 받은 뒤 ack하므로 이 값이 파이프라인 전체의 동시 처리 상한이며, Scale-out 실험에서는 C3 복제 수 + 1로 맞춘다. 뒤쪽이 느려져도 C1에서 오래된 프레임이 쌓이지 않으므로 지연이 누적되지 않는다.
 
 ## 측정
 
-`C1_EVENT_LOG`(compose 기본 `/app/results/c1_events.csv` → host `benchmark/results/`)에 프레임마다 `forwarded / dropped / error / timeout` 이벤트가 `trace_id`, `frame_id`와 함께 기록된다. C4 결과와 `trace_id`로 조인하면 Frame Drop Rate와 구간별 latency를 계산할 수 있다. C1 latency는 계약대로 C2의 `preprocess_started_at_ms - gateway_received_at_ms`로 계산한다.
+`C1_EVENT_LOG`(compose 기본 `/app/results/c1_events.csv` → host `benchmark/results/`)에 프레임마다 이벤트(MQTT 기본 모드는 `published / error`, 그 외 `forwarded / dropped / error / timeout`)가 `trace_id`, `frame_id`와 함께 기록된다. C4 결과와 `trace_id`로 조인하면 Frame Drop Rate와 구간별 latency를 계산할 수 있다. C1 latency는 계약대로 C2의 `preprocess_started_at_ms - gateway_received_at_ms`로 계산한다.
 
 ## 남은 일
 
-- C2의 MQTT 구독·ack 구현 후 통합 테스트
+- C2의 MQTT 구독 구현 후 통합 테스트 (C1 `published` ↔ C2 `forwarded/dropped`를 `trace_id`로 조인)
 - Overlay용 원본 프레임: C4가 `psf/v1/frames/+`를 구독하면 C1 수정 없이 받을 수 있음 (C4와 논의)
