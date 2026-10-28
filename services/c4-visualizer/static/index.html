@@ -49,8 +49,9 @@ header h1 span { color: var(--accent); }
 
 .stats-row {
   grid-column: 1 / -1;
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;
 }
+@media (max-width: 720px) { .stats-row { grid-template-columns: repeat(2, 1fr); } }
 .stat-card {
   background: var(--surface); border-radius: var(--radius);
   padding: 14px 18px; text-align: center;
@@ -163,17 +164,59 @@ header h1 span { color: var(--accent); }
 .donut-center .pct { font-size: 24px; font-weight: 700; }
 .donut-center .lbl { font-size: 11px; color: var(--text2); }
 
-.circ-chart { display: flex; align-items: flex-end; gap: 3px; height: 100px; }
-.circ-bar { flex: 1; border-radius: 3px 3px 0 0; min-height: 2px; transition: height .3s; }
-.circ-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--text2); margin-top: 4px; }
-.circ-threshold { position: relative; height: 100px; margin-bottom: -100px; pointer-events: none; }
-.circ-threshold .line {
-  position: absolute; left: 0; right: 0;
-  border-top: 1px dashed var(--fail); opacity: .5;
+.score-wrap { position: relative; }
+.score-chart { display: flex; align-items: flex-end; gap: 3px; height: 100px; }
+.score-bar { flex: 1; border-radius: 3px 3px 0 0; min-height: 2px; transition: height .3s; }
+.score-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--text2); margin-top: 4px; }
+/* C3: defect <=> defect_score > 0.5 */
+.score-threshold {
+  position: absolute; top: 0; bottom: 18px; left: 50%;
+  border-left: 1px dashed var(--fail); opacity: .6; pointer-events: none;
 }
-.circ-threshold .tag {
-  position: absolute; right: 0; font-size: 10px; color: var(--fail);
-  transform: translateY(-100%); opacity: .7;
+.score-threshold span { position: absolute; top: -2px; left: 4px; font-size: 10px; color: var(--fail); white-space: nowrap; }
+
+/* ---------- pipeline (C1 -> C2 -> C3 -> C4) ---------- */
+.pipe-panel { grid-column: 1 / -1; background: var(--surface); border-radius: var(--radius); padding: 16px 18px; }
+.pipe-panel .panel-hdr { padding: 0 0 12px; border: none; }
+.pipe-sub { font-size: 11px; color: var(--text2); font-weight: 400; }
+.pipe-flow { display: flex; align-items: stretch; gap: 0; overflow-x: auto; padding-bottom: 4px; }
+.pipe-node {
+  flex: 1 1 0; min-width: 132px; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 3px;
+}
+.pipe-node.down { opacity: .55; border-style: dashed; }
+.pipe-node .nt { font-size: 12px; font-weight: 650; display: flex; justify-content: space-between; gap: 6px; }
+.pipe-node .nt .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text2); align-self: center; flex: none; }
+.pipe-node .nt .dot.on { background: var(--pass); }
+.pipe-node .nl { font-size: 11px; color: var(--text2); display: flex; justify-content: space-between; gap: 8px; }
+.pipe-node .nl b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.pipe-node .nl b.warn { color: var(--fail); }
+.pipe-node .rep { font-size: 10.5px; color: var(--text2); border-top: 1px solid var(--border); margin-top: 4px; padding-top: 4px; }
+.pipe-node .rep div { display: flex; justify-content: space-between; gap: 6px; font-variant-numeric: tabular-nums; }
+.pipe-link {
+  flex: 0 0 116px; display: flex; flex-direction: column; justify-content: center; align-items: center;
+  padding: 0 6px; text-align: center; gap: 2px;
+}
+.pipe-link .lp { font-size: 10px; color: var(--text2); }
+.pipe-link .arrow { width: 100%; height: 2px; background: var(--border); position: relative; margin: 4px 0; }
+.pipe-link .arrow::after {
+  content: ''; position: absolute; right: -1px; top: -4px;
+  border-left: 7px solid var(--border); border-top: 5px solid transparent; border-bottom: 5px solid transparent;
+}
+.pipe-link .lat { font-size: 15px; font-weight: 650; color: var(--info); font-variant-numeric: tabular-nums; }
+.pipe-link .lat small { font-size: 10px; color: var(--text2); font-weight: 400; }
+.pipe-link .loss { font-size: 10.5px; color: var(--pass); font-variant-numeric: tabular-nums; }
+.pipe-link .loss.warn { color: var(--fail); }
+.pipe-link .loss.na { color: var(--text2); }
+.pipe-bar { display: flex; height: 22px; border-radius: 6px; overflow: hidden; margin-top: 14px; background: var(--surface2); }
+.pipe-bar div { min-width: 2px; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #0f1117; font-weight: 600; white-space: nowrap; overflow: hidden; }
+.pipe-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 8px; font-size: 11px; color: var(--text2); }
+.pipe-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.pipe-legend b { color: var(--text); font-weight: 600; }
+@media (max-width: 900px) {
+  .pipe-flow { flex-direction: column; }
+  .pipe-link { flex: none; flex-direction: row; justify-content: space-between; padding: 6px 4px; }
+  .pipe-link .arrow { display: none; }
 }
 
 .feed-list::-webkit-scrollbar { width: 4px; }
@@ -183,7 +226,7 @@ header h1 span { color: var(--accent); }
 <body>
 
 <header>
-  <h1>C4 <span>Visualizer</span> — 크랙 검사</h1>
+  <h1>C4 <span>Visualizer</span> — 과자 불량 검사</h1>
   <div class="header-right">
     <a href="/api/export/csv" class="nav-link" download title="쿠키 1개당 1행 (검사선 통과 시 1회 집계)">CSV 내보내기</a>
     <a href="/api/export/detections.csv" class="nav-link" download title="C3 프레임별 검출 1건당 1행">검출 CSV</a>
@@ -207,15 +250,29 @@ header h1 span { color: var(--accent); }
       <div class="label">불량</div>
       <div class="value fail" id="sFail">0</div>
     </div>
+    <div class="stat-card" title="C3가 mask 품질 부족으로 판정하지 않은 개수">
+      <div class="label">판정 보류</div>
+      <div class="value" id="sUnknown">0</div>
+    </div>
     <div class="stat-card">
       <div class="label">불량률</div>
       <div class="value" id="sRate">0%</div>
     </div>
   </div>
 
+  <div class="pipe-panel">
+    <div class="panel-hdr">
+      <span>파이프라인 <span class="pipe-sub">· 화살표 = 구간 지연 P50 (P95) · 아래 = 손실 누적 / 최근 구간 비율</span></span>
+      <span class="pipe-sub" id="pipeSamples">수신 대기</span>
+    </div>
+    <div class="pipe-flow" id="pipeFlow"></div>
+    <div class="pipe-bar" id="pipeBar"></div>
+    <div class="pipe-legend" id="pipeLegend"></div>
+  </div>
+
   <div class="perf-row">
     <div class="perf-card">
-      <div class="perf-heading"><span class="label">Frame Drop</span><span class="perf-tag">C2</span></div>
+      <div class="perf-heading"><span class="label">Frame Drop</span><span class="perf-tag">C1 + C2</span></div>
       <div class="perf-reading"><span class="value empty" id="pDrop">—</span><span class="unit">frames</span></div>
       <div class="perf-footer"><span>C2 시작 이후 누적</span><span id="pDropStatus">수신 대기</span></div>
       <div class="perf-footer" title="C1/C2 카운터를 1초마다 조회해 약 5초 구간 증가분으로 계산 · 처리 중 프레임이 섞일 수 있는 추정값"><span id="pDropRates">구간 drop률 수집 중</span><span id="pC2Rate"></span></div>
@@ -279,10 +336,10 @@ header h1 span { color: var(--accent); }
         <span>불량 점수 분포</span>
         <span style="font-size:11px; color:var(--text2);">C3 Defect Score</span>
       </div>
-      <div style="position:relative;">
-        <div class="circ-threshold" id="threshLine"></div>
-        <div class="circ-chart" id="circChart"></div>
-        <div class="circ-labels"><span>0.0</span><span>0.5</span><span>1.0</span></div>
+      <div class="score-wrap">
+        <div class="score-threshold"><span>불량 기준 0.5</span></div>
+        <div class="score-chart" id="scoreChart"></div>
+        <div class="score-labels"><span>0.0</span><span>0.5</span><span>1.0</span></div>
       </div>
     </div>
   </div>
@@ -293,7 +350,7 @@ header h1 span { color: var(--accent); }
 let ws;
 let items = [];
 const BINS = 20;
-let circHist = new Array(BINS).fill(0);
+let scoreHist = new Array(BINS).fill(0);
 let bboxOverlays = [];
 // Images and C3 results are paired by (session_id, trace_id, frame_id) for 2 seconds.
 const pendingFrames = new Map();
@@ -334,6 +391,7 @@ function updateStats(s) {
   id('sTotal').textContent = s.total.toLocaleString();
   id('sPass').textContent = s.pass_count.toLocaleString();
   id('sFail').textContent = s.fail_count.toLocaleString();
+  id('sUnknown').textContent = (s.unknown_count || 0).toLocaleString();
   const r = s.defect_rate;
   const el = id('sRate');
   el.textContent = r + '%';
@@ -344,10 +402,13 @@ function updateStats(s) {
     ['capture_to_preprocess','preprocess','c2_to_c3','c3_queue','c3_service','c3_total','c3_c4'].includes(name))
     .map(([name, sample]) => `${name}: ${sample.p50_ms == null ? '—' : sample.p50_ms + ' ms'} (P50)`).join('\n');
   const c2 = s.c2_metrics;
-  const drops = c2 ? c2.dropped_stale + c2.dropped_old : null;
+  const c1Drop = s.c1_metrics ? s.c1_metrics.dropped : 0;
+  const drops = c2 ? c2.dropped_stale + c2.dropped_old + c1Drop : null;
   id('pDrop').textContent = drops == null ? '—' : drops.toLocaleString();
   id('pDrop').className = 'value ' + (drops == null ? 'empty' : drops === 0 ? 'clear' : 'warning');
   id('pDropStatus').textContent = drops == null ? '수신 대기' : '실시간';
+  id('pDropDetail').textContent = c2 ? `C1 ${fmtInt(s.c1_metrics?.dropped)} · C2 ${fmtInt(c2.dropped_stale + c2.dropped_old)} 누적` : 'C1·C2 시작 이후 누적';
+  renderPipeline(s);
   const window = s.drop_window;
   const pct = v => v == null ? '—' : v + '%';
   id('pDropRates').textContent = window ?
@@ -364,6 +425,99 @@ function updateStats(s) {
   id('dFail').setAttribute('stroke-dashoffset', `${-passRate * C}`);
   id('dPct').textContent = s.total > 0 ? Math.round(passRate * 100) + '%' : '—';
   id('dPct').title = `판정 보류 ${s.unknown_count || 0}건 (정상/불량에 포함하지 않음)`;
+}
+
+function fmtInt(v) { return v == null ? '—' : Number(v).toLocaleString(); }
+function fmtMs(v) { return v == null ? '—' : (v < 10 ? v.toFixed(1) : Math.round(v)).toString(); }
+function esc(v) { return String(v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// Segment colours for the latency bar, in pipeline order.
+const SEGMENTS = [
+  {key:'upload', label:'폰 → C1 업로드', color:'#a29bfe'},
+  {key:'c1_c2', label:'C1 → C2 (MQTT·대기)', color:'#74b9ff'},
+  {key:'preprocess', label:'C2 전처리', color:'#55efc4'},
+  {key:'c2_c3', label:'C2 → C3 전달', color:'#ffeaa7'},
+  {key:'c3_queue', label:'C3 대기', color:'#fab1a0'},
+  {key:'c3_service', label:'C3 추론', color:'#e17055'},
+  {key:'c3_c4', label:'C3 → C4 전달', color:'#81ecec'},
+];
+
+// Loss on a hop: cumulative count from C1/C2 counters + rate over the last drop window.
+function lossHtml(count, pct, label) {
+  if (count == null) return `<div class="loss na">${label} —</div>`;
+  const rate = pct == null ? '' : ` · ${pct}%`;
+  return `<div class="loss ${count > 0 ? 'warn' : ''}">${label} ${fmtInt(count)}${rate}</div>`;
+}
+
+function linkHtml(protocol, sample, lossLines) {
+  const p50 = sample?.p50_ms, p95 = sample?.p95_ms;
+  return `<div class="pipe-link">
+    <div class="lp">${protocol}</div>
+    <div class="lat">${fmtMs(p50)}<small> ms${p95 == null ? '' : ` (${fmtMs(p95)})`}</small></div>
+    <div class="arrow"></div>${lossLines}</div>`;
+}
+
+function nodeHtml(title, online, lines, extra = '') {
+  return `<div class="pipe-node ${online ? '' : 'down'}">
+    <div class="nt"><span>${title}</span><span class="dot ${online ? 'on' : ''}"></span></div>
+    ${lines.map(([k, v, warn]) => `<div class="nl"><span>${k}</span><b class="${warn ? 'warn' : ''}">${v}</b></div>`).join('')}
+    ${extra}</div>`;
+}
+
+// Every number below comes from C1 /api/metrics, C2 /stats or C3 results; C4 only displays.
+function renderPipeline(s) {
+  const L = s.latency || {}, c1 = s.c1_metrics, c2 = s.c2_metrics, w = s.drop_window;
+  const replicas = Object.entries(s.c3_replicas || {});
+  const hasJoin = (L.upload?.samples || 0) > 0 || (L.c1_c2?.samples || 0) > 0;
+
+  const repHtml = replicas.length ? `<div class="rep">${replicas.map(([name, r]) =>
+    `<div><span>${esc(name)}</span><span>${fmtInt(r.frames)} · ${fmtMs(r.c3_total_p50_ms)} ms</span></div>`).join('')}</div>` : '';
+  const c2Fail = c2 && c2.error != null ? c2.error + (c2.timeout || 0) : null;
+  const c4SendFail = c2 && (c2.c4_error != null || c2.c4_skipped != null) ? (c2.c4_error || 0) + (c2.c4_skipped || 0) : null;
+
+  id('pipeFlow').innerHTML = [
+    nodeHtml('📱 카메라', !!(c1 && c1.sessions), [['세션', fmtInt(c1?.sessions)]]),
+    linkHtml('WebSocket 업로드', L.upload, ''),
+    nodeHtml('C1 Gateway', !!c1, [
+      ['입력', c1?.input_fps == null ? '—' : `${c1.input_fps} fps`],
+      ['수신', fmtInt(c1?.received)],
+      ['C1 드롭', fmtInt(c1?.dropped), c1?.dropped > 0],
+    ]),
+    linkHtml(hasJoin ? 'MQTT · C2 대기' : 'MQTT (촬영→C2 합계)', hasJoin ? L.c1_c2 : L.capture_to_preprocess,
+      lossHtml(c2 ? c2.dropped_stale + c2.dropped_old : null, w?.c2_drop_pct, '밀려서 버림')),
+    nodeHtml('C2 Preprocess', !!c2, [
+      ['전처리 P50', `${fmtMs(L.preprocess?.p50_ms)} ms`],
+      ['C3 전달 성공', fmtInt(c2?.forwarded)],
+      ['처리 중', c2?.inflight == null ? '—' : `${c2.inflight} / ${c2.max_inflight ?? '—'}`],
+    ]),
+    linkHtml('HTTP · Nginx', L.c2_c3, lossHtml(c2Fail, w?.c2_error_pct, '실패(오류+timeout)')),
+    nodeHtml(`C3 Inference ×${replicas.length || '—'}`, replicas.length > 0, [
+      ['대기 P50', `${fmtMs(L.c3_queue?.p50_ms)} ms`],
+      ['추론 P50', `${fmtMs(L.c3_service?.p50_ms)} ms`],
+      ['추론 P95', `${fmtMs(L.c3_service?.p95_ms)} ms`],
+    ], repHtml),
+    linkHtml('HTTP push', L.c3_c4, lossHtml(w ? w.result_gap_estimate : null, null, '결과 미도착(추정)')),
+    nodeHtml('C4 Visualizer', true, [
+      ['결과 수신', `${fmtInt(s.received_frames)} 프레임`],
+      ['수신 속도', `${s.fps ?? 0} fps`],
+      ['C2→C4 이미지 실패', fmtInt(c4SendFail), c4SendFail > 0],
+    ]),
+  ].join('');
+
+  // Stacked latency bar (P50 of each hop). Upload / C1->C2 exist once C2 camera frames are joined.
+  const parts = SEGMENTS.map(seg => ({...seg, v: L[seg.key]?.p50_ms}))
+    .filter(seg => seg.v != null && seg.v > 0);
+  if (!hasJoin && L.capture_to_preprocess?.p50_ms != null) {
+    parts.unshift({key:'capture_to_preprocess', label:'촬영 → C2 시작', color:'#a29bfe', v:L.capture_to_preprocess.p50_ms});
+  }
+  const sum = parts.reduce((a, p) => a + p.v, 0);
+  id('pipeBar').innerHTML = parts.map(p =>
+    `<div style="flex:${p.v} 0 0; background:${p.color}" title="${p.label} P50 ${fmtMs(p.v)} ms">${p.v / sum > .08 ? fmtMs(p.v) : ''}</div>`).join('');
+  const e2e = L.e2e;
+  id('pipeLegend').innerHTML = parts.map(p => `<span><i style="background:${p.color}"></i>${p.label} <b>${fmtMs(p.v)}</b> ms</span>`).join('')
+    + (e2e?.p50_ms != null ? `<span>· 구간 합 <b>${fmtMs(sum)}</b> ms / 실측 E2E(촬영→C4 수신) P50 <b>${fmtMs(e2e.p50_ms)}</b> · P95 <b>${fmtMs(e2e.p95_ms)}</b> ms</span>` : '');
+  const n = L.c3_service?.samples || 0;
+  id('pipeSamples').textContent = n ? `최근 ${n}프레임${w ? ` · 손실 비율 최근 ${w.seconds}초` : ''}` : '수신 대기';
 }
 
 function showLatency(receivedSample) {
@@ -383,8 +537,8 @@ function addResult(d) {
   renderFeed();
 
   const bin = Math.min(BINS - 1, Math.floor((d.defect_score || 0) * BINS));
-  circHist[bin]++;
-  renderCircChart();
+  scoreHist[bin]++;
+  renderScoreChart();
 
 
 }
@@ -403,15 +557,15 @@ function renderFeed() {
   }).join('');
 }
 
-function renderCircChart() {
-  const max = Math.max(1, ...circHist);
+function renderScoreChart() {
+  const max = Math.max(1, ...scoreHist);
 
-  const bars = circHist.map((v, i) => {
+  const bars = scoreHist.map((v, i) => {
     const h = Math.max(2, (v / max) * 100);
     const color = 'var(--info)';
-    return `<div class="circ-bar" style="height:${h}px; background:${color};" title="${(i/BINS).toFixed(2)}~${((i+1)/BINS).toFixed(2)}: ${v}건"></div>`;
+    return `<div class="score-bar" style="height:${h}px; background:${color};" title="${(i/BINS).toFixed(2)}~${((i+1)/BINS).toFixed(2)}: ${v}건"></div>`;
   }).join('');
-  id('circChart').innerHTML = bars;
+  id('scoreChart').innerHTML = bars;
 
 
 }
@@ -657,16 +811,16 @@ async function loadInitial() {
     items = list;
     id('feedCnt').textContent = list.length + '건';
     renderFeed();
-    circHist = new Array(BINS).fill(0);
+    scoreHist = new Array(BINS).fill(0);
     list.forEach(d => {
       const bin = Math.min(BINS - 1, Math.floor((d.defect_score || 0) * BINS));
-      circHist[bin]++;
+      scoreHist[bin]++;
     });
-    renderCircChart();
+    renderScoreChart();
   } catch (e) {}
 }
 
-renderCircChart();
+renderScoreChart();
 loadInitial();
 connect();
 </script>

@@ -125,6 +125,7 @@ async def receive_result(result: DetectionResult):
             session_id=result.session_id,
             defect_type=det.defect_type,
             defect_score=det.defect_score,
+            bbox=det.bbox,
             inference_latency_ms=result.inference_latency_ms,
             container_id=result.inference_container_id,
         )

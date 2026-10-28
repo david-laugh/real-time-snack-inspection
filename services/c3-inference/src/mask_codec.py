@@ -17,11 +17,12 @@ from typing import Any, Dict, List
 import numpy as np
 
 
+
 def rle_encode(mask: np.ndarray) -> Dict[str, Any]:
     h, w = mask.shape
-    flat = mask.reshape(-1).astype(np.int8)
+    flat = mask.reshape(-1)
     # Indices where the value changes, plus both ends.
-    change = np.flatnonzero(np.diff(flat)) + 1
+    change = np.flatnonzero(flat[1:] != flat[:-1]) + 1
     bounds = np.concatenate(([0], change, [flat.size]))
     counts: List[int] = np.diff(bounds).tolist()
     if flat.size and flat[0] == 1:

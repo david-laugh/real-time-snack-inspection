@@ -21,10 +21,8 @@ class InspectionRecord:
     status: str             # normal | defect | unknown
     session_id: str = ""
     defect_type: str | None = None
-    circularity: float | None = None
-    area: float | None = None
-    perimeter: float | None = None
     defect_score: float = 0.0
+    bbox: list[float] | None = None
     inference_latency_ms: float = 0.0
     container_id: str = ""
     timestamp: float = 0.0
@@ -58,25 +56,29 @@ class InspectionStore:
         else:
             self._unknown_count += 1
 
+    FIELDS = (
+        "item_id", "trace_id", "frame_id", "status", "session_id", "defect_type",
+        "defect_score", "bbox", "inference_latency_ms", "container_id", "timestamp",
+    )
+
+    @staticmethod
+    def _row(r: InspectionRecord) -> dict:
+        return {
+            "item_id": r.item_id,
+            "trace_id": r.trace_id,
+            "frame_id": r.frame_id,
+            "status": r.status,
+            "session_id": r.session_id,
+            "defect_type": r.defect_type,
+            "defect_score": round(r.defect_score, 4),
+            "bbox": r.bbox,
+            "inference_latency_ms": round(r.inference_latency_ms, 1),
+            "container_id": r.container_id,
+            "timestamp": round(r.timestamp, 3),
+        }
+
     def get_recent(self, limit: int = 50) -> list[dict]:
-        out = []
-        for r in list(self._records)[:limit]:
-            out.append({
-                "item_id": r.item_id,
-                "trace_id": r.trace_id,
-                "frame_id": r.frame_id,
-                "status": r.status,
-                "session_id": r.session_id,
-                "defect_type": r.defect_type,
-                "circularity": None,
-                "area": r.area,
-                "perimeter": r.perimeter,
-                "defect_score": round(r.defect_score, 4),
-                "inference_latency_ms": round(r.inference_latency_ms, 1),
-                "container_id": r.container_id,
-                "timestamp": round(r.timestamp, 3),
-            })
-        return out
+        return [self._row(r) for r in list(self._records)[:limit]]
 
     def add_cookie(self, cookie: dict) -> dict:
         votes = cookie["votes"]
@@ -102,29 +104,12 @@ class InspectionStore:
 
     def export_detections_csv(self) -> str:
         buf = io.StringIO()
-        fields = [
-            "item_id", "trace_id", "frame_id", "status", "session_id", "defect_type", "circularity",
-            "area", "perimeter", "defect_score", "inference_latency_ms",
-            "container_id", "timestamp",
-        ]
-        writer = csv.DictWriter(buf, fieldnames=fields)
+        writer = csv.DictWriter(buf, fieldnames=self.FIELDS)
         writer.writeheader()
         for r in self._records:
-            writer.writerow({
-                "item_id": r.item_id,
-                "trace_id": r.trace_id,
-                "frame_id": r.frame_id,
-                "status": r.status,
-                "session_id": r.session_id,
-                "defect_type": r.defect_type,
-                "circularity": None,
-                "area": r.area,
-                "perimeter": r.perimeter,
-                "defect_score": round(r.defect_score, 4),
-                "inference_latency_ms": round(r.inference_latency_ms, 1),
-                "container_id": r.container_id,
-                "timestamp": round(r.timestamp, 3),
-            })
+            row = self._row(r)
+            row["bbox"] = " ".join(f"{v:g}" for v in r.bbox) if r.bbox else ""
+            writer.writerow(row)
         return buf.getvalue()
 
     def get_stats(self) -> dict:

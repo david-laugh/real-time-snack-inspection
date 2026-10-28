@@ -1,7 +1,14 @@
 """Frame-level metrics, independent of detection/object counts."""
 import math
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
+
+# Pipeline hops shown on the dashboard, in order. Each is a latency sample name.
+HOPS = ('upload', 'c1_c2', 'preprocess', 'c2_c3', 'c3_queue', 'c3_service', 'c3_c4')
+
+
+def percentile(values, q):
+    return round(values[math.ceil(len(values) * q) - 1], 1) if values else None
 
 
 class PipelineMetrics:
@@ -14,6 +21,7 @@ class PipelineMetrics:
         self.received = deque()
         self.seen = OrderedDict()
         self.received_frames = 0
+        self.replica_frames = Counter()  # results per C3 replica (inference_container_id)
         self.c1 = None
         self.c1_available = False
         self.c1_updated_at_ms = None
@@ -59,6 +67,8 @@ class PipelineMetrics:
         if key in self.seen:
             return
         self.received_frames += 1
+        container = getattr(result, 'inference_container_id', None) or 'unknown'
+        self.replica_frames[container] += 1
         self.seen[key] = None
         if len(self.seen) > 5000:
             self.seen.popitem(last=False)
@@ -71,6 +81,7 @@ class PipelineMetrics:
             'c3_c4': elapsed(now, result.inference_finished_at_ms),
             'c1_c2': None, 'preprocess': None, 'c2_c3': None, 'upload': None,
             '_captured_at_ms': result.captured_at_ms,
+            '_container': container,
             '_breakdown': getattr(result, 'latency_breakdown_ms', None) or {},
         })
 
@@ -105,6 +116,10 @@ class PipelineMetrics:
         values = {name: counters[name] for name in ('received', 'dropped')}
         if any(type(v) is not int or v < 0 for v in values.values()):
             raise ValueError('Invalid C1 counters')
+        # Display-only extras; absent in older C1 builds.
+        for name in ('input_fps', 'sessions'):
+            value = data.get(name)
+            values[name] = value if isinstance(value, (int, float)) and value >= 0 else None
         self.c1 = values
         self.c1_available = True
         self.c1_updated_at_ms = int(time.time() * 1000)
@@ -157,11 +172,20 @@ class PipelineMetrics:
         for name in ('e2e', 'before_c3', 'inference', 'c3_c4', 'c1_c2', 'preprocess', 'c2_c3', 'upload', 'capture_to_preprocess', 'c2_to_c3', 'c3_queue', 'c3_service', 'c3_total', 'capture_to_c3_done'):
             values = sorted(s[name] for s in self.samples if s.get(name) is not None)
             latency[name] = {
-                'p50_ms': round(values[math.ceil(len(values) * .50) - 1], 1) if values else None,
-                'p95_ms': round(values[math.ceil(len(values) * .95) - 1], 1) if values else None,
+                'p50_ms': percentile(values, .50),
+                'p95_ms': percentile(values, .95),
                 'samples': len(values),
             }
+        replicas = {}
+        for container, frames in sorted(self.replica_frames.items()):
+            recent = [s for s in self.samples if s.get('_container') == container]
+            row = {'frames': frames, 'recent_samples': len(recent)}
+            for name in ('c3_queue', 'c3_service', 'c3_total'):
+                values = sorted(s[name] for s in recent if s.get(name) is not None)
+                row[f'{name}_p50_ms'] = percentile(values, .50)
+            replicas[container] = row
         return {'received_frames': self.received_frames, 'drop_window': self.drop_window,
+                'c3_replicas': replicas,
                 'c1_metrics': self.c1 if self.c1_available else None,
                 'fps': round(len(self.received) / 5, 1), 'latency': latency,
                 'c2_metrics': self.c2 if self.c2_available else None,

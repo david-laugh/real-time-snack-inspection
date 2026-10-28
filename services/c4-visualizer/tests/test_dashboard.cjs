@@ -32,7 +32,7 @@ function dashboard() {
   vm.createContext(sandbox);
   const html = fs.readFileSync(path.join(__dirname, '../static/index.html'), 'utf8');
   const script = html.match(/<script>([\s\S]*?)<\/script>/)[1]
-    .replace(/renderCircChart\(\);\s*loadInitial\(\);\s*connect\(\);\s*$/, '');
+    .replace(/renderScoreChart\(\);\s*loadInitial\(\);\s*connect\(\);\s*$/, '');
   vm.runInContext(script, sandbox);
   return {run: code => vm.runInContext(code, sandbox), images, sandbox};
 }
