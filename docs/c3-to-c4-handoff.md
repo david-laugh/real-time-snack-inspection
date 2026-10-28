@@ -15,6 +15,7 @@
 | 2 | 구간별 지연은 결과의 `latency_breakdown_ms`를 그대로 표시 (§3) | 중간 |
 | 3 | Frame drop은 C1·C2 카운터와 C4 수신 수로 계산 (§4). C2 `/stats`의 `error` + `timeout`(C2→C3 실패)도 읽기 | 중간 |
 | 4 | overlay용 mask는 row-major RLE (§2.3) | 필요 시 |
+| 5 | **고유 과자 집계**: 프레임 간 tracking + 검사선 통과 기준 카운트 (§6). 지금 "총 검사·양품·불량"은 **관측 횟수**라서 같은 과자가 프레임 수만큼 반복 집계된다 | **높음** |
 
 ## 2. 전달 방식
 
@@ -126,3 +127,41 @@ capture_to_preprocess 3 / 4, preprocess 6 / 7, c2_to_c3 2 / 3, c3_queue 0 / 0, c
 | 1.1.0 (C3 `feature/inference`) | optional 필드 추가: `preprocess_started_at_ms`, `preprocess_finished_at_ms`, `inference_received_at_ms`, `latency_breakdown_ms`, `inference_timings_ms`. 기존 필드 변경 없음. 메시지의 `schema_version` 값은 계속 C1 값을 그대로 전파한다 |
 
 C4 `models.py`의 `DetectionResult`(pydantic 기본 설정)는 모르는 필드를 무시하므로 **수정하지 않아도 계속 동작한다**. 새 필드를 쓰려면 model에 optional로 추가하면 된다.
+
+## 6. 고유 과자 집계 (C4 구현 필요)
+
+### 6.1 왜 C4에서 해야 하나
+- C3는 프레임마다 독립적으로 추론한다(stateless). `detections[]`는 **그 프레임에서 보인 객체**다. 같은 과자가 화면에 1초 머물면 30 fps 기준 약 30번 들어온다.
+  - 실측: 고유 쿠키 27개(5장 반복)를 30 fps로 20초 송출 → 600프레임, detection **3,240개**(= 27 × 120).
+- C3 replica는 Nginx round-robin으로 **서로 다른 프레임**을 받는다. 그래서 어느 replica도 한 세션의 연속 프레임을 다 보지 못한다. **모든 결과를 받는 곳은 C4뿐**이라 tracking은 C4에서 해야 한다.
+- C3 `/metrics`의 `detected_observation_count`, `status_counts`는 관측 횟수다. **검사 완료 과자 수로 쓰지 않는다.**
+
+### 6.2 C4가 받는 입력 (확인 완료)
+| 필드 | 용도 |
+|---|---|
+| `session_id` | tracking 단위 (카메라 1대 = 세션 1개) |
+| `frame_id` | 세션 안에서 1씩 증가 (C1 부여). **정렬 기준**. replica가 여러 개면 도착 순서가 뒤바뀔 수 있다 |
+| `trace_id` | 프레임 식별, C2 `camera_frame`과 짝짓기 |
+| `captured_at_ms` | 시간 간격 계산 (frame_id 간격이 일정하지 않을 때) |
+| `detections[].bbox` | 위치 매칭 (C2가 리사이즈한 이미지 좌표, `camera_frame.width/height`와 같은 좌표계) |
+| `detections[].mask` | 겹침 판정을 더 정확히 할 때 (선택) |
+| `detections[].status`, `defect_type`, `defect_score` | 트랙별 최종 판정의 근거 |
+| `detections[].object_id` | **프레임 안에서만** 유일한 C2 후보 번호. 프레임 간 같은 과자라는 보장이 없으므로 tracking 키로 쓰지 않는다 |
+| `inference_container_id`, `inference_latency_ms` | 표시용 |
+| 응답 header `X-C3-Detection-Count` | `len(detections)`와 같음 (C3→C4 push에는 body만 오므로 C4는 `len(detections)`를 쓰면 된다) |
+
+### 6.3 권장 구현
+1. **세션별 정렬 버퍼**: `session_id`마다 `frame_id` 순으로 작은 버퍼(예: 5프레임 또는 200 ms)를 두고 순서대로 처리한다. 버퍼보다 늦게 온 결과는 tracking에서 제외하고 카운트만 한다.
+2. **프레임 간 매칭**: 직전 트랙들과 현재 detection을 bbox IoU(또는 중심 거리 / 지름)로 매칭한다(헝가리안 또는 greedy).
+   - 컨베이어는 한 방향으로 움직이므로 예상 이동 방향과 속도를 쓰면 정확해진다.
+   - 매칭되지 않은 detection은 새 트랙이 된다. N프레임(예: 5) 동안 안 보인 트랙은 종료한다.
+3. **카운트 시점: 검사선 통과**: 트랙의 bbox 중심이 화면의 가상 검사선을 넘는 순간 **1회** 센다. 시뮬레이터도 검사선(`INSPECTION LINE`) 통과 기준으로 `total_passed` / `defect_passed`를 세므로 숫자를 직접 비교할 수 있다. 대안으로 트랙 종료 시 1회 세는 방법도 있다(화면 가장자리에서 잘린 쿠키는 C2가 이미 뺀다).
+4. **트랙 최종 판정**: 트랙에 쌓인 프레임별 판정을 합친다.
+   - 권장: `defect` 비율이 50% 초과(또는 연속 k프레임)면 불량, 그렇지 않고 `normal`이 있으면 정상, 전부 `unknown`이면 판정 보류.
+   - `defect_score` 최댓값이나 평균을 함께 기록한다.
+5. **화면 분리 표시**: "관측(검출) 수"와 "검사 완료 과자 수(트랙 기준)"를 **다른 카드로** 보여 준다. 불량률도 과자 기준(트랙)과 관측 기준을 구분한다.
+
+### 6.4 주의
+- **빈 프레임은 오지 않는다**: C2가 후보 0개 프레임은 C3로 보내지 않을 수 있다(`C2_SKIP_EMPTY`). 그러면 `frame_id`에 빈 번호가 생긴다. 빈 번호를 "모든 트랙이 안 보임"으로 처리하면 트랙이 잘못 끊길 수 있다. **시간(`captured_at_ms`) 기준으로 종료 조건을 잡는 것**을 권장한다.
+- **drop된 프레임**: 밀려서 버린 프레임도 빈 번호가 된다. 이동 거리가 커지므로 매칭 거리 한도를 프레임 간격에 비례시킨다.
+- **같은 프레임 안 중복**: C2 fixture와 실제 체인에서는 한 과자에 후보가 2개 생긴 경우가 없었다(bbox·mask 겹침 0). 다만 반사광 등으로 한 과자의 마스크가 쪼개지면 생길 수 있으므로, C4 tracking에서 같은 프레임 안 IoU가 높은 두 detection은 하나로 보는 처리를 두면 안전하다.

@@ -205,9 +205,20 @@ def create_app(
             log.exception("inference failed trace=%s", trace)
             return error_response("internal_error", f"{type(exc).__name__}: {exc}", 500, trace)
 
-        metrics.record_success(timings, pipeline.status_counts(result))
+        metrics.record_success(
+            timings,
+            pipeline.status_counts(result),
+            frame={
+                "trace_id": result.trace_id,
+                "session_id": result.session_id,
+                "frame_id": result.frame_id,
+                "inference_latency_ms": result.inference_latency_ms,
+            },
+        )
         headers = dict(trace)
         headers["X-Inference-Container-Id"] = settings.inference_container_id
+        # Detections in THIS frame (= len(detections)); per-frame observations, not unique snacks.
+        headers["X-C3-Detection-Count"] = str(len(result.detections))
         for key, name in TIMING_HEADERS.items():
             headers[name] = f"{timings[key]:.3f}"
         headers["Server-Timing"] = ", ".join(

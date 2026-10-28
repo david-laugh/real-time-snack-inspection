@@ -14,7 +14,7 @@ Video Predictor의 `inference_state`나 세션 memory는 두지 않는다. 그�
 |---|---|---|
 | `POST` | `/infer` | body: [`processed-frame`](../../shared/schemas/processed-frame.schema.json) (+ `image_b64` = base64 JPEG) → [`detection-result`](../../shared/schemas/detection-result.schema.json) |
 | `GET` | `/healthz` | 모델이 준비되면 `200`, `loading`/`error`/`not_started` 상태면 `503`. body에 status, device, amp, `model_load_ms`, `warmup_ms`, error 포함 |
-| `GET` | `/metrics` | `processed_frame_count`, `error_count`(+code별), stage별 latency window(mean/p50/p95/max), 모델 정보, GPU 메모리, C4 전송 성공/실패 수 |
+| `GET` | `/metrics` | replica별 누적 지표: 프레임 수와 **관측(검출) 수**를 구분해서 제공 (아래 "통계 지표"), stage별 latency window, 모델 정보, GPU 메모리, C4 전송 성공/실패 수 |
 
 **C3 → C4 전송**: `/infer`가 성공하면 같은 `DetectionResult` JSON을 `C3_RESULTS_URL`(기본 `http://c4-visualizer:8003/results`)로 POST한다. trace header 3개도 함께 보낸다.
 - 응답을 C2에 보낸 **뒤에** 백그라운드로 전송하므로 C2가 체감하는 latency에 포함되지 않는다.
@@ -23,7 +23,27 @@ Video Predictor의 `inference_state`나 세션 memory는 두지 않는다. 그�
 - 결과에는 detection-result 1.1.0의 optional 필드 `latency_breakdown_ms`(촬영 → C2 → **C2→C3 전달** → C3 대기/처리 구간별 지연), `preprocess_*_at_ms`, `inference_received_at_ms`, `inference_timings_ms`가 들어간다. C4 작업자용 사양과 frame drop 계산식은 [`docs/c3-to-c4-handoff.md`](../../docs/c3-to-c4-handoff.md)에 있다.
 
 - Trace header `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`를 받아 응답 header로 echo한다(body 값이 기준).
-- `DetectionResult`가 `additionalProperties:false`라서 per-frame timing은 **응답 header**로 보낸다. `X-C3-Decode-Ms`, `X-C3-Encoder-Ms`, `X-C3-Segmentation-Ms`, `X-C3-Defect-Analysis-Ms`, `X-C3-Total-Inference-Ms`, `Server-Timing`, `X-Inference-Container-Id`.
+- `DetectionResult`가 `additionalProperties:false`라서 per-frame timing은 **응답 header**로 보낸다. `X-C3-Decode-Ms`, `X-C3-Encoder-Ms`, `X-C3-Segmentation-Ms`, `X-C3-Defect-Analysis-Ms`, `X-C3-Total-Inference-Ms`, `Server-Timing`, `X-Inference-Container-Id`, `X-C3-Detection-Count`(이 프레임의 검출 수 = `len(detections)`).
+
+### 통계 지표 (`/metrics`, replica별): 프레임 · 관측 · 고유 과자 구분
+
+C3는 프레임마다 독립적으로 추론한다(A안, stateless). **같은 과자가 N개 프레임에 나오면 관측 N회로 센다.** C3는 고유 과자 수를 세지 않는다. 프레임 간 추적이 필요하고, replica마다 서로 다른 프레임을 받기 때문이다. 고유 과자 집계는 모든 결과를 받는 C4에서 한다([`docs/c3-to-c4-handoff.md` §6](../../docs/c3-to-c4-handoff.md)).
+
+| 지표 | 의미 |
+|---|---|
+| `infer_request_count` | 이 replica가 받은 `/infer` 요청 수 (= `processed_frame_count + error_count`) |
+| `processed_frame_count` | 성공적으로 처리한 프레임 수 (결과 1건씩) |
+| `detected_observation_count` | 처리한 프레임들의 검출 수 합계 = **관측 횟수**. 고유 과자 수가 아님 |
+| `processed_detection_count` | **deprecated**: `detected_observation_count`와 같은 값 (호환용으로 유지) |
+| `current_frame_detection_count`, `current_frame` | 이 replica가 마지막으로 처리한 프레임의 검출 수와 trace/session/frame id, 상태별 수, 추론 시간 |
+| `status_counts` | normal / defect / unknown **관측 횟수** 누적 (고유 과자 수가 아님) |
+| `frames_with_detections` / `frames_without_detections` | 검출이 1개 이상 / 0개인 프레임 수 |
+| `detections_per_frame` | 최근 window의 프레임당 검출 수 평균·최대 |
+| `inference_latency_ms` | 프레임별 추론 시간(`DetectionResult.inference_latency_ms`)의 최근 값과 window 통계 |
+| `metric_definitions` | 위 정의를 응답 안에 그대로 포함 |
+
+- 모두 **replica별** 값이다. C3 전체는 replica 값을 더한다(`localhost:18021~18023/metrics`, 테스트 override 기준).
+- 실측 예: 고유 쿠키 27개(5장)를 30 fps로 20초 반복 → 600프레임, **관측 3,240회**(= 27 × 120). C4가 받은 detection 수와 일치한다.
 - 에러는 `{"error": {"code", "message", trace...}}` 형식이다. 422는 입력 오류, 503은 `model_not_ready`, 500은 내부 오류.
 
 ## 처리 단계와 측정
