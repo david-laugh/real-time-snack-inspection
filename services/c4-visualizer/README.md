@@ -37,9 +37,7 @@ C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라�
 
 ## Open Issues (미해결)
 
-1. **원본 프레임 수신 경로 미정** — bbox overlay는 구현했으나, 실제 카메라 영상을 표시하려면 원본 이미지가 필요.
-   현재 후보: (a) C1이 C4로 프레임 미러링, (b) detection-result에 frame 참조 URL 포함.
-   > 현재는 `camera_frame` WebSocket 이벤트로 base64 이미지를 수신하면 표시하는 구조까지 준비되어 있음.
+1. **카메라 프레임 중계 엔드포인트 미구현** — C1이 `{trace_id, session_id, frame_id, width, height, prompts, image_b64}` 형식으로 프레임을 전송하는 것은 확정. 프론트엔드 핸들러(`updateCamera`)는 구현 완료. 백엔드에 `POST /api/camera/frame` → WebSocket broadcast 엔드포인트 구현 필요.
 2. **C3 replica 결과 순서 문제** — C3가 여러 대일 때 결과가 `frame_id` 순서와 다르게 도착할 수 있음.
    → `frame_id` 기준 재정렬 또는 late frame drop 정책 필요.
    > 현재는 순서 무관하게 도착 순으로 처리.
@@ -113,6 +111,7 @@ fps = len(recent) / 5.0
 | 방향 | Endpoint | Payload / 설명 |
 |------|----------|----------------|
 | C3 → C4 | `POST /results` | [`detection-result.schema.json`](../../shared/schemas/detection-result.schema.json) |
+| C1 → C4 | `POST /api/camera/frame` | 카메라 프레임 + prompts 전송 (`image_b64`, `width`, `height`, `prompts`) — 미구현 |
 | Browser → C4 | `GET /` | 메인 대시보드 (port 8003) |
 | Browser → C4 | `GET /viewer` | 불량 확인 뷰어 |
 | Browser → C4 | `WS /ws/dashboard` | 실시간 WebSocket |
@@ -333,19 +332,104 @@ defect_score, inference_latency_ms, container_id, timestamp
 }
 ```
 
-#### 3) `camera_frame` — 카메라 프레임 수신 시 (향후 구현)
+#### 3) `camera_frame` — 카메라 프레임 수신 시
+
+C1 Gateway가 전송하는 원본 프레임 데이터를 WebSocket으로 브라우저에 중계합니다.
+
+**C1 → C4 전송 포맷 (원본):**
+
+```json
+{
+  "trace_id": "trace-abc-123",
+  "session_id": "m-ab12cd",
+  "frame_id": 297,
+  "width": 576,
+  "height": 1024,
+  "prompts": [
+    {"candidate_id": "c0", "type": "box", "bbox": [429.0, 591.0, 525.0, 681.0]},
+    {"candidate_id": "c1", "type": "box", "bbox": [183.0, 584.0, 276.0, 677.0]}
+  ],
+  "image_b64": "/9j/4AAQ..."
+}
+```
+
+| 필드 | 타입 | 필수 | 설명 |
+|------|------|------|------|
+| `trace_id` | string | O | 파이프라인 추적 ID (C1에서 발급) |
+| `session_id` | string | O | 세션 ID (예: `m-ab12cd`) |
+| `frame_id` | int | O | 프레임 번호 (순차 증가, C1이 부여) |
+| `width` | int | O | 원본 이미지 너비 (px) |
+| `height` | int | O | 원본 이미지 높이 (px) |
+| `prompts` | array | O | SAM2 프롬프트 목록 — 객체 후보별 bbox |
+| `prompts[].candidate_id` | string | O | 후보 객체 ID (예: `c0`, `c1`) |
+| `prompts[].type` | string | O | 프롬프트 유형 (`box`) |
+| `prompts[].bbox` | float[4] | O | `[x1, y1, x2, y2]` 픽셀 좌표 |
+| `image_b64` | string | O | JPEG 이미지의 base64 인코딩 (`data:` 접두사 없이 raw base64) |
+
+**WebSocket broadcast 포맷 (서버 → 브라우저):**
 
 ```json
 {
   "type": "camera_frame",
   "data": {
-    "frame": "data:image/jpeg;base64,...",
-    "image_url": "http://..."
+    "frame_id": 297,
+    "width": 576,
+    "height": 1024,
+    "frame": "/9j/4AAQ...",
+    "prompts": [
+      {"candidate_id": "c0", "type": "box", "bbox": [429.0, 591.0, 525.0, 681.0]},
+      {"candidate_id": "c1", "type": "box", "bbox": [183.0, 584.0, 276.0, 677.0]}
+    ]
   }
 }
 ```
 
-> `frame` (base64) 또는 `image_url` 중 하나. 현재는 프레임 수신 경로가 미정이므로 프론트엔드에 핸들러만 준비된 상태.
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `frame_id` | int | 프레임 번호 |
+| `width` | int | 이미지 너비 (px) |
+| `height` | int | 이미지 높이 (px) |
+| `frame` | string | JPEG base64 문자열 — `data:image/jpeg;base64,` 접두사 포함/미포함 모두 허용 (프론트엔드에서 자동 보정) |
+| `prompts` | array | 객체 후보 bbox 목록 (C1이 보낸 원본 그대로 전달) |
+
+**프론트엔드 처리 흐름 (`index.html` — `updateCamera()`):**
+
+```
+camera_frame 수신
+  ├── placeholder 숨김 ("C3 Inference 결과 대기 중" → 이미지)
+  ├── <img> 엘리먼트 생성/갱신
+  │   └── img.src = "data:image/jpeg;base64," + frame (접두사 자동 보정)
+  ├── img.onload → drawBboxOverlays() 호출
+  │   └── width/height로 bbox 좌표 스케일링
+  └── 카메라 상태 배지 → "수신 중"
+```
+
+**BBox Overlay와 카메라 이미지 연동:**
+
+카메라 이미지가 있으면 bbox 좌표를 이미지 비율에 맞게 스케일링합니다:
+
+```
+이미지 aspect ratio vs 캔버스 aspect ratio 비교
+  ├── 이미지가 더 넓으면 → 캔버스 width 기준 스케일
+  └── 이미지가 더 높으면 → 캔버스 height 기준 스케일
+
+scaleX = drawWidth / naturalWidth
+scaleY = drawHeight / naturalHeight
+offsetX = (canvasWidth - drawWidth) / 2
+offsetY = (canvasHeight - drawHeight) / 2
+
+변환: screenX = bboxX × scaleX + offsetX
+```
+
+이미지가 없으면 `width`×`height` 기준 좌표계로 fallback, 둘 다 없으면 1024×1024.
+
+**현재 구현 상태:**
+
+| 구성요소 | 상태 | 설명 |
+|----------|------|------|
+| 프론트엔드 핸들러 (`updateCamera`) | **구현 완료** | base64 이미지 표시, bbox 스케일링 포함 |
+| 백엔드 중계 (`main.py`) | **미구현** | C1 프레임 수신 → WebSocket broadcast 엔드포인트 필요 |
+| C1 → C4 전송 경로 | **확정** | C1이 `POST /api/camera/frame`으로 프레임 + prompts 전송 |
 
 ---
 
