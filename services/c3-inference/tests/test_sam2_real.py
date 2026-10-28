@@ -97,6 +97,7 @@ def test_real_sam2_on_c2_fixture_frames(real_client):
 
     fixture = load_c2_fixture()
     correct = total = 0
+    before = real_client.get("/metrics").json()  # module-scoped client: compare deltas
     for frame in fixture["frames"]:
         src = REPO_DIR / frame["source"]
         if not src.is_file():
@@ -117,3 +118,11 @@ def test_real_sam2_on_c2_fixture_frames(real_client):
                 print(f"[sam2] MISS {frame['name']} {o['candidate_id']} label={o['label']} got={d['status']}/{d['defect_type']}")
     print(f"[sam2] C2 fixture frames: {correct}/{total} correct")
     assert correct == total
+
+    after = real_client.get("/metrics").json()
+    delta = {k: after[k] - before[k] for k in ("infer_request_count", "processed_frame_count", "detected_observation_count")}
+    status = {k: after["status_counts"].get(k, 0) - before["status_counts"].get(k, 0) for k in ("normal", "defect", "unknown")}
+    print(f"[sam2] /metrics delta {delta} status {status} current={after['current_frame_detection_count']}")
+    assert delta == {"infer_request_count": 6, "processed_frame_count": 6, "detected_observation_count": 42}
+    assert status == {"normal": 23, "defect": 19, "unknown": 0}
+    assert after["current_frame_detection_count"] == len(fixture["frames"][-1]["objects"])
