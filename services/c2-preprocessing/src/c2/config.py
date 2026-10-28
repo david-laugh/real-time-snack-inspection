@@ -35,7 +35,8 @@ class Settings(BaseSettings):
     roi: Annotated[Optional[tuple[int, int, int, int]], NoDecode] = None
 
     infer_url: str = "http://nginx-inference-lb:8080/infer"
-    infer_timeout_s: float = 5.0
+    # C1의 C2 대기 타임아웃(C1_TIMEOUT=5s)보다 짧아야 C3 지연이 C1에서 timeout이 아니라 C2의 502로 기록된다.
+    infer_timeout_s: float = 3.0
 
     output_image_format: Literal["jpeg", "png"] = "jpeg"
     jpeg_quality: int = 90

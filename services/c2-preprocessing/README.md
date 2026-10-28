@@ -27,7 +27,7 @@ Header 전파: `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`
 
 ## 처리 흐름
 1. 입력을 frame-envelope 스키마로 검증
-2. `image_b64`(jpeg/png) 디코딩 — `src/c2/codec.py` (이미지 전송 방식이 바뀌면 이 파일만 수정)
+2. `image_b64`(base64 JPEG, png도 허용) 디코딩. 전송 방식은 C1 PR #1에서 확정됐다. 관련 코드는 `src/c2/codec.py`에만 있다
 3. 긴 변이 `C2_RESIZE_LONG_SIDE`가 되도록 축소 (비율 유지, 확대하지 않음)
 4. 후보 bbox 검출 — `src/c2/detect.py` (reference/c2_bbox_detect.py와 같은 로직)
    - HSV 임계값 → morphology open/close → 외곽 contour → bbox
@@ -51,7 +51,7 @@ Header 전파: `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`
 | `C2_ROI_MODE` | `auto` | `auto`: 컨베이어 영역 자동 검출 / `fixed`: `C2_ROI` 사용 / `off`: 화면 전체 |
 | `C2_ROI` | (빈 값) | `fixed` 모드용 `x1,y1,x2,y2` (원본 좌표) |
 | `C2_INFER_URL` | `http://nginx-inference-lb:8080/infer` | |
-| `C2_INFER_TIMEOUT_S` | `5.0` | `/infer` 요청 타임아웃(초) |
+| `C2_INFER_TIMEOUT_S` | `3.0` | `/infer` 요청 타임아웃(초). C1의 `C1_TIMEOUT`(5s)보다 짧게 유지 |
 | `C2_OUTPUT_IMAGE_FORMAT` | `jpeg` | C3로 보낼 이미지 포맷 (`jpeg` / `png`) |
 | `C2_JPEG_QUALITY` | `90` | |
 | `C2_VALIDATE_OUTPUT` | `true` | 출력 processed-frame 스키마 검증 |
@@ -80,6 +80,32 @@ pip install -r requirements-dev.txt
 uvicorn c2.app:app --app-dir src --port 8001
 ```
 
+### C3 없이 C1 → C2 통합 테스트 (가짜 `/infer`)
+`dev/fake_infer.py`는 Nginx/C3 대역이다. processed-frame을 받아 스키마를 검증하고 로그만 남긴다.
+통과하면 200, 위반이면 422로 응답한다. 추론과 C4 전달은 하지 않는다. 프레임마다 `prompts` 수, C2 처리 시간,
+촬영부터 `/infer` 도착까지의 시간, 헤더 전파 여부를 로그로 남긴다. `GET /stats`로 누적 수를 볼 수 있다.
+
+로컬 (프로세스 3개)
+```bash
+# 1) 가짜 /infer
+python dev/fake_infer.py --port 8080                 # --delay-ms 80 : C3 추론 시간 흉내
+# 2) C2
+C2_INFER_URL=http://localhost:8080/infer uvicorn c2.app:app --app-dir src --port 8001
+# 3) C1 (feature/c1-gateway)
+python ../c1-gateway/src/c1_gateway.py serve --downstream http://localhost:8001/preprocess
+#    -> 폰 /cam 또는 c1_gateway.py loadgen으로 프레임 송출
+curl http://localhost:8080/stats
+```
+
+Docker (compose 네트워크 `smart-factory-net` 사용, repo root에서)
+```bash
+docker compose up -d c1-gateway                      # 네트워크 생성 + C1 (C1 PR 머지 후)
+docker run -d --rm --name fake-infer --network smart-factory-net   -v "$PWD/services/c2-preprocessing/dev:/app/dev:ro"   pocket-smart-factory/c2-preprocessing:dev python dev/fake_infer.py --port 8080
+docker run -d --rm --name c2-preprocessing --network smart-factory-net   -e C2_INFER_URL=http://fake-infer:8080/infer pocket-smart-factory/c2-preprocessing:dev
+docker logs -f fake-infer
+```
+compose의 c2 `command`가 아직 `sleep infinity`라서(PROPOSALS P4) C2는 `docker run`으로 직접 띄운다. 이미지 CMD가 uvicorn이고, C1은 `c2-preprocessing` 이름으로 C2를 찾는다.
+
 ### 테스트
 ```bash
 cd services/c2-preprocessing
@@ -96,6 +122,7 @@ docker run --rm -v "$PWD:/repo:ro" -w /repo/services/c2-preprocessing \
 | `test_preprocess_api.py` | `/infer` mock. 전송 메시지의 스키마 통과, 공통 필드·헤더 전파, 오류 코드 |
 | `test_latency.py` | 프레임당 처리 시간 (목표 < 33 ms) |
 | `test_phone_frames.py` | 폰 촬영 프레임 5장의 기대 개수와 위치 (원본, 1024 리사이즈, 576/720px 저해상도 입력) |
+| `test_fake_infer.py` | 가짜 `/infer` 검증 동작, C2 → 가짜 `/infer` 연결 |
 | `test_schema_sync.py` | `schemas/` 사본이 `shared/schemas` 원본과 같은지 |
 
 ## 디렉터리
@@ -109,6 +136,7 @@ src/c2/
   schemas.py   jsonschema 검증
 schemas/       shared/schemas 사본 (컨테이너용)
 reference/     검증용 원본 스크립트 (이미지에 포함 안 함)
+dev/           개발 도구: fake_infer.py (가짜 /infer)
 tests/         pytest + fixtures
 PROPOSALS.md   공유 파일(스키마/compose/.env) 변경 제안
 ```
@@ -119,7 +147,9 @@ PROPOSALS.md   공유 파일(스키마/compose/.env) 변경 제안
 - [x] bbox 좌표계 확정: **전처리 후 이미지 기준 `[x1, y1, x2, y2]` pixel**
 - [x] `preprocess_started_at_ms` / `preprocess_finished_at_ms` 기록
 - [x] Dockerfile CMD를 uvicorn으로 교체 (compose `command` 교체는 PROPOSALS P4, Member A)
-- [ ] 이미지 전송 방식 확정 후 `codec.py` 반영 (`raw_bgr` / `raw_rgb` 지원 포함)
+- [x] 이미지 전송 방식 확정: frame-envelope `image_b64`(base64 JPEG) (C1 PR #1)
+- [ ] `raw_bgr` / `raw_rgb` 지원 (보내는 쪽이 생기면)
+- [ ] `/cam` 기본 해상도 상향 (PROPOSALS P7)
 - [ ] `scale` / `crop_offset` / `expected_diameter_px` 스키마 반영 후 출력에 추가, ROI crop 도입 (PROPOSALS P1, P2)
 - [ ] `/preprocess` 비동기(202) + drop 카운트 여부 결정 (PROPOSALS P3)
 - [x] 폰 촬영 프레임 fixture 추가 (`tests/fixtures/phone/`, 5장)
