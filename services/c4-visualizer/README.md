@@ -4,34 +4,146 @@
 **Port:** 8003
 
 과자 크랙 검사 결과를 실시간으로 시각화하는 대시보드 서비스.
+C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라우저에 실시간 push합니다.
 
 **역할:**
 - Detection 결과 실시간 표시 (WebSocket push)
-- 영상 위에 mask / bbox / 불량 마킹 overlay (TODO)
-- 모니터링: Processed FPS, latency (E2E P50/P95), defect count
-- End-to-End latency 계산 (`now - captured_at_ms`)
+- 영상 위에 bbox / 불량 마킹 overlay (canvas 기반)
+- 모니터링: Processed FPS, latency (E2E / Inference / Network, P50/P95), defect count, frame drop
+- End-to-End latency 계산 지점 (`now - captured_at_ms`)
 
 ---
 
 ## 구현 현황
 
-- [x] Dashboard 프레임워크 선정 → FastAPI + vanilla JS (WebSocket 실시간)
-- [x] Docker `command`를 실제 entrypoint로 교체 → `uvicorn src.main:app`
-- [x] 실시간 통계 대시보드 (총 검사/양품/불량/불량률/FPS/Latency P50·P95)
-- [x] 불량 확인 뷰어 (`/viewer`) — 테이블 + 상세 패널
-- [x] 원형도(Circularity) 기반 양품/불량 판정
-- [x] WebSocket 브로드캐스트 (`/ws/dashboard`)
-- [x] Overlay 렌더링 — canvas 기반 bbox overlay (pass/fail 색상 구분, 라벨 표시, fade-out)
-- [x] 구간별 Latency 모니터링 — E2E / Inference(C3) / Network 각각 P50·P95 표시
-- [x] frame drop 감지 및 모니터링 — `frame_id` 갭 감지, 대시보드 카드 + 서버 로그
-- [x] 메트릭 집계 및 CSV export — `GET /api/export/csv` 엔드포인트 + 대시보드 다운로드 버튼
+### 기존 스펙(TODO) 대비 완료 상태
 
-## Open Issues
+| # | 기존 TODO | 상태 | 구현 내용 |
+|---|-----------|------|-----------|
+| 1 | Dashboard 프레임워크 선정 | **완료** | FastAPI + vanilla JS + WebSocket 실시간 통신 |
+| 2 | Overlay 렌더링 | **완료** | HTML Canvas 기반 bbox overlay (아래 상세) |
+| 3 | 메트릭 집계 및 CSV export | **완료** | `GET /api/export/csv` + 대시보드 다운로드 버튼 |
+| 4 | Docker command를 실제 entrypoint로 교체 | **완료** | `uvicorn src.main:app --host 0.0.0.0 --port 8003` |
 
-1. **원본 프레임 수신 경로 미정** — Overlay를 그리려면 원본 이미지가 필요.
-   현재 후보: (a) C1이 C4로 프레임 미러링, (b) detection-result에 frame 참조 URL 포함
+### 기존 스펙에 없었으나 추가 구현된 기능
+
+| 기능 | 설명 | 관련 파일 |
+|------|------|-----------|
+| **구간별 Latency 모니터링** | E2E뿐 아니라 Inference(C3), Network(C1→C4) 구간을 분리해 P50/P95 표시 | `store.py`, `index.html` |
+| **Frame Drop 감지** | `frame_id` 갭을 실시간 감지, 대시보드 카드에 누적 drop 수 표시 + 서버 WARNING 로그 | `store.py`, `main.py`, `index.html` |
+| **불량 확인 뷰어** (`/viewer`) | 불량 항목 테이블 + 행 클릭 시 슬라이드인 상세 패널 (원형도 게이지, 파이프라인 정보) | `viewer.html` |
+| **REST API 확장** | `/api/stats`, `/api/inspections`, `/api/defects`, `/api/export/csv` 4개 엔드포인트 추가 | `main.py` |
+| **양품률 도넛 차트** | SVG 기반 실시간 양품/불량 비율 도넛 차트 | `index.html` |
+| **원형도 분포 히스토그램** | 20구간 바 차트 + 0.85 임계선 표시 | `index.html` |
+| **WebSocket 자동 재연결** | 연결 끊김 시 2초 후 자동 재시도 + 상태 배지 표시 | `index.html` |
+| **CSV 내보내기** | 검사 이력 전체를 CSV 파일로 다운로드 | `store.py`, `main.py` |
+
+## Open Issues (미해결)
+
+1. **원본 프레임 수신 경로 미정** — bbox overlay는 구현했으나, 실제 카메라 영상을 표시하려면 원본 이미지가 필요.
+   현재 후보: (a) C1이 C4로 프레임 미러링, (b) detection-result에 frame 참조 URL 포함.
+   > 현재는 `camera_frame` WebSocket 이벤트로 base64 이미지를 수신하면 표시하는 구조까지 준비되어 있음.
 2. **C3 replica 결과 순서 문제** — C3가 여러 대일 때 결과가 `frame_id` 순서와 다르게 도착할 수 있음.
-   → `frame_id` 기준 재정렬 또는 late frame drop 정책 필요
+   → `frame_id` 기준 재정렬 또는 late frame drop 정책 필요.
+   > 현재는 순서 무관하게 도착 순으로 처리하되, frame drop 카운터로 갭을 모니터링.
+
+---
+
+## 핵심 로직 상세
+
+### 1. 원형도(Circularity) 판정
+
+C3에서 받은 detection의 `bbox [x1, y1, x2, y2]`로부터 양품/불량을 판정합니다.
+
+```
+width     = |x2 - x1|
+height    = |y2 - y1|
+area      = width × height
+perimeter = 2 × (width + height)
+
+Circularity = 4π × area / perimeter²
+```
+
+| 조건 | 판정 | 의미 |
+|------|------|------|
+| `circularity >= 0.85` | **pass** (양품) | 정원에 가까운 형태 |
+| `circularity < 0.85` | **fail** (불량) | 찌그러지거나 깨진 형태 |
+
+**참고값:**
+- 정사각형 (100×100): `4π × 10000 / 400² ≈ 0.785` → **불량**
+- 정사각형에 가까운 직사각형 (100×95): `≈ 0.784` → **불량**
+- 길쭉한 직사각형 (200×20): `4π × 4000 / 440² ≈ 0.259` → **불량**
+
+> 임계값은 `main.py`의 `CIRCULARITY_THRESHOLD = 0.85`에서 변경 가능.
+
+### 2. Latency 계산 구조
+
+```
+시점            C1 캡처  ─── 네트워크 ───  C3 추론 시작  ── 추론 ──  C3 추론 종료  ─── 네트워크 ───  C4 수신
+타임스탬프      captured_at_ms            inference_started_at_ms   inference_finished_at_ms       now (C4)
+                │                                                                                    │
+                └────────────────────── E2E Latency = now - captured_at_ms ──────────────────────────┘
+                                          │                          │
+                                          └─ Inference Latency (C3) ─┘
+                │                                                                                    │
+                └── Network Latency ≈ E2E - Inference (C1→C2→C3 + C3→C4 전송 포함) ────────────────┘
+```
+
+| 지표 | 산출 방법 | 설명 |
+|------|-----------|------|
+| **E2E Latency** | `현재시각(ms) - captured_at_ms` | 카메라 캡처 → C4 수신 전체 |
+| **Inference Latency** | `inference_latency_ms` (C3이 측정) | C3 모델 추론 시간만 |
+| **Network Latency** | `E2E - Inference` (근사) | 파이프라인 전송 + 전처리 시간 |
+
+각 지표는 최근 200건 기준 **P50 (중앙값)** 과 **P95**를 계산합니다.
+
+### 3. Frame Drop 감지
+
+```python
+# store.py — add() 호출 시마다
+if last_frame_id >= 0 and new_frame_id > last_frame_id + 1:
+    drop_count += new_frame_id - last_frame_id - 1
+```
+
+- `frame_id`는 순차 증가한다고 가정 (C1이 부여)
+- 예: frame 2 → frame 5 도착 시 → **3건 drop** (frame 3, 4 누락)
+- 서버 로그에 `WARNING: frame drop detected: 2 frames missing (frame 2 → 5)` 출력
+- 대시보드에 누적 drop 수 실시간 표시 (0이면 녹색, 1+ 이면 빨간색)
+
+### 4. FPS 계산
+
+```python
+# store.py — get_stats()
+# 최근 5초 내 처리된 레코드 수 / 5.0
+recent = [t for t in fps_timestamps if now - t < 5.0]
+fps = len(recent) / 5.0
+```
+
+`_fps_timestamps` 링 버퍼(최대 60건)에 각 레코드의 처리 시각을 저장하고, 최근 5초 윈도우의 처리량으로 FPS를 산출합니다.
+
+### 5. BBox Overlay 렌더링
+
+프론트엔드 `index.html`에서 HTML Canvas로 구현:
+
+- detection 결과가 도착하면 `bboxOverlays` 배열에 push (최대 20개 유지)
+- 카메라 피드 영역 위에 `<canvas>`를 절대 위치로 겹침
+- 각 bbox를 사각형으로 그림 (pass=녹색, fail=빨간색)
+- 상단에 라벨 표시: `{object_id} {상태} {circularity}`
+- 오래된 bbox는 투명도 점진 감소 (fade-out)
+- 카메라 이미지가 있으면 좌표를 이미지 비율에 맞게 스케일링
+
+### 6. 인메모리 저장소
+
+`InspectionStore` — SQLite 없이 메모리에서 최근 N건만 유지하는 경량 구조.
+
+| 버퍼 | 최대 크기 | 용도 |
+|------|-----------|------|
+| `_records` | 500건 | 검사 이력 (deque, FIFO) |
+| `_latency_buf` | 200건 | E2E latency percentile 계산 |
+| `_inference_latency_buf` | 200건 | Inference latency percentile 계산 |
+| `_fps_timestamps` | 60건 | FPS 산출용 타임스탬프 |
+
+컨테이너 재시작 시 데이터는 초기화됩니다 (stateless).
 
 ---
 
@@ -42,24 +154,272 @@
 | C3 → C4 | `POST /results` | [`detection-result.schema.json`](../../shared/schemas/detection-result.schema.json) |
 | Browser → C4 | `GET /` | 메인 대시보드 (port 8003) |
 | Browser → C4 | `GET /viewer` | 불량 확인 뷰어 |
-| Browser → C4 | `WS /ws/dashboard` | 실시간 WebSocket (inspection_result, stats, camera_frame) |
+| Browser → C4 | `WS /ws/dashboard` | 실시간 WebSocket |
 | Browser → C4 | `GET /api/stats` | 통계 JSON |
 | Browser → C4 | `GET /api/inspections` | 검사 이력 |
 | Browser → C4 | `GET /api/defects` | 불량 목록 |
-| Browser → C4 | `GET /api/export/csv` | 검사 결과 CSV 다운로드 |
+| Browser → C4 | `GET /api/export/csv` | CSV 다운로드 |
 | — | `GET /healthz` | 헬스체크 |
+
+---
+
+## API 명세
+
+### `POST /results`
+
+C3 Inference에서 detection 결과를 수신합니다.
+
+**Request Body** (`DetectionResult`):
+
+```json
+{
+  "schema_version": "1.0.0",
+  "trace_id": "string (전파용 추적 ID)",
+  "session_id": "string (세션 ID)",
+  "frame_id": 0,
+  "captured_at_ms": 1730000000000,
+  "inference_container_id": "c3-inference-1",
+  "inference_started_at_ms": 1730000000050,
+  "inference_finished_at_ms": 1730000000100,
+  "inference_latency_ms": 50.0,
+  "detections": [
+    {
+      "object_id": "snack-001",
+      "bbox": [100.0, 100.0, 200.0, 200.0],
+      "status": "normal | defect | unknown",
+      "defect_type": "crack | null",
+      "defect_score": 0.05,
+      "mask": null
+    }
+  ]
+}
+```
+
+| 필드 | 타입 | 필수 | 설명 |
+|------|------|------|------|
+| `schema_version` | string | O | 스키마 버전 (기본 `"1.0.0"`) |
+| `trace_id` | string | O | 파이프라인 추적 ID (C1에서 발급) |
+| `session_id` | string | O | 세션 ID |
+| `frame_id` | int | O | 프레임 번호 (순차 증가, frame drop 감지에 사용) |
+| `captured_at_ms` | int | O | C1 캡처 시각 (Unix ms) — E2E latency 계산 기준 |
+| `inference_container_id` | string | O | C3 replica 식별자 (예: `c3-inference-1`) |
+| `inference_started_at_ms` | int | O | C3 추론 시작 시각 (Unix ms) |
+| `inference_finished_at_ms` | int | O | C3 추론 종료 시각 (Unix ms) |
+| `inference_latency_ms` | float | O | C3 추론 소요 시간 (ms) |
+| `detections` | array | O | detection 배열 |
+| `detections[].object_id` | string | O | SAM2 추적 객체 ID |
+| `detections[].bbox` | float[4] | O | `[x1, y1, x2, y2]` 픽셀 좌표 |
+| `detections[].status` | string | O | `normal` / `defect` / `unknown` |
+| `detections[].defect_type` | string? | - | 불량 유형 (`crack`, `broken` 등), null 가능 |
+| `detections[].defect_score` | float | - | 불량 신뢰도 `[0, 1]` (기본 0.0) |
+| `detections[].mask` | object? | - | 세그멘테이션 마스크 (현재 미사용, null 가능) |
+
+**Response** `200 OK`:
+
+```json
+{
+  "status": "ok",
+  "detections_processed": 1
+}
+```
+
+**처리 흐름:**
+1. E2E latency 계산: `현재시각(ms) - captured_at_ms`
+2. Frame drop 감지: 이전 `frame_id`와 갭 확인
+3. 각 detection마다:
+   - bbox에서 area, perimeter 계산
+   - circularity 산출 → pass/fail 판정
+   - `InspectionStore`에 기록
+   - WebSocket으로 `inspection_result` 이벤트 브로드캐스트
+4. 전체 통계 재계산 → WebSocket으로 `stats` 이벤트 브로드캐스트
+
+---
+
+### `GET /api/stats`
+
+현재 집계 통계를 반환합니다.
+
+**Response** `200 OK`:
+
+```json
+{
+  "total": 150,
+  "pass_count": 142,
+  "fail_count": 8,
+  "defect_rate": 5.3,
+  "fps": 12.4,
+  "latency_p50_ms": 85.0,
+  "latency_p95_ms": 142.0,
+  "inference_p50_ms": 50.0,
+  "inference_p95_ms": 78.0,
+  "network_p50_ms": 35.0,
+  "network_p95_ms": 64.0,
+  "frame_drop_count": 2,
+  "last_frame_id": 152
+}
+```
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `total` | int | 총 검사 수 |
+| `pass_count` | int | 양품 수 |
+| `fail_count` | int | 불량 수 |
+| `defect_rate` | float | 불량률 (%) |
+| `fps` | float | 최근 5초 기준 처리 FPS |
+| `latency_p50_ms` | float | E2E latency 중앙값 (ms) |
+| `latency_p95_ms` | float | E2E latency P95 (ms) |
+| `inference_p50_ms` | float | C3 inference latency 중앙값 (ms) |
+| `inference_p95_ms` | float | C3 inference latency P95 (ms) |
+| `network_p50_ms` | float | 네트워크 latency 중앙값 (ms) |
+| `network_p95_ms` | float | 네트워크 latency P95 (ms) |
+| `frame_drop_count` | int | 누적 frame drop 수 |
+| `last_frame_id` | int | 마지막 처리된 frame_id |
+
+---
+
+### `GET /api/inspections`
+
+최근 검사 결과 목록을 반환합니다.
+
+**Query Parameters:**
+
+| 파라미터 | 타입 | 기본값 | 설명 |
+|----------|------|--------|------|
+| `limit` | int | 50 | 반환할 최대 건수 |
+
+**Response** `200 OK`:
+
+```json
+[
+  {
+    "item_id": "snack-001",
+    "trace_id": "trace-abc",
+    "frame_id": 42,
+    "status": "pass",
+    "circularity": 0.8912,
+    "area": 16900.0,
+    "perimeter": 520.0,
+    "defect_score": 0.02,
+    "inference_latency_ms": 45.0,
+    "e2e_latency_ms": 82.0,
+    "container_id": "c3-inference-1",
+    "timestamp": 1730000000.123
+  }
+]
+```
+
+---
+
+### `GET /api/defects`
+
+불량(`status: "fail"`) 항목만 필터링하여 반환합니다.
+
+**Query Parameters:**
+
+| 파라미터 | 타입 | 기본값 | 설명 |
+|----------|------|--------|------|
+| `limit` | int | 50 | 반환할 최대 건수 |
+
+**Response**: `/api/inspections`과 동일한 형태, `status: "fail"`인 것만.
+
+---
+
+### `GET /api/export/csv`
+
+검사 결과를 CSV 파일로 다운로드합니다.
+
+**Response** `200 OK`:
+- `Content-Type: text/csv`
+- `Content-Disposition: attachment; filename=inspection-results.csv`
+
+**CSV 컬럼:**
+
+```
+item_id, trace_id, frame_id, status, circularity, area, perimeter,
+defect_score, inference_latency_ms, e2e_latency_ms, container_id, timestamp
+```
+
+---
+
+### `GET /healthz`
+
+컨테이너 헬스체크용 엔드포인트.
+
+**Response** `200 OK`:
+
+```json
+{"status": "healthy"}
+```
+
+---
+
+### `WS /ws/dashboard`
+
+실시간 대시보드 WebSocket. 연결 즉시 현재 stats를 전송하고, 이후 detection 결과가 들어올 때마다 push합니다.
+
+**연결:** `ws://localhost:8003/ws/dashboard`
+
+**서버 → 클라이언트 메시지 종류:**
+
+#### 1) `inspection_result` — detection 수신 시마다
+
+```json
+{
+  "type": "inspection_result",
+  "data": {
+    "item_id": "snack-001",
+    "status": "pass",
+    "circularity": 0.8912,
+    "area": 16900.0,
+    "perimeter": 520.0,
+    "defect_score": 0.02,
+    "inference_latency_ms": 45.0,
+    "e2e_latency_ms": 82,
+    "container_id": "c3-inference-1",
+    "frame_id": 42,
+    "bbox": [100, 100, 230, 230],
+    "defect_type": null
+  }
+}
+```
+
+#### 2) `stats` — 통계 갱신 시 (연결 직후 + 매 detection 후)
+
+```json
+{
+  "type": "stats",
+  "data": { /* GET /api/stats 와 동일한 구조 */ }
+}
+```
+
+#### 3) `camera_frame` — 카메라 프레임 수신 시 (향후 구현)
+
+```json
+{
+  "type": "camera_frame",
+  "data": {
+    "frame": "data:image/jpeg;base64,...",
+    "image_url": "http://..."
+  }
+}
+```
+
+> `frame` (base64) 또는 `image_url` 중 하나. 현재는 프레임 수신 경로가 미정이므로 프론트엔드에 핸들러만 준비된 상태.
+
+---
 
 ## 아키텍처
 
 ```
 C3 Inference ──POST /results──▶ C4 Visualizer ──WebSocket──▶ Browser Dashboard
                                      │
-                                     ├── GET /           (메인 대시보드)
-                                     ├── GET /viewer     (불량 확인 뷰어)
-                                     ├── GET /api/stats  (통계 JSON)
+                                     ├── GET /              (메인 대시보드)
+                                     ├── GET /viewer        (불량 확인 뷰어)
+                                     ├── GET /api/stats     (통계 JSON)
                                      ├── GET /api/inspections (검사 이력)
-                                     ├── GET /api/defects    (불량 목록)
-                                     └── GET /healthz        (헬스체크)
+                                     ├── GET /api/defects   (불량 목록)
+                                     ├── GET /api/export/csv (CSV 다운로드)
+                                     └── GET /healthz       (헬스체크)
 ```
 
 ## 폴더 구조
@@ -71,12 +431,12 @@ services/c4-visualizer/
 ├── README.md               # 이 문서
 ├── src/
 │   ├── __init__.py
-│   ├── main.py             # FastAPI 앱, 엔드포인트, WebSocket 브로드캐스트
-│   ├── models.py           # DetectionResult Pydantic 모델
-│   └── store.py            # 인메모리 검사 결과 저장소 + 통계
+│   ├── main.py             # FastAPI 앱 (엔드포인트, WebSocket, 판정 로직)
+│   ├── models.py           # DetectionResult / Detection Pydantic 모델
+│   └── store.py            # 인메모리 저장소 (검사 이력, 통계, CSV export)
 └── static/
-    ├── index.html           # 메인 대시보드 UI
-    └── viewer.html          # 불량 상세 뷰어 UI
+    ├── index.html           # 메인 대시보드 UI (실시간 차트, bbox overlay, 검사 피드)
+    └── viewer.html          # 불량 상세 뷰어 UI (테이블, 상세 패널)
 ```
 
 ---
@@ -125,20 +485,19 @@ docker compose --profile scale-out up --build
 
 | URL | 설명 |
 |-----|------|
-| `http://localhost:8003/` | 메인 대시보드 — 실시간 검사 통계, 카메라 피드, 원형도 분포 차트 |
-| `http://localhost:8003/viewer` | 불량 확인 뷰어 — 불량 항목 테이블, 클릭 시 상세 패널 |
+| `http://localhost:8003/` | 메인 대시보드 — 실시간 검사 통계, 카메라 피드 + bbox overlay, 원형도 분포 차트 |
+| `http://localhost:8003/viewer` | 불량 확인 뷰어 — 불량 항목 테이블, 클릭 시 상세 패널 (원형도 게이지, 파이프라인 정보) |
 
-## API 엔드포인트
+### 메인 대시보드 구성요소
 
-| Method | Path | 설명 |
-|--------|------|------|
-| `POST` | `/results` | C3에서 detection 결과 수신 (DetectionResult JSON) |
-| `GET` | `/api/stats` | 현재 통계 (총 검사, 양품/불량, 불량률, FPS, latency) |
-| `GET` | `/api/inspections?limit=50` | 최근 검사 결과 목록 |
-| `GET` | `/api/defects?limit=50` | 불량 항목만 필터링 |
-| `GET` | `/api/export/csv` | 검사 결과 CSV 다운로드 |
-| `GET` | `/healthz` | 헬스체크 (`{"status": "healthy"}`) |
-| `WS` | `/ws/dashboard` | 실시간 WebSocket (inspection_result, stats, camera_frame 이벤트) |
+| 영역 | 표시 항목 |
+|------|-----------|
+| **상단 통계 카드 (5개)** | 총 검사, 양품, 불량, 불량률, Frame Drop |
+| **성능 카드 (4개)** | 처리 FPS, E2E P50/P95, Inference P50/P95, Network P50/P95 |
+| **카메라 피드** | 원본 이미지 + canvas bbox overlay (pass=녹색, fail=빨간색) |
+| **검사 결과 피드** | 최근 60건 실시간 스크롤 목록 (아이템 ID, 원형도, latency) |
+| **양품률 도넛 차트** | SVG 기반 pass/fail 비율 시각화 |
+| **원형도 분포 차트** | 20구간 히스토그램 + 0.85 임계선 |
 
 ---
 
@@ -202,29 +561,41 @@ curl -X POST http://localhost:8003/results \
   }'
 ```
 
+### Frame Drop 테스트 (frame 3~4 건너뛰기)
+
+```bash
+curl -X POST http://localhost:8003/results \
+  -H "Content-Type: application/json" \
+  -d '{
+    "schema_version": "1.0.0",
+    "trace_id": "test-trace-003",
+    "session_id": "test-session",
+    "frame_id": 5,
+    "captured_at_ms": 1730000002000,
+    "inference_container_id": "c3-inference-1",
+    "inference_started_at_ms": 1730000002050,
+    "inference_finished_at_ms": 1730000002110,
+    "inference_latency_ms": 60.0,
+    "detections": [
+      {
+        "object_id": "snack-003",
+        "bbox": [150, 150, 280, 280],
+        "status": "normal",
+        "defect_type": null,
+        "defect_score": 0.01,
+        "mask": null
+      }
+    ]
+  }'
+```
+
+> frame_id를 2 → 5로 보내면 서버 로그에 `WARNING: frame drop detected: 2 frames missing (frame 2 → 5)` 출력, 대시보드 Frame Drop 카드에 2 표시.
+
 > **Windows PowerShell**에서는 `curl` 대신 아래처럼 사용:
 > ```powershell
 > Invoke-RestMethod -Uri http://localhost:8003/results -Method Post -ContentType "application/json" -Body '{ ... }'
 > ```
 > 또는 Git Bash에서 위의 curl 명령을 그대로 사용할 수 있습니다.
-
----
-
-## 핵심 로직: 원형도(Circularity) 판정
-
-과자의 양품/불량은 **원형도** 기준으로 판정합니다:
-
-```
-Circularity = 4π × Area / Perimeter²
-```
-
-- **Circularity >= 0.85** → 양품 (pass)
-- **Circularity < 0.85** → 불량 (fail)
-
-> 정사각형 bbox: Area=10000, Perimeter=400 → Circularity ≈ 0.785 (불량)
-> 정원에 가까운 형태일수록 1.0에 가까워짐
-
-임계값은 `main.py`의 `CIRCULARITY_THRESHOLD = 0.85`에서 변경 가능.
 
 ---
 
@@ -235,8 +606,6 @@ Circularity = 4π × Area / Perimeter²
 | `C4_PORT` | `8003` | 호스트에 노출할 포트 (docker-compose) |
 | `SERVICE_NAME` | `c4-visualizer` | 서비스 식별 이름 |
 
----
-
 ## 컨테이너 상세
 
 | 항목 | 값 |
@@ -245,7 +614,8 @@ Circularity = 4π × Area / Perimeter²
 | Working dir | `/app` |
 | Exposed port | `8003` |
 | Entrypoint | `uvicorn src.main:app --host 0.0.0.0 --port 8003` |
-| Healthcheck | `GET /healthz` (10초 간격) |
+| Healthcheck | `GET /healthz` (10초 간격, 3초 timeout, 3회 retry) |
+| Max records | 500건 (인메모리, 컨테이너 재시작 시 초기화) |
 
 ---
 
@@ -271,3 +641,6 @@ uvicorn src.main:app --host 0.0.0.0 --port 8003 --reload
 | curl 후 대시보드에 안 뜸 | 브라우저 탭이 WS 연결 전 | 브라우저를 먼저 열고 WS 연결(연결됨) 확인 후 curl |
 | `docker compose up` 에러 | Docker Desktop 미실행 | Docker Desktop 실행 후 재시도 |
 | port 8003 already in use | 다른 프로세스가 포트 사용 중 | `.env`에서 `C4_PORT=8004` 등으로 변경 |
+| Frame Drop 카드가 빨간색 | 프레임이 순서 없이 도착하거나 누락 | C1~C3 파이프라인 상태 확인, 네트워크 지연 점검 |
+| CSV 다운로드가 빈 파일 | 아직 detection 결과가 없음 | curl로 테스트 데이터를 먼저 전송 |
+| bbox overlay가 안 보임 | 카메라 이미지 없이 좌표만 수신 | Open Issue #1 — 프레임 수신 경로 구현 후 표시 |
