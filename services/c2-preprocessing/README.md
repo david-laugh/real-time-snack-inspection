@@ -40,6 +40,11 @@ Header 전파: `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`
 
 `prompts[].bbox`는 **전처리(리사이즈) 후 이미지 기준 `[x1, y1, x2, y2]` pixel**이다.
 
+**동시 처리:** 요청 본문 수신과 `/infer` 전달(I/O)만 이벤트 루프에서 한다. JSON 파싱부터 직렬화까지의 CPU 작업은
+`process_request()` 하나로 묶어 스레드풀에서 실행한다. OpenCV는 GIL을 풀고 실행되므로 동시 요청이 병렬로 처리된다.
+세션별 지름 EMA는 lock으로 보호한다. 이 상태는 프로세스 메모리에 있으므로 uvicorn worker를 늘리지 않는다(worker마다 상태가 갈라진다).
+서버가 시작될 때(lifespan) 1080×1920 더미 프레임으로 파이프라인을 한 번 돌려 워밍업한다.
+
 ## 설정 (환경변수, `C2_` 접두어)
 | 변수 | 기본값 | 설명 |
 |---|---|---|
@@ -122,6 +127,7 @@ docker run --rm -v "$PWD:/repo:ro" -w /repo/services/c2-preprocessing \
 | `test_preprocess_api.py` | `/infer` mock. 전송 메시지의 스키마 통과, 공통 필드·헤더 전파, 오류 코드 |
 | `test_latency.py` | 프레임당 처리 시간 (목표 < 33 ms) |
 | `test_phone_frames.py` | 폰 촬영 프레임 5장의 기대 개수와 위치 (원본, 1024 리사이즈, 576/720px 저해상도 입력) |
+| `test_concurrency.py` | 처리 중에도 이벤트 루프 응답, 동시 요청 병렬 처리, EMA 스레드 안전성, 워밍업 |
 | `test_fake_infer.py` | 가짜 `/infer` 검증 동작, C2 → 가짜 `/infer` 연결 |
 | `test_schema_sync.py` | `schemas/` 사본이 `shared/schemas` 원본과 같은지 |
 
