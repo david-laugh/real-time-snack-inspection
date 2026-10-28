@@ -15,6 +15,8 @@ python src/c1_gateway.py serve --transport mqtt               # C1: localhost:18
 python src/c1_gateway.py loadgen --fps 30 --duration 20 --reset
 ```
 
+`loadgen`은 입력(합성 프레임, 이미지 폴더, 영상 파일)을 기본값으로 **폭 960px, JPEG 품질 70**으로 다시 인코딩해서 보낸다. 폰 `/cam`의 기본값(해상도 960, 화질 보통 0.7)과 맞춰 둔 것이므로, 폰 측정과 처리량을 비교할 때는 두 설정을 같게 유지한다. 바꾸려면 `--width`, `--quality`를 쓴다. 이미지 폴더나 영상을 쓰려면 `--source <폴더|파일>`(영상은 opencv 필요)을 지정한다.
+
 `serve`만 실행하면(전송 방식 지정 없음) 에코 모드로 수신만 한다. HTTP로 돌리려면 `stub --transport http --port 8001`과 `serve --downstream http://localhost:8001/preprocess`를 쓴다.
 
 Compose에서는 `C1_TRANSPORT=mqtt`, `MQTT_HOST=mqtt-broker`로 뜬다. 상태 페이지는 `http://<host>:8000/`, 폰 카메라 페이지는 `/cam`이다. 상태 페이지 상단에 MQTT 연결 여부가 표시된다.
@@ -31,7 +33,7 @@ Compose에서는 `C1_TRANSPORT=mqtt`, `MQTT_HOST=mqtt-broker`로 뜬다. 상태 
 
 **C1 → C2 (HTTP, 예비)** `C1_TRANSPORT=http`이면 `POST {C1_DOWNSTREAM}`으로 같은 JSON을 보내고 헤더 `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`를 붙인다. 2xx 응답이 ack 역할을 한다.
 
-**ID 규칙** `trace_id`는 프레임마다 UUID v4(hex), `session_id`는 WebSocket 연결 단위, `frame_id`는 세션 안에서 0부터 단조 증가하는 정수다.
+**ID 규칙** `trace_id`는 프레임마다 UUID v4(hex), `session_id`는 WebSocket 연결 단위, `frame_id`는 세션 안에서 0부터 단조 증가하는 정수다. 클라이언트가 이미 쓴 `session_id`로 다시 접속하면(폰 재접속 등) C1은 `원래id-xxxx` 형태의 새 `session_id`를 발급하고 `hello` 메시지로 알려준다. 그래서 같은 `session_id` 안에서 `frame_id`가 0으로 되돌아가는 일은 없다.
 
 **기타** `GET /healthz`(전송 방식, MQTT 연결 여부), `GET /api/metrics`(입력/전달 FPS, C1 drop, C1 대기·C2 ack p50/p95, MQTT 상태), `POST /api/metrics/reset`, 상태 페이지 `GET /`, 카메라 페이지 `GET /cam`.
 
