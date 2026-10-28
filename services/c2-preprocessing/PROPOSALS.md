@@ -5,13 +5,14 @@ C2(Member B)가 직접 수정할 수 없는 파일(`shared/schemas/`, `docker-co
 
 | # | 대상 | 요약 | 관련 | 상태 |
 |---|---|---|---|---|
-| P1 | `processed-frame`, `detection-result` | `scale`, `crop_offset` 필드 추가 | C3(C), C4(D) | 제안 |
+| P1 | `processed-frame`, `detection-result` | `scale`, `crop_offset` 필드 추가 | C3(C), C4(D) | **불필요** (C4가 C2 리사이즈 이미지 위에 그림) |
 | P2 | `processed-frame` | `expected_diameter_px` 필드 추가 | C3(C) | 제안 |
 | P3 | C1↔C2↔C3 전달 방식 | 동기 HTTP 때문에 C3 동시 처리가 C1_MAX_INFLIGHT로 제한됨 | C1(A), C3(C) | **해결됨** (MQTT 전환) |
 | P4 | `docker-compose.yml` | c2 `command` 교체 / healthcheck | A | 제안 |
 | P5 | `.env.example` | `C2_RESIZE_WIDTH/HEIGHT` → `C2_RESIZE_LONG_SIDE` 등 | A | 제안 |
 | P6 | 스키마 공유 방식 | 서비스 이미지 안에서 `shared/schemas` 접근 | A | 제안 |
-| P7 | C1 `/cam` 기본 해상도 | 640 → 960 (또는 1280) | A, C | 제안 |
+| P7 | C1 `/cam` 기본 해상도 | 640 → 960 (또는 1280) | A, C | **반영됨** (C1 기본 960) |
+| P8 | `docs/api-contract.md` (+ 스키마) | C2 → C4 리사이즈 프레임 구간 추가 | A, D | 제안 |
 
 ## 확정된 사항
 
@@ -19,6 +20,7 @@ C2(Member B)가 직접 수정할 수 없는 파일(`shared/schemas/`, `docker-co
 |---|---|---|
 | 프레임 이미지 전송 방식 | **frame-envelope JSON 안의 `image_b64`(base64 JPEG)** + 헤더 `X-Trace-Id` / `X-Frame-Id` / `X-Session-Id` | C1 PR #1(`feature/c1-gateway`)이 이 방식으로 구현했다. C2는 같은 방식으로 받고(`codec.decode_frame`), C3로도 같은 방식으로 보낸다(`processed-frame.image_b64`, JPEG q90) |
 | C1 → C2 전송 프로토콜 | **MQTT** (`mqtt-broker:1883`, 토픽 `psf/v1/frames/+`, QoS 0). 본문은 기존과 같은 frame-envelope JSON(`image_b64` JPEG) | 팀 결정. C2 → C3는 HTTP `/infer` 유지. P3 참고 |
+| C2 → C4 리사이즈 프레임 전송 | `POST http://c4-visualizer:8003/api/camera/frame`, body `{trace_id, session_id, frame_id, width, height, prompts, image_b64}` | C4(Member D)와 합의. C4는 trace_id로 이 이미지와 C3 결과를 짝지어 그린다. P1, P8 참고 |
 
 - 스키마의 `image_b64` 설명에 있는 "TODO: transport is not decided" 문구는 owner가 정리해 주길 요청한다 (`shared/schemas/` 소유자).
 - `raw_bgr` / `raw_rgb`는 현재 보내는 쪽이 없으므로 C2는 계속 422로 거절한다. 필요해지면 `codec.py`에 추가한다.
@@ -26,38 +28,20 @@ C2(Member B)가 직접 수정할 수 없는 파일(`shared/schemas/`, `docker-co
 
 ---
 
-## P1. `scale` / `crop_offset` 필드 추가 (processed-frame, detection-result)
+## P1. `scale` / `crop_offset` 필드 추가 — ⛔ 불필요 (C4가 C2 리사이즈 이미지 위에 그림)
 
-### 문제
-C2는 긴 변 기준으로 리사이즈하고(기본 1024px), 앞으로 ROI crop도 할 수 있다. 그런데 `prompts[].bbox`와 C3의
-`detections[].bbox`/`mask`는 **전처리 후 이미지** 좌표다. 현재 스키마에는 전처리 후 좌표를 원본 좌표로 되돌릴 정보가 없다.
+### 원래 제안 (기록)
+C2가 리사이즈(긴 변 1024)와 ROI crop을 하면 C3 결과 좌표가 전처리 후 이미지 기준이 된다. C4가 **원본 프레임** 위에 그리려면
+좌표를 되돌릴 정보가 필요하다. 그래서 `processed-frame`과 `detection-result`에 `scale`, `crop_offset`을 추가하자고 제안했다.
 
-- C4가 **원본 프레임** 위에 mask/bbox를 그리면 좌표가 어긋난다. 예를 들어 1920×1080 원본을 1024×576으로 줄이면
-  배율이 0.533이라, 보정하지 않으면 overlay가 왼쪽 위로 쏠려 약 절반 크기로 그려진다.
-- 해상도는 세션(기기)마다 다르고 설정(`C2_RESIZE_LONG_SIDE`)으로도 바뀌므로 C4에 하드코딩할 수 없다.
-- `source_width/height`는 frame-envelope에만 있고 detection-result까지 전파되지 않는다. 배율을 다시 계산하는 것도 불가능하다.
-- ROI crop을 도입하면 평행 이동(offset)이 생기는데, 이것은 width/height만으로는 복원할 수 없다.
+### 결론
+C4(Member D)와 합의해 **C2가 리사이즈한 이미지와 prompts를 C4로 직접 보낸다** (`POST /api/camera/frame`, P8).
+C4는 `trace_id`로 이 이미지와 C3 결과(bbox, mask)를 짝지어 그린다. C3 결과는 C2가 리사이즈한 이미지 기준 좌표이므로
+**C4에서 좌표를 변환할 필요가 없고**, `scale` / `crop_offset` 필드도 필요 없다.
 
-### 제안
-`processed-frame`과 `detection-result`에 선택(optional) 필드를 추가하고, C3는 받은 값을 그대로 전파한다.
-
-```jsonc
-"scale": {
-  "type": "number", "exclusiveMinimum": 0,
-  "description": "preprocessed = (source - crop_offset) * scale. Uniform scale factor applied by C2."
-},
-"crop_offset": {
-  "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2,
-  "description": "[x, y] of the crop origin in source pixel coordinates. [0, 0] when not cropped."
-}
-```
-
-원본 좌표 복원: `x_src = x / scale + crop_offset[0]`, `y_src = y / scale + crop_offset[1]`
-
-- 비율을 유지하는 리사이즈라 배율은 스칼라 하나면 된다. 축마다 다른 배율이 필요해지면 `[sx, sy]`로 확장한다.
-- optional로 추가하므로 1.0.0 consumer와 호환된다 → `schema_version` 1.1.0(minor).
-- C2는 이미 내부에서 배율을 계산한다(`pipeline.Detection.scale`). 스키마에 반영되면 바로 넣는다.
-- **C2는 이 필드가 승인될 때까지 ROI를 crop하지 않고 경계 판정에만 쓴다.** (팀 합의 사항)
+- C3로 보낸 이미지와 C4로 보낸 이미지는 같은 JPEG 바이트다. 좌표계가 정확히 일치한다.
+- 나중에 C2가 ROI **crop**을 도입해도, C4로 보내는 이미지가 crop된 이미지 자체라면 계속 필요 없다.
+  원본 해상도로 overlay해야 하는 요구가 새로 생기면 그때 다시 검토한다.
 
 ---
 
@@ -164,7 +148,7 @@ compose의 build context가 `./services/c2-preprocessing`라서 이미지에 `sh
 
 ---
 
-## P7. C1 `/cam` 기본 해상도 640 → 960 또는 1280 (Member A, C)
+## P7. C1 `/cam` 기본 해상도 640 → 960 또는 1280 (Member A, C) — ✅ 반영됨 (C1 `/cam` 기본 960)
 
 ### 문제
 C1의 `/cam` 페이지는 해상도 기본값이 640px이다. 폰을 **가로**로 촬영하면 긴 변 1920이 640으로 줄어(1/3)
@@ -191,3 +175,38 @@ C1의 `/cam` 페이지는 해상도 기본값이 640px이다. 폰을 **가로**�
 - 세로 촬영이면 해상도 값이 폭이라 긴 변이 더 길어진다. 960 폭이면 긴 변 약 1707이 되고, C2가 1024로 줄여 폭 576(쿠키 약 90 px)이 된다.
 - 대역·지연 부담은 업링크 JPEG 크기에 비례한다. 960 기준으로 측정하고, 30fps가 유지되지 않으면 화질(q)을 먼저 낮추는 것을 권장한다.
 - 최종 값은 C3의 판정 정확도 실험(지름별 원형도 분포)을 보고 C와 함께 정한다.
+
+---
+
+## P8. `docs/api-contract.md`에 C2 → C4 구간 추가 (Member A, D)
+
+C2 → C4 리사이즈 프레임 전송이 C4와 합의되어 구현됐다(`src/c2/c4_frames.py`). 하지만 API 계약 문서의 메시지 흐름에는
+C3 → C4(detection-result)만 있다. 문서와 스키마 owner가 다음을 추가해 주길 제안한다. C2는 문서를 직접 수정하지 않는다.
+
+**메시지 흐름 표에 행 추가**
+
+| # | Producer → Consumer | Endpoint | Schema |
+|---|---|---|---|
+| 2b | C2 → C4 | `POST http://c4-visualizer:8003/api/camera/frame` | `camera-frame` (신규) |
+
+**camera-frame (C2 → C4)**: C3로 보내는 processed-frame의 일부. 필드를 추가하거나 빼지 않는다.
+
+| Field | Type | 설명 |
+|---|---|---|
+| `trace_id` | string | processed-frame과 같음. C4는 이 값으로 C3 결과와 짝을 짓는다 |
+| `session_id` | string | 〃 |
+| `frame_id` | integer | 〃 |
+| `width` / `height` | integer | 리사이즈된 이미지 크기 (= C3 결과 좌표계) |
+| `prompts` | prompt[] | processed-frame의 prompts 그대로. 0개여도 보낸다 |
+| `image_b64` | string | processed-frame과 **같은 JPEG** (재인코딩 없음) |
+
+동작 규약 (C2 구현 기준)
+- C3로 보내는 프레임만 보낸다. C2에서 drop된 프레임(`dropped_stale` / `dropped_old`)은 보내지 않는다.
+- C3 전송과 동시에 보내고 응답을 기다리지 않는다. 대개 이미지가 C3 결과보다 먼저 도착하지만 **순서는 보장하지 않는다.**
+  C4는 이미지와 결과 중 어느 쪽이 먼저 와도 `trace_id`로 짝지을 수 있도록 짧게 버퍼링하는 것을 권장한다.
+- best-effort다. C4가 느리거나 꺼져 있으면 C2는 보내지 않거나(`c4_skipped`, 동시 전송 한도 `C2_C4_MAX_INFLIGHT` 초과)
+  실패로 기록(`c4_error`)할 뿐 재시도하지 않는다. 따라서 C4에는 C3 결과는 있는데 이미지가 없는 프레임이 생길 수 있다.
+- 헤더 `X-Trace-Id` / `X-Frame-Id` / `X-Session-Id`를 함께 보낸다(본문 필드와 같은 값).
+
+`shared/schemas/camera-frame.schema.json`도 만들기를 제안한다(`additionalProperties: false`, prompt는 processed-frame의 `$defs/prompt` 재사용).
+그러면 C4가 입력을 검증할 수 있고, C2 테스트도 가짜 C4(`dev/fake_c4.py`) 대신 스키마로 검증할 수 있다.

@@ -1,4 +1,4 @@
-# 로컬 통합 테스트용 compose override 예시: dev/publish_frames.py -> c2-dev-broker -> C2 -> fake /infer
+# 로컬 통합 테스트용 compose override 예시: dev/publish_frames.py -> c2-dev-broker -> C2 -> fake /infer (+ fake C4)
 # C1·C3 없이 C2 MQTT 경로만 확인한다. 실제 compose 변경은 C1 담당(Member A)이 한다.
 #
 # 브로커는 base의 mqtt-broker(C1 PR #5, 호스트 1883)와 겹치지 않도록 별도 서비스 c2-dev-broker(호스트 11883)를 쓴다.
@@ -6,7 +6,7 @@
 #
 # repo root에서:
 #   docker compose -f docker-compose.yml -f services/c2-preprocessing/dev/docker-compose.override.yml \
-#     up -d --no-deps c2-dev-broker fake-infer c2-preprocessing
+#     up -d --no-deps c2-dev-broker fake-infer fake-c4 c2-preprocessing
 #   curl localhost:8001/healthz                                   # mqtt.connected: true
 #   python services/c2-preprocessing/dev/publish_frames.py --fps 30 --seconds 5   # localhost:11883
 #   curl localhost:8001/stats
@@ -14,7 +14,7 @@
 #
 # 정리:
 #   docker compose -f docker-compose.yml -f services/c2-preprocessing/dev/docker-compose.override.yml \
-#     rm -sf c2-dev-broker fake-infer c2-preprocessing
+#     rm -sf c2-dev-broker fake-infer fake-c4 c2-preprocessing
 
 services:
   c2-dev-broker:
@@ -34,6 +34,14 @@ services:
     networks:
       - smart-factory-net
 
+  fake-c4:
+    image: pocket-smart-factory/c2-preprocessing:dev
+    command: ["python", "dev/fake_c4.py", "--port", "8003"]
+    volumes:
+      - ./services/c2-preprocessing/dev:/app/dev:ro
+    networks:
+      - smart-factory-net
+
   c2-preprocessing:
     # 이미지 CMD(uvicorn)를 쓰도록 base의 `sleep infinity`를 덮어쓴다
     command: ["uvicorn", "c2.app:app", "--app-dir", "src", "--host", "0.0.0.0", "--port", "8001"]
@@ -41,6 +49,7 @@ services:
       C2_MQTT_HOST: c2-dev-broker        # .env의 공용 MQTT_HOST(mqtt-broker)보다 우선
       C2_MQTT_PORT: "1883"
       C2_INFER_URL: http://fake-infer:8080/infer      # 실제 구성: http://nginx-inference-lb:8080/infer
+      C2_C4_FRAME_URL: http://fake-c4:8003/api/camera/frame   # 실제 구성: 기본값(c4-visualizer). 끄려면 빈 값
       C2_EVENT_LOG: /app/results/c2_events.csv
     volumes:
       - ./benchmark/results:/app/results

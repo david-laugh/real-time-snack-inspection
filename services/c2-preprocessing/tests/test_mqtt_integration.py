@@ -29,6 +29,7 @@ from helpers import load_fixture
 
 DEV = Path(__file__).resolve().parents[1] / "dev"
 sys.path.insert(0, str(DEV))
+from fake_c4 import create_app as create_fake_c4  # noqa: E402
 from fake_infer import create_app as create_fake  # noqa: E402
 
 MOSQUITTO_IMAGE = "eclipse-mosquitto:2.0.20"
@@ -124,9 +125,9 @@ async def wait_for(cond, timeout=10.0, interval=0.05):
     return False
 
 
-async def run_c2(broker, settings_kw, fake_delay_ms, scenario):
-    """C2(lifespan 포함) + 가짜 /infer를 같은 이벤트 루프에서 띄우고 scenario(c2, fake)를 실행."""
-    fake = create_fake(fake_delay_ms)
+async def run_c2(broker, settings_kw, fake_delay_ms, scenario, fake=None, c4_app=None):
+    """C2(lifespan 포함) + 가짜 /infer(+ 가짜 C4)를 같은 이벤트 루프에서 띄우고 scenario(c2, fake)를 실행."""
+    fake = fake or create_fake(fake_delay_ms)
     prefix = f"psf/test-{uuid.uuid4().hex[:8]}/frames"
     host, port = broker
     kw = dict(mqtt_enabled=True, mqtt_host=host, mqtt_port=port, mqtt_topic=f"{prefix}/+",
@@ -134,7 +135,11 @@ async def run_c2(broker, settings_kw, fake_delay_ms, scenario):
     kw.update(settings_kw)
     if "mqtt_proxy" in kw:                          # 재접속 테스트: C2는 프록시로 접속
         kw["mqtt_host"], kw["mqtt_port"] = kw.pop("mqtt_proxy")
-    app = create_app(Settings(**kw), transport=httpx.ASGITransport(app=fake))
+    c4_transport = None
+    if c4_app is not None:
+        kw.setdefault("c4_frame_url", "http://fake-c4/api/camera/frame")
+        c4_transport = httpx.ASGITransport(app=c4_app)
+    app = create_app(Settings(**kw), transport=httpx.ASGITransport(app=fake), c4_transport=c4_transport)
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://c2") as c2, \
                 httpx.AsyncClient(transport=httpx.ASGITransport(app=fake), base_url="http://fake") as fk:
@@ -300,3 +305,37 @@ def test_refuses_host_default_broker_port(host):
         Publisher(host, 1883)
     assert_not_host_default_broker(host, 11883)              # 전용 포트는 허용
     assert_not_host_default_broker("mqtt-test-broker", 1883)  # 컨테이너 네트워크 안의 브로커는 허용
+
+
+def test_c4_receives_only_frames_forwarded_to_c3(broker, frame_b64):
+    """30fps + /infer 200ms: drop된 프레임(dropped_stale/old)은 C4로 가지 않고, C3로 간 프레임만 C4로 간다."""
+    n, fps = 60, 30
+    fake, fake_c4 = create_fake(200), create_fake_c4()
+
+    async def scenario(c2, _fake, prefix):
+        pub = Publisher(*broker)
+        try:
+            t0 = time.monotonic()
+            for i in range(n):
+                await asyncio.sleep(max(0.0, t0 + i / fps - time.monotonic()))
+                pub.publish(f"{prefix}/cam", envelope(frame_b64, "cam", i))
+
+            async def drained():
+                s = (await c2.get("/stats")).json()
+                return (s["mqtt"]["received"] == n and s["inflight"] == 0 and s["pending_sessions"] == 0
+                        and s["c4_inflight"] == 0)
+            assert await wait_for(drained), (await c2.get("/stats")).json()
+        finally:
+            pub.close()
+        return (await c2.get("/stats")).json()
+
+    stats = asyncio.run(run_c2(broker, {"c4_max_inflight": 4}, 0, scenario, fake=fake, c4_app=fake_c4))
+    ev = stats["events"]
+    c3_ids, c4_ids = set(fake.state.trace_ids), set(fake_c4.state.frames)
+    print(f"\n[C4 via MQTT] events={ev} c4_sent={stats['c4_sent']} c4_skipped={stats['c4_skipped']} "
+          f"c4_error={stats['c4_error']}")
+    assert ev["dropped_stale"] > 0 and len(c3_ids) == ev["forwarded"] < n
+    assert c4_ids <= c3_ids                                        # drop된 프레임은 C4로 가지 않음
+    assert stats["c4_sent"] == len(c4_ids) > 0
+    assert stats["c4_sent"] + stats["c4_skipped"] + stats["c4_error"] == ev["forwarded"]
+    assert "c4_error" not in ev                                    # 프레임 이벤트 집계와 분리
