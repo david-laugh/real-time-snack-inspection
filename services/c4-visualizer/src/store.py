@@ -7,7 +7,7 @@ import csv
 import io
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -15,8 +15,10 @@ class InspectionRecord:
     item_id: str
     trace_id: str
     frame_id: int
-    status: str             # pass | fail
-    circularity: float
+    status: str             # normal | defect | unknown
+    session_id: str = ""
+    defect_type: str | None = None
+    circularity: float | None = None
     area: float | None = None
     perimeter: float | None = None
     defect_score: float = 0.0
@@ -30,13 +32,19 @@ class InspectionStore:
         self._records: deque[InspectionRecord] = deque(maxlen=max_records)
         self._total = 0
         self._fail_count = 0
+        self._pass_count = 0
+        self._unknown_count = 0
 
     def add(self, rec: InspectionRecord):
         rec.timestamp = time.time()
         self._records.appendleft(rec)
         self._total += 1
-        if rec.status == "fail":
+        if rec.status == "defect":
             self._fail_count += 1
+        elif rec.status == "normal":
+            self._pass_count += 1
+        else:
+            self._unknown_count += 1
 
     def get_recent(self, limit: int = 50) -> list[dict]:
         out = []
@@ -46,7 +54,9 @@ class InspectionStore:
                 "trace_id": r.trace_id,
                 "frame_id": r.frame_id,
                 "status": r.status,
-                "circularity": round(r.circularity, 4),
+                "session_id": r.session_id,
+                "defect_type": r.defect_type,
+                "circularity": None,
                 "area": r.area,
                 "perimeter": r.perimeter,
                 "defect_score": round(r.defect_score, 4),
@@ -57,12 +67,12 @@ class InspectionStore:
         return out
 
     def get_defects(self, limit: int = 50) -> list[dict]:
-        return [r for r in self.get_recent(limit * 3) if r["status"] == "fail"][:limit]
+        return [r for r in self.get_recent(limit * 3) if r["status"] == "defect"][:limit]
 
     def export_csv(self) -> str:
         buf = io.StringIO()
         fields = [
-            "item_id", "trace_id", "frame_id", "status", "circularity",
+            "item_id", "trace_id", "frame_id", "status", "session_id", "defect_type", "circularity",
             "area", "perimeter", "defect_score", "inference_latency_ms",
             "container_id", "timestamp",
         ]
@@ -74,7 +84,9 @@ class InspectionStore:
                 "trace_id": r.trace_id,
                 "frame_id": r.frame_id,
                 "status": r.status,
-                "circularity": round(r.circularity, 4),
+                "session_id": r.session_id,
+                "defect_type": r.defect_type,
+                "circularity": None,
                 "area": r.area,
                 "perimeter": r.perimeter,
                 "defect_score": round(r.defect_score, 4),
@@ -85,12 +97,13 @@ class InspectionStore:
         return buf.getvalue()
 
     def get_stats(self) -> dict:
-        pass_count = self._total - self._fail_count
+        pass_count = self._pass_count
         defect_rate = round(self._fail_count / self._total * 100, 1) if self._total > 0 else 0.0
 
         return {
             "total": self._total,
             "pass_count": pass_count,
+            "unknown_count": self._unknown_count,
             "fail_count": self._fail_count,
             "defect_rate": defect_rate,
         }

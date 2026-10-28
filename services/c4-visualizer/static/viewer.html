@@ -127,7 +127,7 @@ tr.selected td { background: rgba(108,92,231,.1); }
         <tr>
           <th>Object ID</th>
           <th>상태</th>
-          <th>원형도</th>
+          <th>불량 유형</th>
           <th>Defect Score</th>
         </tr>
       </thead>
@@ -174,12 +174,11 @@ function render() {
   empty.style.display = 'none';
 
   tbody.innerHTML = allData.map((d, i) => {
-    const ok = d.status === 'pass';
-    const circ = d.circularity != null ? d.circularity.toFixed(3) : '-';
+    const ok = d.status === 'normal';
     return `<tr class="${i === selectedIdx ? 'selected' : ''}" onclick="showDetail(${i})">
       <td>${d.item_id}</td>
-      <td><span class="status-badge ${ok ? 'sb-pass' : 'sb-fail'}">${ok ? '정상' : '불량'}</span></td>
-      <td><span class="circ-val ${d.circularity >= 0.85 ? 'high' : 'low'}">${circ}</span></td>
+      <td><span class="status-badge ${ok ? 'sb-pass' : d.status === 'defect' ? 'sb-fail' : ''}">${ok ? '정상' : d.status === 'defect' ? '불량' : '판정 보류'}</span></td>
+      <td>${d.defect_type || '—'}</td>
       <td>${d.defect_score != null ? (d.defect_score * 100).toFixed(1) + '%' : '-'}</td>
     </tr>`;
   }).join('');
@@ -191,18 +190,14 @@ function showDetail(idx) {
   const d = allData[idx];
   if (!d) return;
 
-  const ok = d.status === 'pass';
-  const circ = d.circularity != null ? d.circularity : 0;
-  const circPct = Math.min(100, Math.round(circ * 100));
-  const fillColor = circ >= 0.85 ? 'var(--pass)' : 'var(--fail)';
-
+  const ok = d.status === 'normal';
   document.getElementById('detailBody').innerHTML = `
     <h2>${d.item_id}</h2>
 
     <div class="detail-grid">
       <div class="detail-field">
         <div class="fl">상태</div>
-        <div class="fv ${ok ? 'pass' : 'fail'}">${ok ? '✅ 정상' : '❌ 불량'}</div>
+        <div class="fv ${ok ? 'pass' : d.status === 'defect' ? 'fail' : ''}">${ok ? '✅ 정상' : d.status === 'defect' ? '❌ 불량' : '◌ 판정 보류'}</div>
       </div>
       <div class="detail-field">
         <div class="fl">Defect Score</div>
@@ -210,15 +205,7 @@ function showDetail(idx) {
       </div>
     </div>
 
-    <div class="circ-gauge">
-      <div style="font-size:12px; color:var(--text2); margin-bottom:2px;">원형도 (Circularity)</div>
-      <div style="font-size:28px; font-weight:700; color:${fillColor};">${circ.toFixed(3)}</div>
-      <div class="gauge-bar-wrap">
-        <div class="gauge-fill" style="width:${circPct}%; background:${fillColor};"></div>
-        <div class="gauge-marker" style="left:85%;"></div>
-      </div>
-      <div class="gauge-labels"><span>0.0</span><span style="color:var(--fail);">← 0.85 기준</span><span>1.0</span></div>
-    </div>
+    <div class="detail-field"><div class="fl">불량 유형</div><div class="fv">${d.defect_type || '—'}</div></div>
 
     <div style="font-size:12px; color:var(--text2); margin: 16px 0 8px;">파이프라인 정보</div>
     <div class="detail-grid">

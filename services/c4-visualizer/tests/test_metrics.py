@@ -89,3 +89,37 @@ class MetricsTests(unittest.TestCase):
             gateway_received_at_ms=1010, preprocess_started_at_ms=1020,
             preprocess_finished_at_ms=1030))
         self.assertIsNone(m.get_stats()['latency']['c1_c2']['p50_ms'])
+
+    def test_breakdown_precedes_camera_fallback_including_null(self):
+        m = PipelineMetrics()
+        m.record(result(latency_breakdown_ms={'preprocess': 7, 'c2_to_c3': None,
+                                             'c3_service': 20, 'c3_queue': None}), 1120)
+        m.record_camera(SimpleNamespace(session_id='s', trace_id='t1', frame_id=1,
+            gateway_received_at_ms=1010, preprocess_started_at_ms=1020,
+            preprocess_finished_at_ms=1030))
+        latency = m.get_stats()['latency']
+        self.assertEqual(latency['preprocess']['p50_ms'], 7)
+        self.assertIsNone(latency['c2_c3']['p50_ms'])
+        self.assertEqual(latency['c3_service']['p50_ms'], 20)
+
+    def test_drop_window_deltas_and_restart(self):
+        m = PipelineMetrics()
+        def update(received, forwarded, errors, results):
+            m.update_c1({'counters': {'received':received, 'dropped':0}})
+            m.update_c2({'events': {'dropped_stale':0,'dropped_old':0,
+                                    'forwarded':forwarded,'error':errors,'timeout':0}})
+            m.received_frames = results
+        with patch('src.metrics.time.monotonic', return_value=0):
+            update(100,80,10,80)
+            m.sample_drop_window()
+        with patch('src.metrics.time.monotonic', return_value=6):
+            update(120,98,12,97)
+            m.sample_drop_window()
+        window = m.get_stats()['drop_window']
+        self.assertEqual(window['c2_error_pct'], 10)
+        self.assertEqual(window['result_gap_estimate'], 1)
+        self.assertEqual(window['overall_loss_pct_estimate'], 15)
+        with patch('src.metrics.time.monotonic', return_value=12):
+            update(0,0,0,97)
+            m.sample_drop_window()
+        self.assertIsNone(m.get_stats()['drop_window'])

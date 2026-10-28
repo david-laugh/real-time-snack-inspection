@@ -9,7 +9,6 @@ from contextlib import asynccontextmanager, suppress
 from urllib.request import urlopen
 
 import json
-import math
 import logging
 from pathlib import Path
 
@@ -19,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from src.models import CameraFrame, DetectionResult
 from src.metrics import PipelineMetrics
-from src.config import C2_STATS_URL, C2_STATS_TIMEOUT_S, C2_STATS_INTERVAL_S
+from src.config import C2_STATS_URL, C2_STATS_TIMEOUT_S, C2_STATS_INTERVAL_S, C1_METRICS_URL
 from src.store import InspectionStore, InspectionRecord
 
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +29,11 @@ metrics = PipelineMetrics()
 
 def fetch_c2_stats():
     with urlopen(C2_STATS_URL, timeout=C2_STATS_TIMEOUT_S) as response:
+        return json.load(response)
+
+
+def fetch_c1_metrics():
+    with urlopen(C1_METRICS_URL, timeout=C2_STATS_TIMEOUT_S) as response:
         return json.load(response)
 
 
@@ -44,6 +48,12 @@ async def poll_metrics():
                 metrics.update_c2(await asyncio.to_thread(fetch_c2_stats))
             except Exception:
                 metrics.c2_available = False
+        if C1_METRICS_URL:
+            try:
+                metrics.update_c1(await asyncio.to_thread(fetch_c1_metrics))
+            except Exception:
+                metrics.c1_available = False
+        metrics.sample_drop_window()
         await broadcast({"type": "stats", "data": dashboard_stats()})
         await asyncio.sleep(C2_STATS_INTERVAL_S)
 
@@ -63,9 +73,6 @@ app = FastAPI(title="C4 Visualizer", lifespan=lifespan)
 store = InspectionStore(max_records=500)
 ws_clients: list[WebSocket] = []
 
-CIRCULARITY_THRESHOLD = 0.85
-
-
 async def broadcast(payload: dict):
     msg = json.dumps(payload)
     dead = []
@@ -79,35 +86,21 @@ async def broadcast(payload: dict):
             ws_clients.remove(ws)
 
 
-def compute_circularity(area: float, perimeter: float) -> float:
-    if perimeter <= 0:
-        return 0.0
-    return (4 * math.pi * area) / (perimeter * perimeter)
-
-
 @app.post("/results")
 async def receive_result(result: DetectionResult):
     """C3 Inference → C4: detection-result 수신."""
     metrics.record(result, time.time() * 1000)
     overlays = []
     for det in result.detections:
-        bbox = det.bbox
-        w = abs(bbox[2] - bbox[0])
-        h = abs(bbox[3] - bbox[1])
-        area = w * h
-        perimeter = 2 * (w + h)
-        circ = compute_circularity(area, perimeter)
-
-        status = "pass" if circ >= CIRCULARITY_THRESHOLD else "fail"
+        status = det.status
 
         rec = InspectionRecord(
             item_id=det.object_id,
             trace_id=result.trace_id,
             frame_id=result.frame_id,
             status=status,
-            circularity=circ,
-            area=area,
-            perimeter=perimeter,
+            session_id=result.session_id,
+            defect_type=det.defect_type,
             defect_score=det.defect_score,
             inference_latency_ms=result.inference_latency_ms,
             container_id=result.inference_container_id,
@@ -115,7 +108,7 @@ async def receive_result(result: DetectionResult):
         store.add(rec)
         overlays.append({
             "item_id": det.object_id, "bbox": det.bbox, "mask": det.mask,
-            "status": status, "circularity": round(circ, 4),
+            "status": status, "defect_type": det.defect_type, "defect_score": det.defect_score,
         })
 
         await broadcast({
@@ -125,9 +118,6 @@ async def receive_result(result: DetectionResult):
                 "trace_id": result.trace_id,
                 "session_id": result.session_id,
                 "status": status,
-                "circularity": round(circ, 4),
-                "area": round(area, 1),
-                "perimeter": round(perimeter, 1),
                 "defect_score": round(det.defect_score, 4),
                 "inference_latency_ms": round(result.inference_latency_ms, 1),
                 "container_id": result.inference_container_id,
@@ -140,7 +130,9 @@ async def receive_result(result: DetectionResult):
     # Send one complete frame, including empty detections, for atomic overlays.
     await broadcast({"type": "frame_result", "data": {
         "trace_id": result.trace_id, "session_id": result.session_id,
-        "frame_id": result.frame_id, "detections": overlays,
+        "frame_id": result.frame_id, "captured_at_ms": result.captured_at_ms,
+        "latency_breakdown_ms": result.latency_breakdown_ms,
+        "inference_timings_ms": result.inference_timings_ms, "detections": overlays,
     }})
     stats = dashboard_stats()
     await broadcast({"type": "stats", "data": stats})
@@ -188,6 +180,8 @@ async def export_csv():
 async def connections():
     """Observed connectivity; absence of input is not proof that upstream is down."""
     return {
+        "c1_metrics": {"enabled": bool(C1_METRICS_URL), "available": metrics.c1_available,
+                       "last_success_at_ms": metrics.c1_updated_at_ms},
         "c2_stats": {"enabled": bool(C2_STATS_URL), "available": metrics.c2_available,
                      "last_success_at_ms": metrics.c2_updated_at_ms},
         "camera": {"last_received_at_ms": metrics.last_camera_at_ms},

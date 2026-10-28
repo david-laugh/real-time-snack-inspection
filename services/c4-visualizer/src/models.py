@@ -3,6 +3,8 @@ detection-result 스키마에 대응하는 Pydantic 모델.
 shared/schemas/detection-result.schema.json 기준.
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -22,7 +24,7 @@ class CameraFrame(BaseModel):
 class Detection(BaseModel):
     object_id: str
     bbox: list[float]
-    status: str          # normal | defect | unknown
+    status: Literal["normal", "defect", "unknown"]
     defect_type: str | None = None
     defect_score: float = 0.0
     mask: dict | None = None
@@ -39,3 +41,9 @@ class DetectionResult(BaseModel):
     inference_finished_at_ms: int
     inference_latency_ms: float
     detections: list[Detection]
+
+    preprocess_started_at_ms: int | None = None
+    preprocess_finished_at_ms: int | None = None
+    inference_received_at_ms: int | None = None
+    latency_breakdown_ms: dict[str, float | None] | None = None
+    inference_timings_ms: dict[str, float | None] | None = None

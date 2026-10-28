@@ -47,6 +47,30 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(connections['results']['last_received_at_ms'])
         self.assertFalse(connections['mqtt_required'])
 
+    async def test_c3_status_is_authoritative_in_feed_store_and_csv(self):
+        from src.store import InspectionStore
+        old_store = main.store
+        main.store = InspectionStore()
+        self.addCleanup(setattr, main, 'store', old_store)
+        result = DetectionResult(trace_id='classification', session_id='s', frame_id=1,
+            captured_at_ms=1000, inference_container_id='c3',
+            inference_started_at_ms=1010, inference_finished_at_ms=1020,
+            inference_latency_ms=10, latency_breakdown_ms={'c3_queue': None, 'c3_service': 10},
+            detections=[dict(object_id=status, bbox=[0,0,10,10], status=status,
+                             defect_type='broken' if status == 'defect' else None)
+                        for status in ('normal', 'defect', 'unknown')])
+        with patch.object(main, 'broadcast', new_callable=AsyncMock) as send:
+            await main.receive_result(result)
+        stats = main.store.get_stats()
+        self.assertEqual((stats['pass_count'], stats['fail_count'], stats['unknown_count']), (1,1,1))
+        rows = main.store.get_recent()
+        self.assertEqual({r['status'] for r in rows}, {'normal','defect','unknown'})
+        self.assertTrue(all(r['circularity'] is None for r in rows))
+        self.assertEqual(main.store.get_defects()[0]['defect_type'], 'broken')
+        self.assertIn('broken', main.store.export_csv())
+        event = next(c.args[0] for c in send.call_args_list if c.args[0]['type']=='frame_result')
+        self.assertEqual(event['data']['latency_breakdown_ms']['c3_service'], 10)
+
     async def test_result_preserves_mask_and_emits_empty_frames(self):
         mask = dict(encoding='rle', width=3, height=2,
                     data=dict(order='row-major', counts=[0, 2, 4]))

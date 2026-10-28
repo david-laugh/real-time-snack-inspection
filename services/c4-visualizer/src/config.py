@@ -16,3 +16,7 @@ if C2_STATS_URL and (urlsplit(C2_STATS_URL).scheme not in ('http', 'https') or n
     raise ValueError('C4_C2_STATS_URL must be an HTTP(S) URL or empty to disable polling')
 C2_STATS_TIMEOUT_S = positive_seconds('C4_C2_STATS_TIMEOUT_S', 1)
 C2_STATS_INTERVAL_S = positive_seconds('C4_C2_STATS_INTERVAL_S', 2)
+
+C1_METRICS_URL = os.getenv('C4_C1_METRICS_URL', 'http://c1-gateway:8000/api/metrics').strip()
+if C1_METRICS_URL and (urlsplit(C1_METRICS_URL).scheme not in ('http', 'https') or not urlsplit(C1_METRICS_URL).hostname):
+    raise ValueError('C4_C1_METRICS_URL must be an HTTP(S) URL or empty')

@@ -1,731 +1,150 @@
 # C4 Visualizer
 
-**Owner:** Member D
-**Port:** 8003
+C2의 리사이즈 이미지와 C3의 검사 결과를 매칭해 실시간 표시하는 FastAPI 대시보드입니다. 기본 포트는 8003입니다.
 
-과자 크랙 검사 결과를 실시간으로 시각화하는 대시보드 서비스.
-C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라우저에 실시간 push합니다.
-
-**역할:**
-- Detection 결과 실시간 표시 (WebSocket push)
-- 영상 위에 bbox / RLE mask / 불량 마킹 overlay (canvas 기반)
-- 모니터링: Processed FPS, defect count
-
----
-
-## 구현 현황
-
-### 기존 스펙(TODO) 대비 완료 상태
-
-| # | 기존 TODO | 상태 | 구현 내용 |
-|---|-----------|------|-----------|
-| 1 | Dashboard 프레임워크 선정 | **완료** | FastAPI + vanilla JS + WebSocket 실시간 통신 |
-| 2 | Overlay 렌더링 | **완료** | HTML Canvas 기반 bbox + RLE mask overlay (아래 상세) |
-| 3 | 메트릭 집계 및 CSV export | **완료** | `GET /api/export/csv` + 대시보드 다운로드 버튼 |
-| 4 | Docker command를 실제 entrypoint로 교체 | **완료** | `uvicorn src.main:app --host 0.0.0.0 --port 8003` |
-
-### 기존 스펙에 없었으나 추가 구현된 기능
-
-| 기능 | 설명 | 관련 파일 |
-|------|------|-----------|
-| **불량 확인 뷰어** (`/viewer`) | 불량 항목 테이블 + 행 클릭 시 슬라이드인 상세 패널 (원형도 게이지, 파이프라인 정보) | `viewer.html` |
-| **REST API 확장** | `/api/stats`, `/api/inspections`, `/api/defects`, `/api/export/csv` 4개 엔드포인트 추가 | `main.py` |
-| **양품률 도넛 차트** | SVG 기반 실시간 양품/불량 비율 도넛 차트 | `index.html` |
-| **원형도 분포 히스토그램** | 20구간 바 차트 + 0.85 임계선 표시 | `index.html` |
-| **WebSocket 자동 재연결** | 연결 끊김 시 2초 후 자동 재시도 + 상태 배지 표시 | `index.html` |
-| **CSV 내보내기** | 검사 이력 전체를 CSV 파일로 다운로드 | `store.py`, `main.py` |
-
-## Open Issues (미해결)
-
-1. **C2 전송 연동 필요** — C4의 `POST /api/camera/frame` 수신·중계는 구현 완료. C2는 C3에 보내는 것과 같은 리사이즈 이미지와 prompts를 같은 시점에 C4로 비동기 전송합니다. C3 요청 경로에서 C4 응답을 기다리지 않습니다. 최신 main의 PR #8/#9에 C2 송신 구현이 반영돼 있습니다.
-2. **결과 지연/역순 도착** — 브라우저는 `(session_id, trace_id, frame_id)`로 이미지와 결과를 짝짓고, 최대 30개 프레임을 보관합니다. 짝이 맞는 결과를 표시한 뒤에는 다음 짝이 완성될 때까지 현재 화면을 유지합니다. 이미 선택한 이미지보다 먼저 수신된 이미지의 늦은 결과는 표시하지 않습니다. 버퍼에서 제거된 프레임은 표시하지 못할 수 있습니다.
-
----
-
-## 핵심 로직 상세
-
-### 1. 원형도(Circularity) 판정
-
-C3에서 받은 detection의 `bbox [x1, y1, x2, y2]`로부터 양품/불량을 판정합니다.
-
-```
-width     = |x2 - x1|
-height    = |y2 - y1|
-area      = width × height
-perimeter = 2 × (width + height)
-
-Circularity = 4π × area / perimeter²
-```
-
-| 조건 | 판정 | 의미 |
-|------|------|------|
-| `circularity >= 0.85` | **pass** (양품) | 정원에 가까운 형태 |
-| `circularity < 0.85` | **fail** (불량) | 찌그러지거나 깨진 형태 |
-
-**참고값:**
-- 정사각형 (100×100): `4π × 10000 / 400² ≈ 0.785` → **불량**
-- 정사각형에 가까운 직사각형 (100×95): `≈ 0.784` → **불량**
-- 길쭉한 직사각형 (200×20): `4π × 4000 / 440² ≈ 0.259` → **불량**
-
-> 임계값은 `main.py`의 `CIRCULARITY_THRESHOLD = 0.85`에서 변경 가능.
-
-### 2. 처리량·지연·Frame Drop
-
-`metrics.py`는 객체 수와 별개로 C3 결과 프레임을 집계합니다. detection이 0개여도 한 프레임으로 세고, 최근 5,000개 추적 키 내 중복 결과는 성능 집계에서 제외합니다. FPS는 최근 5초의 수신 프레임 수 / 5입니다. 기존 검사 건수는 객체 단위로 유지합니다.
-
-대시보드 성능 영역은 **Frame Drop**과 **Latency** 두 카드만 표시합니다. Frame Drop은 C2 누적 드롭 수, Latency는 E2E P50을 대표값으로 표시하고 P95를 작게 덧붙입니다. 데이터가 없으면 `—` / `수신 대기`로 표시합니다. 나머지 지표는 API에서 확인할 수 있습니다.
-
-| 수집 지표 (API 포함) | 계산 / 출처 |
-|---|---|
-| E2E P50/P95 | C4 결과 수신 시각 − `captured_at_ms` |
-| C3 추론 P50/P95 | `inference_latency_ms` |
-| C3 → C4 P50/P95 | C4 결과 수신 시각 − `inference_finished_at_ms` |
-| C3 이전 전체 P50/P95 | `inference_started_at_ms` − `captured_at_ms` (전송·대기·전처리 포함) |
-| C1 → C2 (`c1_c2`) | C2 전처리 시작 − C1 게이트웨이 수신 (전송 및 C2 대기 포함) |
-| C2 전처리 (`preprocess`) | C2 전처리 종료 − 시작 |
-| C2 → C3 (`c2_c3`) | C3 추론 시작 − C2 전처리 종료 (LB 및 대기 포함) |
-| C2 Frame Drop | C2 `/stats`의 `events.dropped_stale + events.dropped_old` |
-| 화면용 이미지 전송 누락 | C2 `/stats`의 `c4_skipped + c4_error` (PR #8 적용 시 제공) |
-
-지연은 최근 200개 결과 프레임의 유효 샘플로 계산합니다. 호스트 간 시각 차이를 계산하므로 시계 동기화가 필요합니다. 음수 지연 및 0인 기준 타임스탬프는 제외하고 샘플이 없으면 `—`를 표시합니다. C3→C4는 결과 전송·직렬화 등도 포함하므로 순수 네트워크 지연은 아닙니다.
-
-C4는 별도 백그라운드 작업으로 C2 `/stats`를 조회합니다 (요청 timeout 1초, 조회 후 2초 대기). 프레임 수신 경로에서 기다리지 않습니다. C2 접속 실패 시 카운터를 0으로 표시하지 않고 `—` / `수신 대기`로 표시합니다. C2 재시작 시 카운터가 초기화됩니다. C2 드롭과 화면용 이미지 누락은 서로 다른 지표이며 C1/C3의 전체 드롭을 뜻하지 않습니다. `frame_id` 간격은 드롭으로 세지 않습니다.
-
-- `C4_C2_STATS_URL`: 기본 `http://c2-preprocessing:8001/stats`; 로컬 실행에서는 접근 가능한 C2 URL로 지정합니다. 빈 문자열이면 C2 조회를 끕니다.
-- 기존 C2 `/stats`도 지원합니다. PR #8 이전에는 C2 드롭을 제공하고 화면용 이미지 누락 카운터는 API에서 null로 반환합니다.
-- main PR #9의 C2 타임스탬프 3개와 C3 결과를 동일 세션/trace/frame 키로 매칭하여 구간 지연을 계산합니다. 도착 순서와 무관하며 이미지 메타데이터는 최대 500개, 결과 샘플은 200개를 보관합니다. 이미지가 누락되거나 구형 7필드 형식이면 해당 구간 값은 null입니다. UI는 Frame Drop/Latency 두 카드로 유지합니다.
-
-### 3. BBox / RLE Mask Overlay 렌더링
-
-- C3의 `mask`를 프레임 단위 `frame_result` WebSocket 이벤트로 전달합니다. 빈 detection 배열도 전달하여 이전 마스크를 지웁니다.
-- `index.html`에서 C2 이미지와 결과를 추적 ID·세션·프레임으로 매칭한 뒤 함께 표시합니다.
-- C3의 RLE는 `{"encoding":"rle","width":576,"height":1024,"data":{"order":"row-major","counts":[...]}}` 형식입니다. counts는 배경(0)부터 시작하여 배경/전경 길이가 번갈아 나오며, 합계는 width × height입니다.
-- 마스크는 pass=녹색, fail=빨간색의 반투명 영역으로 그립니다. bbox와 라벨도 유지합니다.
-- null, 미지원 인코딩, 잘못된 RLE, 이미지와 크기가 다른 마스크는 건너뛰고 bbox만 표시합니다.
-- C2와 C3는 같은 이미지 좌표계를 사용합니다. 화면에 맞추는 확대·축소와 여백만 이미지/bbox/mask에 동일하게 적용합니다.
-
-### 4. 인메모리 저장소
-
-`InspectionStore` — SQLite 없이 메모리에서 최근 N건만 유지하는 경량 구조.
-
-| 버퍼 | 최대 크기 | 용도 |
-|------|-----------|------|
-| `_records` | 500건 | 검사 이력 (deque, FIFO) |
-| `PipelineMetrics.samples` | 200프레임 | 지연 P50/P95 집계 |
-
-컨테이너 재시작 시 데이터는 초기화됩니다 (stateless).
-
----
-
-## Interface
-
-| 방향 | Endpoint | Payload / 설명 |
-|------|----------|----------------|
-| C3 → C4 | `POST /results` | [`detection-result.schema.json`](../../shared/schemas/detection-result.schema.json) |
-| C2 → C4 | `POST /api/camera/frame` | 리사이즈 프레임 + prompts 전송 (`trace_id`, `session_id`, `frame_id`, `width`, `height`, `prompts`, `image_b64`) |
-| Browser → C4 | `GET /` | 메인 대시보드 (port 8003) |
-| Browser → C4 | `GET /viewer` | 불량 확인 뷰어 |
-| Browser → C4 | `WS /ws/dashboard` | 실시간 WebSocket |
-| Browser → C4 | `GET /api/stats` | 통계 JSON |
-| Browser → C4 | `GET /api/inspections` | 검사 이력 |
-| Browser → C4 | `GET /api/defects` | 불량 목록 |
-| Browser → C4 | `GET /api/export/csv` | CSV 다운로드 |
-| — | `GET /healthz` | 헬스체크 |
-
----
-
-## API 명세
-
-### `POST /results`
-
-C3 Inference에서 detection 결과를 수신합니다.
-
-**Request Body** (`DetectionResult`):
-
-```json
-{
-  "schema_version": "1.0.0",
-  "trace_id": "string (전파용 추적 ID)",
-  "session_id": "string (세션 ID)",
-  "frame_id": 0,
-  "captured_at_ms": 1730000000000,
-  "inference_container_id": "c3-inference-1",
-  "inference_started_at_ms": 1730000000050,
-  "inference_finished_at_ms": 1730000000100,
-  "inference_latency_ms": 50.0,
-  "detections": [
-    {
-      "object_id": "snack-001",
-      "bbox": [100.0, 100.0, 200.0, 200.0],
-      "status": "normal | defect | unknown",
-      "defect_type": "crack | null",
-      "defect_score": 0.05,
-      "mask": null
-    }
-  ]
-}
-```
-
-| 필드 | 타입 | 필수 | 설명 |
-|------|------|------|------|
-| `schema_version` | string | O | 스키마 버전 (기본 `"1.0.0"`) |
-| `trace_id` | string | O | 파이프라인 추적 ID (C1에서 발급) |
-| `session_id` | string | O | 세션 ID |
-| `frame_id` | int | O | 프레임 번호 (순차 증가) |
-| `captured_at_ms` | int | O | C1 캡처 시각 (Unix ms) |
-| `inference_container_id` | string | O | C3 replica 식별자 (예: `c3-inference-1`) |
-| `inference_started_at_ms` | int | O | C3 추론 시작 시각 (Unix ms) |
-| `inference_finished_at_ms` | int | O | C3 추론 종료 시각 (Unix ms) |
-| `inference_latency_ms` | float | O | C3 추론 소요 시간 (ms) |
-| `detections` | array | O | detection 배열 |
-| `detections[].object_id` | string | O | SAM2 추적 객체 ID |
-| `detections[].bbox` | float[4] | O | `[x1, y1, x2, y2]` 픽셀 좌표 |
-| `detections[].status` | string | O | `normal` / `defect` / `unknown` |
-| `detections[].defect_type` | string? | - | 불량 유형 (`crack`, `broken` 등), null 가능 |
-| `detections[].defect_score` | float | - | 불량 신뢰도 `[0, 1]` (기본 0.0) |
-| `detections[].mask` | object? | - | 세그멘테이션 마스크 (RLE 렌더링 지원, null 가능) |
-
-**Response** `200 OK`:
-
-```json
-{
-  "status": "ok",
-  "detections_processed": 1
-}
-```
-
-**처리 흐름:**
-1. 각 detection마다:
-   - bbox에서 area, perimeter 계산
-   - circularity 산출 → pass/fail 판정
-   - `InspectionStore`에 기록
-   - WebSocket으로 `inspection_result` 이벤트 브로드캐스트
-2. 전체 통계 재계산 → WebSocket으로 `stats` 이벤트 브로드캐스트
-
----
-
-### `GET /api/stats`
-
-현재 집계 통계를 반환합니다.
-
-**Response** `200 OK`:
-
-```json
-{
-  "total": 150,
-  "pass_count": 142,
-  "fail_count": 8,
-  "defect_rate": 5.3,
-  "fps": 12.4
-}
-```
-
-| 필드 | 타입 | 설명 |
-|------|------|------|
-| `total` | int | 총 검사 수 |
-| `pass_count` | int | 양품 수 |
-| `fail_count` | int | 불량 수 |
-| `defect_rate` | float | 불량률 (%) |
-| `fps` | float | 최근 5초 기준 C3 결과 프레임 FPS (객체 수 아님) |
-| `latency` | object | `e2e`, `before_c3`, `inference`, `c3_c4` 각각 `{p50_ms, p95_ms, samples}` |
-| `c2_metrics` | object? | `dropped_stale`, `dropped_old`, `c4_skipped`, `c4_error`; 미연결이면 null, 미제공 필드는 null |
-| `c2_updated_at_ms` | int? | 마지막 C2 조회 성공 시각 (Unix ms) |
-
----
-
-### `GET /api/inspections`
-
-최근 검사 결과 목록을 반환합니다.
-
-**Query Parameters:**
-
-| 파라미터 | 타입 | 기본값 | 설명 |
-|----------|------|--------|------|
-| `limit` | int | 50 | 반환할 최대 건수 |
-
-**Response** `200 OK`:
-
-```json
-[
-  {
-    "item_id": "snack-001",
-    "trace_id": "trace-abc",
-    "frame_id": 42,
-    "status": "pass",
-    "circularity": 0.8912,
-    "area": 16900.0,
-    "perimeter": 520.0,
-    "defect_score": 0.02,
-    "inference_latency_ms": 45.0,
-    "container_id": "c3-inference-1",
-    "timestamp": 1730000000.123
-  }
-]
-```
-
----
-
-### `GET /api/defects`
-
-불량(`status: "fail"`) 항목만 필터링하여 반환합니다.
-
-**Query Parameters:**
-
-| 파라미터 | 타입 | 기본값 | 설명 |
-|----------|------|--------|------|
-| `limit` | int | 50 | 반환할 최대 건수 |
-
-**Response**: `/api/inspections`과 동일한 형태, `status: "fail"`인 것만.
-
----
-
-### `GET /api/export/csv`
-
-검사 결과를 CSV 파일로 다운로드합니다.
-
-**Response** `200 OK`:
-- `Content-Type: text/csv`
-- `Content-Disposition: attachment; filename=inspection-results.csv`
-
-**CSV 컬럼:**
-
-```
-item_id, trace_id, frame_id, status, circularity, area, perimeter,
-defect_score, inference_latency_ms, container_id, timestamp
-```
-
----
-
-### `GET /healthz`
-
-컨테이너 헬스체크용 엔드포인트.
-
-**Response** `200 OK`:
-
-```json
-{"status": "healthy"}
-```
-
----
-
-### `WS /ws/dashboard`
-
-실시간 대시보드 WebSocket. 연결 즉시 현재 stats를 전송하고, 이후 detection 결과가 들어올 때마다 push합니다.
-
-**연결:** `ws://localhost:8003/ws/dashboard`
-
-**서버 → 클라이언트 메시지 종류:**
-
-#### 1) `inspection_result` — detection 수신 시마다
-
-```json
-{
-  "type": "inspection_result",
-  "data": {
-    "item_id": "snack-001",
-    "status": "pass",
-    "circularity": 0.8912,
-    "area": 16900.0,
-    "perimeter": 520.0,
-    "defect_score": 0.02,
-    "inference_latency_ms": 45.0,
-    "container_id": "c3-inference-1",
-    "frame_id": 42,
-    "bbox": [100, 100, 230, 230],
-    "defect_type": null
-  }
-}
-```
-
-#### 2) `stats` — 통계 갱신 시 (연결 직후 + 결과 수신 후 + 백그라운드 주기 갱신)
-
-```json
-{
-  "type": "stats",
-  "data": { /* GET /api/stats 와 동일한 구조 */ }
-}
-```
-
-#### 3) `camera_frame` — 카메라 프레임 수신 시
-
-C2 Preprocessing이 C3에 보내는 것과 동일한 리사이즈 프레임 데이터를 WebSocket으로 브라우저에 중계합니다.
-
-**C2 → C4 전송 포맷 (`POST /api/camera/frame`):**
-
-응답: `200 OK`, `{"status":"ok"}`. C2는 C3 요청과 같은 시점에 별도 비동기 전송하며, 응답 대기로 추론 경로를 지연시키지 않습니다.
-
-```json
-{
-  "trace_id": "trace-abc-123",
-  "session_id": "m-ab12cd",
-  "frame_id": 297,
-  "gateway_received_at_ms": 1730000000010,
-  "preprocess_started_at_ms": 1730000000020,
-  "preprocess_finished_at_ms": 1730000000030,
-  "width": 576,
-  "height": 1024,
-  "prompts": [
-    {"candidate_id": "c0", "type": "box", "bbox": [429.0, 591.0, 525.0, 681.0]},
-    {"candidate_id": "c1", "type": "box", "bbox": [183.0, 584.0, 276.0, 677.0]}
-  ],
-  "image_b64": "/9j/4AAQ..."
-}
-```
-
-| 필드 | 타입 | 필수 | 설명 |
-|------|------|------|------|
-| `trace_id` | string | O | 파이프라인 추적 ID (C1에서 발급) |
-| `session_id` | string | O | 세션 ID (예: `m-ab12cd`) |
-| `frame_id` | int | O | 프레임 번호 (순차 증가, C1이 부여) |
-| `width` | int | O | C2 리사이즈 이미지 너비 (px) |
-| `height` | int | O | C2 리사이즈 이미지 높이 (px) |
-| `prompts` | array | O | SAM2 프롬프트 목록 — 객체 후보별 bbox |
-| `prompts[].candidate_id` | string | O | 후보 객체 ID (예: `c0`, `c1`) |
-| `prompts[].type` | string | O | 프롬프트 유형 (`box`) |
-| `prompts[].bbox` | float[4] | O | `[x1, y1, x2, y2]` 픽셀 좌표 |
-| `image_b64` | string | O | JPEG 이미지의 base64 인코딩 (`data:` 접두사 없이 raw base64) |
-
-**WebSocket broadcast 포맷 (서버 → 브라우저):**
-
-```json
-{
-  "type": "camera_frame",
-  "data": {
-    "trace_id": "trace-abc-123",
-    "session_id": "m-ab12cd",
-    "frame_id": 297,
-    "width": 576,
-    "height": 1024,
-    "frame": "/9j/4AAQ...",
-    "prompts": [
-      {"candidate_id": "c0", "type": "box", "bbox": [429.0, 591.0, 525.0, 681.0]},
-      {"candidate_id": "c1", "type": "box", "bbox": [183.0, 584.0, 276.0, 677.0]}
-    ]
-  }
-}
-```
-
-| 필드 | 타입 | 설명 |
-|------|------|------|
-| `frame_id` | int | 프레임 번호 |
-| `width` | int | 이미지 너비 (px) |
-| `height` | int | 이미지 높이 (px) |
-| `frame` | string | JPEG base64 문자열 — `data:image/jpeg;base64,` 접두사 포함/미포함 모두 허용 (프론트엔드에서 자동 보정) |
-| `prompts` | array | 객체 후보 bbox 목록 (C2가 만든 후보 목록 그대로 전달) |
-
-**프론트엔드 처리 흐름:**
-
-`camera_frame`과 `frame_result`를 최대 30개 버퍼에서 매칭 → 이미지 디코딩 → 동일 프레임의 이미지/bbox/mask를 함께 갱신합니다. 결과가 먼저 도착해도 매칭할 수 있습니다. 매칭 전에는 첫 카메라 이미지만 미리 표시합니다.
-
-#### 4) `frame_result` — 프레임의 모든 detection 처리 후
-
-```json
-{
-  "type": "frame_result",
-  "data": {
-    "trace_id": "trace-abc-123",
-    "session_id": "m-ab12cd",
-    "frame_id": 297,
-    "detections": [
-      {
-        "item_id": "c0", "bbox": [429, 591, 525, 681],
-        "status": "fail", "circularity": 0.78,
-        "mask": {"encoding": "rle", "width": 576, "height": 1024,
-                 "data": {"order": "row-major", "counts": [589824]}}
-      }
-    ]
-  }
-}
-```
-
-위 counts는 형식을 설명하기 위한 빈 마스크 예시입니다. `inspection_result`는 기존 검사 피드용으로 유지하며 `trace_id`, `session_id`도 전달합니다. 마스크는 중복 전송하지 않고 `frame_result`에 포함합니다.
-
-| 구성요소 | 상태 | 설명 |
-|----------|------|------|
-| 프론트엔드 | **구현 완료** | 이미지/결과 매칭, RLE 마스크 + bbox 렌더링 |
-| 백엔드 중계 (`main.py`) | **구현 완료** | C2 프레임 수신 → WebSocket broadcast |
-| C2 → C4 송신 | **C2 담당** | 동일 리사이즈 이미지와 prompts를 비동기 전송 |
-
----
-
-## 아키텍처
-
-```
-C3 Inference ──POST /results──▶ C4 Visualizer ──WebSocket──▶ Browser Dashboard
-                                     │
-                                     ├── GET /              (메인 대시보드)
-                                     ├── GET /viewer        (불량 확인 뷰어)
-                                     ├── GET /api/stats     (통계 JSON)
-                                     ├── GET /api/inspections (검사 이력)
-                                     ├── GET /api/defects   (불량 목록)
-                                     ├── GET /api/export/csv (CSV 다운로드)
-                                     └── GET /healthz       (헬스체크)
-```
-
-## 폴더 구조
-
-```
-services/c4-visualizer/
-├── Dockerfile              # Python 3.11-slim 기반 컨테이너
-├── requirements.txt        # FastAPI + Uvicorn + Pydantic
-├── README.md               # 이 문서
-├── src/
-│   ├── __init__.py
-│   ├── main.py             # FastAPI 앱 (엔드포인트, WebSocket, 판정 로직)
-│   ├── models.py           # DetectionResult / Detection Pydantic 모델
-│   └── store.py            # 인메모리 저장소 (검사 이력, 통계, CSV export)
-└── static/
-    ├── index.html           # 메인 대시보드 UI (실시간 차트, bbox overlay, 검사 피드)
-    └── viewer.html          # 불량 상세 뷰어 UI (테이블, 상세 패널)
-```
-
----
-
-## Docker로 실행하기
-
-### 사전 준비
-
-- **Docker Desktop** 설치 (Windows/Mac) 또는 **Docker Engine** (Linux)
-- **Docker Compose** v2 이상 (`docker compose version`으로 확인)
-
-### 방법 1: C4만 단독 실행 (가장 간단)
-
-프로젝트 루트에서:
-
-```bash
-docker compose up c4-visualizer --build
-```
-
-또는 `services/c4-visualizer/` 폴더에서 직접:
-
-```bash
-docker build -t c4-visualizer .
-docker run -p 8003:8003 c4-visualizer
-```
-
-실행 후 브라우저에서 **http://localhost:8003** 접속.
-
-### 방법 2: 전체 파이프라인 실행
-
-```bash
-docker compose up --build
-```
-
-> C1~C3도 구현돼 있습니다. 단, 현재 main에는 C3 결과를 C4 `/results`로 전달하는 송신 경로가 없어 전체 결과 연동은 담당 서비스의 추가 구현이 필요합니다.
-
-### 방법 3: Scale-out 프로필 (C3 3대)
-
-```bash
-docker compose --profile scale-out up --build
-```
-
----
-
-## 대시보드 페이지
-
-| URL | 설명 |
-|-----|------|
-| `http://localhost:8003/` | 메인 대시보드 — 실시간 검사 통계, 카메라 피드 + bbox overlay, 원형도 분포 차트 |
-| `http://localhost:8003/viewer` | 불량 확인 뷰어 — 불량 항목 테이블, 클릭 시 상세 패널 (원형도 게이지, 파이프라인 정보) |
-
-### 메인 대시보드 구성요소
-
-| 영역 | 표시 항목 |
-|------|-----------|
-| **상단 통계 카드 (4개)** | 총 검사, 양품, 불량, 불량률 |
-| **성능 카드 (2개)** | Frame Drop: C2 누적 드롭 / Latency: E2E P50 + P95 |
-| **카메라 피드** | 원본 이미지 + canvas bbox overlay (pass=녹색, fail=빨간색) |
-| **검사 결과 피드** | 최근 60건 실시간 스크롤 목록 (아이템 ID, 원형도) |
-| **양품률 도넛 차트** | SVG 기반 pass/fail 비율 시각화 |
-| **원형도 분포 차트** | 20구간 히스토그램 + 0.85 임계선 |
-
----
-
-## 테스트 데이터 보내보기
-
-C4가 실행 중일 때 터미널에서 아래 curl로 테스트 데이터를 보내볼 수 있습니다:
-
-### 정상 과자 (원형도 높음)
-
-```bash
-curl -X POST http://localhost:8003/results \
-  -H "Content-Type: application/json" \
-  -d '{
-    "schema_version": "1.0.0",
-    "trace_id": "test-trace-001",
-    "session_id": "test-session",
-    "frame_id": 1,
-    "captured_at_ms": 1730000000000,
-    "inference_container_id": "c3-inference-1",
-    "inference_started_at_ms": 1730000000050,
-    "inference_finished_at_ms": 1730000000100,
-    "inference_latency_ms": 50.0,
-    "detections": [
-      {
-        "object_id": "snack-001",
-        "bbox": [100, 100, 200, 200],
-        "status": "normal",
-        "defect_type": null,
-        "defect_score": 0.05,
-        "mask": null
-      }
-    ]
-  }'
-```
-
-### 불량 과자 (원형도 낮음 — 길쭉한 bbox)
-
-```bash
-curl -X POST http://localhost:8003/results \
-  -H "Content-Type: application/json" \
-  -d '{
-    "schema_version": "1.0.0",
-    "trace_id": "test-trace-002",
-    "session_id": "test-session",
-    "frame_id": 2,
-    "captured_at_ms": 1730000001000,
-    "inference_container_id": "c3-inference-1",
-    "inference_started_at_ms": 1730000001050,
-    "inference_finished_at_ms": 1730000001120,
-    "inference_latency_ms": 70.0,
-    "detections": [
-      {
-        "object_id": "snack-002",
-        "bbox": [100, 100, 300, 120],
-        "status": "defect",
-        "defect_type": "crack",
-        "defect_score": 0.92,
-        "mask": null
-      }
-    ]
-  }'
-```
-
-> **Windows PowerShell**에서는 `curl` 대신 아래처럼 사용:
-> ```powershell
-> Invoke-RestMethod -Uri http://localhost:8003/results -Method Post -ContentType "application/json" -Body '{ ... }'
-> ```
-> 또는 Git Bash에서 위의 curl 명령을 그대로 사용할 수 있습니다.
-
----
-
-## 환경 변수
-
-| 변수 | 기본값 | 설명 |
-|------|--------|------|
-| `C4_PORT` | `8003` | 호스트에 노출할 포트 (docker-compose) |
-| `SERVICE_NAME` | `c4-visualizer` | 서비스 식별 이름 |
-
-## 컨테이너 상세
-
-| 항목 | 값 |
-|------|-----|
-| Base image | `python:3.11-slim` |
-| Working dir | `/app` |
-| Exposed port | `8003` |
-| Entrypoint | `uvicorn src.main:app --host 0.0.0.0 --port 8003` |
-| Healthcheck | `GET /healthz` (10초 간격, 3초 timeout, 3회 retry) |
-| Max records | 500건 (인메모리, 컨테이너 재시작 시 초기화) |
-
----
-
-## 개발 모드 (Docker 없이)
-
-Docker 없이 로컬에서 바로 실행할 수도 있습니다:
-
-```bash
-cd services/c4-visualizer
-pip install -r requirements.txt
-uvicorn src.main:app --host 0.0.0.0 --port 8003 --reload
-```
-
-`--reload` 옵션으로 코드 수정 시 자동 재시작됩니다.
-
----
-
-## 트러블슈팅
-
-| 증상 | 원인 | 해결 |
-|------|------|------|
-| 브라우저에서 "연결 끊김" 표시 | WebSocket 미연결 | C4 서버가 실행 중인지 확인, 포트 8003 확인 |
-| curl 후 대시보드에 안 뜸 | 브라우저 탭이 WS 연결 전 | 브라우저를 먼저 열고 WS 연결(연결됨) 확인 후 curl |
-| `docker compose up` 에러 | Docker Desktop 미실행 | Docker Desktop 실행 후 재시도 |
-| port 8003 already in use | 다른 프로세스가 포트 사용 중 | `.env`에서 `C4_PORT=8004` 등으로 변경 |
-| CSV 다운로드가 빈 파일 | 아직 detection 결과가 없음 | curl로 테스트 데이터를 먼저 전송 |
-| bbox overlay가 안 보임 | 카메라 이미지 없이 좌표만 수신 | Open Issue #1 — 프레임 수신 경로 구현 후 표시 |
-
-
-## C4 회귀 테스트
-
-프로젝트 루트에서 프론트엔드 RLE/프레임 매칭 테스트:
-
-```bash
-node --test services/c4-visualizer/tests/test_dashboard.cjs
-```
-
-C4 Python 의존성이 설치된 환경에서 수신 핸들러/이벤트 테스트:
-
-```bash
-cd services/c4-visualizer
-python -m unittest discover -s tests -p 'test_*.py' -v
-```
-
-
-## 현재 main 통신 계약과 실행 설정 (PR #8/#9 반영)
+## 통신 구조
 
 ```text
 C1 --MQTT--> C2 --HTTP /infer--> Nginx --> C3
              |                           |
-             +--HTTP /api/camera/frame--> C4
-                                         ^
-C3 결과는 현재 C2 HTTP 요청에 대한 응답으로만 반환됨
-C4 --HTTP GET /stats--> C2
-C4 --WebSocket /ws/dashboard--> Browser
+             +--POST /api/camera/frame   +--POST /results
+                         |                    |
+                         +-------- C4 --------+
+                                    |
+                              WebSocket → Browser
+C4 --GET /api/metrics--> C1
+C4 --GET /stats-------> C2
 ```
 
-**남은 연동 공백:** C3는 `/infer` 응답만 반환하고 C2는 상태 코드만 사용합니다. 어느 쪽도 C4 `/results`에 POST하지 않습니다. C4는 수신 API를 이미 제공하지만, 환경변수만으로 없는 송신 코드를 활성화할 수는 없습니다. C2가 응답 본문을 C4로 전달하거나 C3가 별도 POST하도록 담당자와 합의해야 합니다. 결과가 없으면 마스크와 E2E Latency는 대기 상태입니다. C4에서 이미지를 다시 C3로 보내 이중 추론하지 않습니다.
+C4는 MQTT를 사용하지 않습니다. C3 결과 전송은 전달받은 2026-10-28 사양(`feature/inference`, schema 1.1.0)에 대응합니다. 해당 송신 구현이 적용된 C3를 실행해야 합니다. C3는 `/infer` 응답 후 백그라운드로 결과를 한 번 보내며 재시도하지 않습니다. C4는 200 응답을 반환합니다.
 
-### 설정 위치
-
-C4 설정 예시는 이 폴더의 `.env.example`에 있습니다. Docker Compose 실행 시 필요한 줄을 **프로젝트 루트 `.env`**에 추가합니다. 기존 `.env`를 덮어쓰지 마세요. 루트 Compose의 `env_file`이 C4에도 값을 전달하므로 Compose 수정은 필요 없습니다.
-
-| 설정 | 기본값 | 의미 |
-|---|---|---|
-| `C4_PORT` | `8003` | Compose의 호스트 공개 포트. 컨테이너 내부는 8003 고정 |
-| `C4_C2_STATS_URL` | `http://c2-preprocessing:8001/stats` | C2 통계 조회 URL. 빈 문자열이면 끔 |
-| `C4_C2_STATS_TIMEOUT_S` | `1` | 조회 timeout (양의 초) |
-| `C4_C2_STATS_INTERVAL_S` | `2` | 조회 완료 후 대기 간격 (양의 초) |
-
-연동 상대의 **기존 설정** (C4 소스에서 설정하는 값이 아님):
-
-| 담당 | 설정 / 주소 | 확인 사항 |
-|---|---|---|
-| C2 | `C2_C4_FRAME_URL=http://c4-visualizer:8003/api/camera/frame` | main의 기본값. 이미지와 3개 시각을 포함한 10필드 전송 |
-| C2 | `C2_C4_TIMEOUT_S=1.0`, `C2_C4_MAX_INFLIGHT=2` | 실패/한도 초과 시 화면용 이미지만 누락될 수 있음 |
-| C3 | `C3_RETURN_MASK=true` | RLE 마스크를 결과에 포함 (기본 true) |
-| C1/C2 | `MQTT_HOST=mqtt-broker`, `MQTT_PORT=1883`, `MQTT_TOPIC_PREFIX=psf/v1` | C4는 MQTT를 사용하지 않음 |
-| 호스트 MQTT 도구 | `localhost:11883` | Compose 외부용 브로커 포트. 컨테이너 내부 1883과 구분 |
-
-C4는 구형 7필드 프레임도 수신합니다. 추가 필드는 `gateway_received_at_ms`, `preprocess_started_at_ms`, `preprocess_finished_at_ms`이며 Unix milliseconds입니다. C4→브라우저 중계에도 보존합니다.
-
-### 로컬 실행 / 컨테이너 실행
-
-- 동일 Compose 네트워크: 위 기본 URL 사용. `localhost`는 각 컨테이너 자신이므로 상대 서비스에 사용하지 않습니다.
-- C4만 로컬 Python으로 실행: `$env:C4_C2_STATS_URL='http://접근가능한-C2주소:포트/stats'` 설정 후 실행합니다. 루트 Compose는 C2 8001을 호스트에 공개하지 않으므로 `localhost:8001`로 자동 접근되지는 않습니다.
-- 별도 PC의 C2/C3에서 C4에 연결: C4 호스트의 접근 가능한 IP와 공개 포트로 수신 URL을 지정해야 합니다.
-- C4 단독 UI 확인: `$env:C4_C2_STATS_URL=''`로 조회를 끌 수 있습니다.
+## 실행과 환경변수
 
 ```bash
 docker compose up -d --no-deps --build c4-visualizer
 ```
 
-### 연결 진단
+브라우저: `http://localhost:8003/`, 상세 뷰어: `/viewer`.
+소스 변경 후에는 위 명령으로 이미지를 재빌드하고 브라우저를 새로고침합니다.
 
-`GET /api/connections`는 C2 통계 조회 활성/성공 여부, 마지막 이미지·결과 수신 시각, WebSocket 접속 수를 반환합니다. 미수신 시각은 null입니다. `/healthz`는 C4 자체 생존 확인용이므로 upstream 연결 성공을 뜻하지 않습니다.
+이 폴더의 `.env.example`에서 필요한 값을 **프로젝트 루트 `.env`**에 추가합니다. 루트 Compose가 값을 주입하므로 C4 별도 Compose 수정은 필요 없습니다. 기존 `.env`를 덮어쓰지 마세요. 로컬 Python 실행 시에는 셸 환경변수를 설정해야 하며 예시 파일은 자동 로드하지 않습니다.
+
+| 설정 | 기본값 | 의미 |
+|---|---|---|
+| `C4_PORT` | `8003` | Compose 호스트 공개 포트 (컨테이너 내부는 8003) |
+| `C4_C1_METRICS_URL` | `http://c1-gateway:8000/api/metrics` | C1 누적 카운터 조회. 빈 값이면 끔 |
+| `C4_C2_STATS_URL` | `http://c2-preprocessing:8001/stats` | C2 누적 카운터 조회. 빈 값이면 끔 |
+| `C4_C2_STATS_TIMEOUT_S` | `1` | C1/C2 각각의 조회 timeout, 양의 초 |
+| `C4_C2_STATS_INTERVAL_S` | `2` | 두 조회가 끝난 뒤 대기 시간, 양의 초 |
+
+상대 서비스 설정 (C4가 대신 변경하지 않습니다):
+
+| 담당 | 설정 | 용도 |
+|---|---|---|
+| C2 | `C2_C4_FRAME_URL=http://c4-visualizer:8003/api/camera/frame` | 리사이즈 이미지와 prompts 전달 |
+| C3 | `C3_RESULTS_URL=http://c4-visualizer:8003/results` | 전달받은 사양의 결과 push URL |
+| C3 | `C3_RETURN_MASK=1` | row-major RLE 마스크 포함 |
+| C1/C2 | `MQTT_HOST=mqtt-broker`, `MQTT_PORT=1883`, `MQTT_TOPIC_PREFIX=psf/v1` | C1→C2 통신용 |
+
+컨테이너 내부에서 상대 서비스를 `localhost`로 지정하지 않습니다. 호스트 MQTT 도구는 `localhost:11883`을 사용합니다. C4를 로컬 Python으로 실행할 때는 C1/C2의 접근 가능한 주소를 지정해야 합니다. 루트 Compose의 C2 8001은 호스트에 공개되지 않습니다. 다른 PC에서는 C4 호스트 IP와 공개 포트를 사용합니다.
+
+## 수신 계약
+
+### POST /api/camera/frame — C2
+
+필수 7필드: `trace_id`, `session_id`, `frame_id`, `width`, `height`, `prompts`, `image_b64`.
+추가 optional 필드: `gateway_received_at_ms`, `preprocess_started_at_ms`, `preprocess_finished_at_ms` (Unix ms).
+
+C2는 C3와 같은 이미지/좌표계로 전송합니다. C4는 `image_b64`를 WebSocket의 `frame`으로 바꾸고 나머지 값을 보존합니다. 구형 7필드와 최신 10필드 모두 지원합니다.
+
+### POST /results — C3
+
+기본 필드: `schema_version`, `trace_id`, `session_id`, `frame_id`, `captured_at_ms`, `inference_container_id`, `inference_started_at_ms`, `inference_finished_at_ms`, `inference_latency_ms`, `detections`.
+
+1.1.0 optional 필드: `preprocess_started_at_ms`, `preprocess_finished_at_ms`, `inference_received_at_ms`, `latency_breakdown_ms`, `inference_timings_ms`. `schema_version` 문자열로 새 필드 사용 여부를 제한하지 않습니다. C3가 C1의 버전 값을 그대로 전파할 수 있기 때문입니다.
+
+**판정은 C3 값을 그대로 보존합니다.** bbox 원형도로 재판정하지 않습니다.
+
+| C3 status | 표시 / 집계 |
+|---|---|
+| `normal` | 정상 / `pass_count` |
+| `defect` | 불량 / `fail_count` |
+| `unknown` | 판정 보류 / `unknown_count` (정상·불량에 포함하지 않음) |
+
+`defect_type`(예: `broken`)과 `defect_score`도 검사 피드, 상세 뷰어, CSV에 반영됩니다. `object_id`는 프레임 안에서만 유일하므로 세션·trace·프레임과 함께 해석해야 합니다. 기존 API/CSV 호환용 `circularity`, `area`, `perimeter`는 null이며, 화면은 불량 점수를 표시합니다.
+
+## 화면과 프레임 매칭
+
+성능 카드는 **Frame Drop / Latency 두 개**만 표시합니다. 세부 지표는 API 및 카드 툴팁으로 확인합니다.
+
+- 이미지와 결과는 `(session_id, trace_id, frame_id)`로 매칭합니다. 어느 쪽이 먼저 와도 처리합니다.
+- 브라우저 버퍼는 최대 30개입니다. 이미지가 없는 결과는 검사 피드·통계에는 반영하고, 카메라는 이전 매칭 화면을 유지합니다.
+- 새 매칭 화면보다 먼저 수신된 이미지의 늦은 결과로 화면을 되돌리지 않습니다. 완전한 프레임 순서 재정렬 기능은 아닙니다.
+- 빈 detections는 이전 마스크를 지웁니다.
+- RLE: `{"encoding":"rle","width":576,"height":1024,"data":{"order":"row-major","counts":[...]}}`. 배경(0) run부터 시작하고 합계는 width × height입니다. COCO column-major 형식은 사용하지 않습니다.
+- 마스크/박스 색상: 정상 녹색, 불량 빨간색, 판정 보류 회색. 잘못된 마스크는 bbox로 대체합니다.
+
+## 지연과 드롭
+
+### 지연
+
+`latency_breakdown_ms`의 `capture_to_preprocess`, `preprocess`, `c2_to_c3`, `c3_queue`, `c3_service`, `c3_total`, `capture_to_c3_done`은 C3 제공값을 우선 사용합니다. null/음수/비유한 값은 집계에서 제외합니다. 제공된 null을 카메라 시각으로 덮어쓰지 않습니다. `inference_timings_ms`는 프레임 WebSocket 이벤트에 그대로 포함합니다.
+
+- `/api/stats.latency`: 최근 200개 결과 프레임별 P50/P95와 유효 샘플 수.
+- `e2e`: C4 **서버 수신** − 촬영 시각. `c3_c4`: C4 수신 − C3 종료.
+- Latency 카드: 매칭 이미지/마스크를 canvas에 그린 시각 − 촬영 시각을 브라우저에서 측정하고 최근 200회 표시의 P50/P95를 보여줍니다 (`표시 · P50`). 첫 매칭 전에는 서버 수신 지연을 보여줍니다 (`수신 · P50`). 브라우저 paint 완료 시각까지 측정하는 것은 아닙니다.
+- 카메라 시각이 있으면 `upload`, `c1_c2`도 계산합니다. C3 breakdown이 없을 때만 기존 `preprocess`, `c2_c3` 추정을 사용합니다. 이는 대기 시간까지 포함할 수 있습니다.
+- 서버는 이미지 메타데이터 500개, 매칭 대상 결과 200개를 보관합니다. 이미지 누락은 C3 제공 지연 집계에 영향을 주지 않습니다.
+- 호스트/폰/브라우저의 시계 동기화가 필요합니다. 지연을 0으로 대체하지 않습니다.
+
+### 드롭
+
+Frame Drop 카드의 큰 값은 **C2 기동 이후 dropped_stale + dropped_old 누적 수**입니다.
+
+C1의 `counters.received/dropped`, C2의 `events.forwarded/error/timeout`도 읽습니다. `received_frames`는 detection 개수가 아닌 결과 프레임 수이며 최근 5,000개 `(session_id, trace_id, frame_id)` 키 내 중복을 제외합니다.
+
+`drop_window`는 최초 비교 기준 수집 후 약 5초 이상 간격의 증가분을 사용합니다:
+
+| 필드 | 계산 |
+|---|---|
+| `c1_drop_pct` | ΔC1 dropped / ΔC1 received |
+| `c2_drop_pct` | ΔC2 stale+old / ΔC1 received |
+| `c2_error_pct` | ΔC2 error+timeout / ΔC2 forwarded+error+timeout |
+| `result_gap_estimate` | max(0, ΔC2 forwarded − ΔC4 received_frames) |
+| `overall_loss_pct_estimate` | 1 − ΔC4 received_frames / ΔC1 received (0~100%로 제한) |
+
+분모가 0이면 비율은 null입니다. 조회 실패·미제공 카운터·카운터 감소(재시작/reset) 시 비교 기준과 구간 지표를 초기화합니다. 폴링 시점과 비동기 전송 시점이 달라 경계의 처리 중 프레임도 차이에 포함될 수 있어 **유실은 추정값이며 확정 드롭이 아닙니다**. C2 error에는 입력 오류도 포함될 수 있습니다. frame_id 갭을 즉시 드롭으로 세지 않습니다. C4만 재시작해도 새 기준을 수집하므로 누적 카운터의 시작 시점 차이를 직접 빼지 않습니다.
+
+## API와 연결 진단
+
+| 경로 | 내용 |
+|---|---|
+| `GET /healthz` | C4 자체 생존 확인 (upstream 연결 보장 아님) |
+| `GET /api/connections` | C1/C2 조회 활성·성공 여부, 마지막 이미지/결과 수신 시각, WS 접속 수 |
+| `GET /api/stats` | 객체 판정 수, 결과 프레임 FPS, 지연, C1/C2 카운터, 구간 유실 추정 |
+| `GET /api/inspections?limit=50` | 최근 검사 목록 |
+| `GET /api/defects?limit=50` | C3 status=defect 목록 |
+| `GET /api/export/csv` | 검사 이력 CSV |
+| `WS /ws/dashboard` | `stats`, `camera_frame`, `inspection_result`, `frame_result` |
+
+결과만 도착하지 않으면 C3 송신 구현/`C3_RESULTS_URL` 및 C3 `/metrics`의 `results_push_error_count`를 확인합니다. replica별 결과 push 실패 카운터는 현재 C4가 자동 조회하지 않습니다. 프레임에 detection이 없어도 frame_result와 성능 집계는 갱신됩니다. 검사 이력은 최대 500건이며 재시작 시 초기화됩니다.
 
 ```bash
 curl http://localhost:8003/api/connections
 curl http://localhost:8003/api/stats
 ```
 
-`camera.last_received_at_ms`만 갱신되고 `results.last_received_at_ms`가 null이면 이미지 경로는 연결됐지만 결과 전달 경로를 확인해야 합니다. 모든 호스트의 시계를 동기화해야 구간별 지연을 비교할 수 있습니다.
+## 검증
+
+프로젝트 루트:
+
+```bash
+node --test services/c4-visualizer/tests/test_dashboard.cjs
+```
+
+C4 Python 의존성 설치 환경:
+
+```bash
+cd services/c4-visualizer
+python -m unittest discover -s tests -p 'test_*.py' -v
+```

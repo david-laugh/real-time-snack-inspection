@@ -37,13 +37,13 @@ function loaded(d) { const img = d.images.at(-1); img.naturalWidth = 3; img.natu
 
 test('RLE row-major pixels, leading zero, and invalid-mask fallback', () => {
   const d = dashboard();
-  const pixels = d.run(`decodeMask({encoding:'rle',width:3,height:2,data:{order:'row-major',counts:[0,2,2,1,1]}},3,2,'pass').getContext('2d').pixels`);
+  const pixels = d.run(`decodeMask({encoding:'rle',width:3,height:2,data:{order:'row-major',counts:[0,2,2,1,1]}},3,2,'normal').getContext('2d').pixels`);
   assert.deepEqual(Array.from(pixels).filter((_,i) => i % 4 === 3), [96,96,0,0,96,0]);
   for (const counts of ['[7]', '[1,-1,6]', '[2]', '[1,1.5,3.5]']) {
-    assert.equal(d.run(`decodeMask({encoding:'rle',width:3,height:2,data:{order:'row-major',counts:${counts}}},3,2,'pass')`), null);
+    assert.equal(d.run(`decodeMask({encoding:'rle',width:3,height:2,data:{order:'row-major',counts:${counts}}},3,2,'normal')`), null);
   }
   assert.equal(d.run(`decodeMask(null,3,2,'pass')`), null);
-  assert.equal(d.run(`decodeMask({encoding:'rle',width:2,height:3},3,2,'pass')`), null);
+  assert.equal(d.run(`decodeMask({encoding:'rle',width:2,height:3},3,2,'normal')`), null);
 });
 
 test('matches either arrival order, clears empty frames, and ignores late results', () => {
@@ -74,7 +74,7 @@ test('a preview does not prevent delayed results from being displayed', () => {
 test('renders a matched mask and removes it on an empty next frame', () => {
   const d = dashboard();
   d.run(`updateCamera(${frame(1)}); updateFrameResult({trace_id:'t1',session_id:'s',frame_id:1,
-    detections:[{item_id:'cookie',bbox:[0,0,2,1],status:'fail',circularity:0.7,
+    detections:[{item_id:'cookie',bbox:[0,0,2,1],status:'defect',defect_score:0.7,
       mask:{encoding:'rle',width:3,height:2,data:{order:'row-major',counts:[0,2,4]}}}]});`);
   loaded(d);
   assert.equal(d.run('bboxOverlays.length'), 1);
@@ -92,4 +92,13 @@ test('metrics distinguish unavailable counters from zero', () => {
     c2_metrics:{dropped_stale:0,dropped_old:0,c4_skipped:null,c4_error:null}});`);
   assert.equal(d.run("id('pDrop').textContent"), '0');
   assert.equal(d.run("id('pLatencyTail').textContent"), '수신 대기');
+});
+
+test('normal, defect and unknown remain distinct in overlay and feed', () => {
+  const d = dashboard();
+  assert.equal(d.run("statusView('normal').label"), '정상');
+  assert.equal(d.run("statusView('unknown').label"), '판정 보류');
+  assert.equal(d.run("statusView('defect').label"), '불량');
+  d.run("addResult({status:'unknown',item_id:'c0',defect_score:0,defect_type:null})");
+  assert.match(d.run("id('feedList').innerHTML"), /판정 보류/);
 });
