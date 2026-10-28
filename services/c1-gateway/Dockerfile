@@ -1,5 +1,4 @@
-# C1 Gateway — skeleton
-# Future: FastAPI WebSocket server receiving 30fps stream from smartphone/simulator.
+# C1 Gateway — FastAPI WebSocket server receiving the phone/simulator stream.
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -14,6 +13,7 @@ COPY src/ ./src/
 
 EXPOSE 8000
 
-# TODO(Member A): replace with real entrypoint, e.g.
-# CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000"]
-CMD ["sleep", "infinity"]
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"
+
+CMD ["python", "src/c1_gateway.py", "serve"]
