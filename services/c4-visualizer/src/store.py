@@ -33,6 +33,8 @@ class InspectionStore:
         self._latency_buf: deque[float] = deque(maxlen=200)
         self._inference_latency_buf: deque[float] = deque(maxlen=200)
         self._fps_timestamps: deque[float] = deque(maxlen=60)
+        self._last_frame_id: int = -1
+        self._frame_drop_count: int = 0
 
     def add(self, rec: InspectionRecord):
         rec.timestamp = time.time()
@@ -44,6 +46,11 @@ class InspectionStore:
         if rec.inference_latency_ms > 0:
             self._inference_latency_buf.append(rec.inference_latency_ms)
         self._fps_timestamps.append(rec.timestamp)
+
+        if self._last_frame_id >= 0 and rec.frame_id > self._last_frame_id + 1:
+            self._frame_drop_count += rec.frame_id - self._last_frame_id - 1
+        if rec.frame_id > self._last_frame_id:
+            self._last_frame_id = rec.frame_id
 
     def get_recent(self, limit: int = 50) -> list[dict]:
         out = []
@@ -102,4 +109,6 @@ class InspectionStore:
             "inference_p95_ms": round(inf_p95, 1),
             "network_p50_ms": round(net_p50, 1),
             "network_p95_ms": round(net_p95, 1),
+            "frame_drop_count": self._frame_drop_count,
+            "last_frame_id": self._last_frame_id,
         }
