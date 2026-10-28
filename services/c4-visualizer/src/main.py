@@ -88,6 +88,8 @@ async def receive_result(result: DetectionResult):
                 "e2e_latency_ms": e2e,
                 "container_id": result.inference_container_id,
                 "frame_id": result.frame_id,
+                "bbox": det.bbox,
+                "defect_type": det.defect_type,
             },
         })
 
