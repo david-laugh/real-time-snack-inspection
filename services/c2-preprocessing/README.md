@@ -11,7 +11,7 @@
 ## Interface
 | 방향 | 프로토콜 / Endpoint | Payload |
 |---|---|---|
-| C1 → C2 | **MQTT** 구독 `psf/v1/frames/+` (QoS 0, 브로커 `mqtt-broker:1883`) | [`frame-envelope`](../../shared/schemas/frame-envelope.schema.json) JSON (`image_b64` JPEG) |
+| C1 → C2 | **MQTT** 구독 `{MQTT_TOPIC_PREFIX}/frames/+` = `psf/v1/frames/+` (QoS 0, 브로커 `mqtt-broker:1883`). C1은 `{prefix}/frames/{session_id}`로 발행 | [`frame-envelope`](../../shared/schemas/frame-envelope.schema.json) JSON (`image_b64` JPEG) |
 | C2 → Nginx | HTTP `POST http://nginx-inference-lb:8080/infer` | [`processed-frame`](../../shared/schemas/processed-frame.schema.json) JSON |
 | (디버깅) → C2 | HTTP `POST /preprocess` | frame-envelope JSON. MQTT와 같은 처리 함수를 쓰며 `/infer` 결과까지 기다린다 |
 | — | `GET /healthz` | `{"status": "ok" \| "degraded", "mqtt": {"connected": …}}` |
@@ -91,8 +91,8 @@ paho 네트워크 스레드: 수신 → JSON 파싱만 → 이벤트 루프로 �
 | `C2_JPEG_QUALITY` | `90` | |
 | `C2_VALIDATE_OUTPUT` | `true` | 출력 processed-frame 스키마 검증 |
 | `C2_MQTT_ENABLED` | `true` | MQTT 수신 사용 여부 (`false`면 HTTP `/preprocess`만) |
-| `C2_MQTT_HOST` / `C2_MQTT_PORT` | `mqtt-broker` / `1883` | 브로커 주소 |
-| `C2_MQTT_TOPIC` | `psf/v1/frames/+` | 구독 토픽 |
+| `C2_MQTT_HOST` / `C2_MQTT_PORT` | 공용 `MQTT_HOST` / `MQTT_PORT` → `mqtt-broker` / `1883` | 브로커 주소 |
+| `C2_MQTT_TOPIC` | `{MQTT_TOPIC_PREFIX}/frames/+` → `psf/v1/frames/+` | 구독 토픽 |
 | `C2_MQTT_QOS` | `0` | |
 | `C2_MQTT_CLIENT_ID` | (빈 값) | 비우면 `c2-preprocessing-<hostname>` |
 | `C2_MQTT_KEEPALIVE_S` | `30` | |
@@ -101,6 +101,9 @@ paho 네트워크 스레드: 수신 → JSON 파싱만 → 이벤트 루프로 �
 | `C2_MAX_FRAME_AGE_MS` | `500` | 이보다 오래된 프레임은 버림(`captured_at_ms` 기준). `0`이면 끔 |
 | `C2_EVENT_LOG` | (빈 값) | 프레임 이벤트 CSV 경로. 비우면 기록 안 함 |
 | `LOG_LEVEL` | `INFO` | `DEBUG`이면 프레임별 지름·배율·ROI를 로그로 남긴다 |
+
+**MQTT 설정 우선순위:** `C2_MQTT_*` 값 → 공용 `MQTT_HOST` / `MQTT_PORT` / `MQTT_TOPIC_PREFIX`(C1과 공유, `.env`가 env_file로
+모든 컨테이너에 주입) → 기본값 순으로 적용한다. 빈 값(`C2_MQTT_HOST=`)은 지정하지 않은 것으로 본다. 보통은 공용 변수만 두면 된다.
 
 **쿠키 지름은 촬영 세팅마다 다르다.** 예를 들어 시뮬레이터 PNG(1045×450)에서는 약 **78px**,
 폰 세로 촬영에서는 약 **170px**이다. 그래서 기본값은 자동 추정이다. 촬영 세팅이 고정되어 있고 쿠키 대부분이 불량인
@@ -116,73 +119,76 @@ docker run --rm -p 8001:8001 -e C2_MQTT_HOST=<broker> pocket-smart-factory/c2-pr
 curl http://localhost:8001/healthz
 ```
 
-### compose 설정 예시 (compose 파일은 Member A가 수정)
-현재 `docker-compose.yml`의 c2는 `command: ["sleep", "infinity"]`이고, MQTT 브로커 서비스가 없다. 필요한 설정은 다음과 같다.
+### compose 설정 예시 (C1 MQTT PR #5 기준, compose 파일은 Member A가 수정)
+브로커 서비스 `mqtt-broker`와 공용 변수 `MQTT_HOST` / `MQTT_PORT` / `MQTT_TOPIC_PREFIX`(`.env` → env_file)는 C1 PR #5에 있다.
+C2는 공용 변수를 그대로 읽으므로 c2 블록에서는 **`command` 제거와 이벤트 로그 볼륨만** 필요하다.
 ```yaml
-  mqtt-broker:
-    image: eclipse-mosquitto:2.0.20
-    volumes:
-      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro   # 예시 경로. 내용은 dev/mosquitto.conf 참고
-    networks: [smart-factory-net]
-
   c2-preprocessing:
-    # command 줄 삭제 (이미지 CMD = uvicorn :8001)
+    <<: *common-service
+    build:
+      context: ./services/c2-preprocessing
+    image: pocket-smart-factory/c2-preprocessing:dev
     environment:
       SERVICE_NAME: c2-preprocessing
-      C2_MQTT_HOST: mqtt-broker
-      C2_MQTT_TOPIC: psf/v1/frames/+
-      C2_MAX_INFLIGHT: "4"                     # C3 복제본 수 이상
-      C2_EVENT_LOG: /app/results/c2_events.csv
-    volumes:
+      C2_EVENT_LOG: /app/results/c2_events.csv          # 추가
+    expose:
+      - "${C2_PORT:-8001}"
+    volumes:                                              # 추가
       - ./benchmark/results:/app/results
     depends_on:
-      - mqtt-broker
+      - mqtt-broker                                       # 선택 (C2는 브로커가 늦게 떠도 재접속한다)
       - nginx-inference-lb
+    # command: ["sleep", "infinity"]                      # 삭제 → 이미지 CMD(uvicorn :8001)
 ```
-`depends_on`은 시작 순서만 정한다. 브로커가 늦게 떠도 C2가 자동으로 재접속한다.
+`C2_MAX_INFLIGHT`(기본 4)는 C3 복제본 수에 맞춰 `.env`에서 조정한다.
 
-### 로컬 통합 테스트: (발행) → MQTT → C2 → 가짜 `/infer`
-`dev/fake_infer.py`는 Nginx/C3 대역이다. processed-frame을 받아 스키마를 검증하고 로그만 남긴다
-(통과하면 200, 위반이면 422, `--delay-ms`로 C3 추론 시간을 흉내 낼 수 있다). `GET /stats`는 받은 수와
-도착 시점의 프레임 나이(`now - captured_at_ms`)를 보여준다.
+> **호스트 1883 충돌 주의:** C1 PR의 `mqtt-broker`는 호스트 포트 `${MQTT_HOST_PORT:-1883}`로 노출된다. 같은 PC에서 다른 MQTT 브로커
+> (예: 다른 프로젝트의 mosquitto)가 1883을 쓰고 있으면 기동에 실패한다. 그리고 컨테이너 밖에서 실행한 도구가 `localhost:1883`에
+> 붙으면 **그 다른 브로커에 발행**하게 된다. 이런 PC에서는 `.env`에 `MQTT_HOST_PORT=11883`을 두고, 로컬 도구도 11883을 쓴다.
 
-compose override 예시 [`dev/docker-compose.override.yml`](dev/docker-compose.override.yml): mqtt-broker + fake-infer + C2 (repo root에서)
+### 로컬 통합 테스트: 발행 → MQTT → C2 → 가짜 `/infer`
+- `dev/fake_infer.py`: Nginx/C3 대역. processed-frame을 스키마로 검증하고 로그만 남긴다. 통과하면 200, 위반이면 422로 응답한다.
+  `--delay-ms`로 C3 추론 시간을 흉내 낼 수 있고, `GET /stats`는 받은 수와 도착 시점 프레임 나이(`now - captured_at_ms`)를 보여준다.
+- `dev/publish_frames.py`: C1 대역 발행기. 기본 `localhost:11883`이며, **호스트의 `localhost:1883`에는 발행을 거부한다.**
+
+compose override 예시 [`dev/docker-compose.override.yml`](dev/docker-compose.override.yml) (repo root에서).
+브로커는 base의 `mqtt-broker`와 겹치지 않는 별도 서비스 `c2-dev-broker`이고, 호스트 `127.0.0.1:11883`에만 노출된다.
 ```bash
 docker build -t pocket-smart-factory/c2-preprocessing:dev services/c2-preprocessing
 docker compose -f docker-compose.yml -f services/c2-preprocessing/dev/docker-compose.override.yml \
-  up -d --no-deps mqtt-broker fake-infer c2-preprocessing
-curl localhost:8001/healthz                          # mqtt.connected: true
-# 호스트에서 발행: localhost:11883, 토픽 psf/v1/frames/<session>  (C1을 붙이면 C1이 발행)
+  up -d --no-deps c2-dev-broker fake-infer c2-preprocessing
+curl localhost:8001/healthz                                            # mqtt.connected: true
+python services/c2-preprocessing/dev/publish_frames.py --fps 30 --seconds 5
 curl localhost:8001/stats
 docker compose -f docker-compose.yml -f services/c2-preprocessing/dev/docker-compose.override.yml logs -f fake-infer
 ```
-브로커의 호스트 포트는 다른 MQTT 브로커와 겹치지 않도록 1883이 아니라 **11883**이다(`C2_DEV_MQTT_HOST_PORT`).
 
-로컬 프로세스로 띄울 때
+로컬 프로세스로 띄울 때 (services/c2-preprocessing에서)
 ```bash
-docker run -d --rm --name c2-dev-mosquitto -p 11883:1883 \
+docker run -d --rm --name c2-dev-mosquitto -p 127.0.0.1:11883:1883 \
   -v "$PWD/dev/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2.0.20
 python dev/fake_infer.py --port 8080 --delay-ms 0
 C2_MQTT_HOST=localhost C2_MQTT_PORT=11883 C2_INFER_URL=http://localhost:8080/infer \
   uvicorn c2.app:app --app-dir src --port 8001
+python dev/publish_frames.py --fps 30 --seconds 5
 ```
 
 ### 테스트
-MQTT 통합 테스트(`test_mqtt_integration.py`)는 실제 mosquitto가 필요하다. 브로커 주소는
-`C2_TEST_MQTT_HOST` / `C2_TEST_MQTT_PORT`(기본 `127.0.0.1:18830`)이고, 접속할 수 없으면 skip된다.
+MQTT 통합 테스트(`test_mqtt_integration.py`)는 **테스트가 직접 mosquitto 컨테이너를 띄운다**(`127.0.0.1`의 무작위 포트, 끝나면 삭제).
+`C2_TEST_MQTT_HOST` / `C2_TEST_MQTT_PORT`로 브로커를 지정할 수도 있지만, 호스트의 `localhost:1883`은 거부한다.
+docker가 없고 브로커도 지정하지 않으면 skip된다.
 ```bash
 cd services/c2-preprocessing
-docker run -d --rm --name c2-test-mosquitto -p 18830:1883 \
-  -v "$PWD/dev/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2.0.20
 pytest -rs        # 처리 시간·30fps 결과까지 보려면 pytest -s
 
-# Python 3.11 컨테이너 안에서 (repo root에서 실행)
+# Python 3.11 컨테이너 안에서 (repo root에서 실행, 사이드카 브로커를 지정)
 docker network create c2-test-net
 docker run -d --rm --name mqtt-test-broker --network c2-test-net \
   -v "$PWD/services/c2-preprocessing/dev/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro" eclipse-mosquitto:2.0.20
 docker run --rm --network c2-test-net -e C2_TEST_MQTT_HOST=mqtt-test-broker -e C2_TEST_MQTT_PORT=1883 \
   -v "$PWD:/repo:ro" -w /repo/services/c2-preprocessing pocket-smart-factory/c2-preprocessing:dev \
   sh -c "pip install -q pytest==8.3.4 && python -m pytest -p no:cacheprovider -rs"
+docker rm -f mqtt-test-broker && docker network rm c2-test-net
 ```
 | 테스트 | 내용 |
 |---|---|
@@ -192,7 +198,8 @@ docker run --rm --network c2-test-net -e C2_TEST_MQTT_HOST=mqtt-test-broker -e C
 | `test_phone_frames.py` | 폰 촬영 프레임 5장의 기대 개수와 위치 (원본, 1024 리사이즈, 576/720px 저해상도 입력) |
 | `test_concurrency.py` | 처리 중에도 이벤트 루프 응답, 동시 요청 병렬 처리, EMA 스레드 안전성, 워밍업 |
 | `test_frame_slots.py` | 세션별 최신 1장 보관, `dropped_stale` / `dropped_old`, 이벤트 CSV |
-| `test_mqtt_integration.py` | 실제 mosquitto: 발행 → 수신 → 가짜 `/infer` 도착, 30fps + `/infer` 200ms에서 지연 누적 없음·drop 기록, 오래된/잘못된 메시지, 연결 끊김 후 재접속 |
+| `test_mqtt_integration.py` | 실제 mosquitto: 발행 → 수신 → 가짜 `/infer` 도착, 30fps + `/infer` 200ms에서 지연 누적 없음·drop 기록, 오래된/잘못된 메시지, 연결 끊김 후 재접속, 호스트 `localhost:1883` 거부 |
+| `test_settings_mqtt.py` | MQTT 설정 우선순위 (`C2_MQTT_*` → 공용 `MQTT_*` → 기본값, 빈 값 처리) |
 | `test_fake_infer.py` | 가짜 `/infer` 검증 동작, C2 → 가짜 `/infer` 연결 |
 | `test_schema_sync.py` | `schemas/` 사본이 `shared/schemas` 원본과 같은지 |
 
@@ -209,7 +216,7 @@ src/c2/
   schemas.py   jsonschema 검증
 schemas/       shared/schemas 사본 (컨테이너용)
 reference/     검증용 원본 스크립트 (이미지에 포함 안 함)
-dev/           개발 도구: fake_infer.py (가짜 /infer), mosquitto.conf, docker-compose.override.yml
+dev/           개발 도구: fake_infer.py (가짜 /infer), publish_frames.py (dev 발행기), mosquitto.conf, docker-compose.override.yml
 tests/         pytest + fixtures
 PROPOSALS.md   공유 파일(스키마/compose/.env) 변경 제안
 ```

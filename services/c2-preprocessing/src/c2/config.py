@@ -1,7 +1,7 @@
 """환경변수(C2_ 접두어) 기반 설정."""
 from typing import Annotated, Literal, Optional
 
-from pydantic import field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -15,7 +15,7 @@ def _parse_ints(v, n):
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="C2_", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="C2_", extra="ignore", populate_by_name=True)
 
     # 긴 변 기준 리사이즈(px). 0이면 리사이즈하지 않는다. 원본이 더 작으면 확대하지 않는다.
     resize_long_side: int = 1024
@@ -39,10 +39,17 @@ class Settings(BaseSettings):
     infer_timeout_s: float = 3.0
 
     # ---- C1 -> C2 MQTT 수신 ----
+    # 우선순위: C2_MQTT_HOST / C2_MQTT_PORT / C2_MQTT_TOPIC
+    #        -> 공용 MQTT_HOST / MQTT_PORT / {MQTT_TOPIC_PREFIX}/frames/+  (.env가 env_file로 모든 컨테이너에 주입)
+    #        -> 기본값 mqtt-broker / 1883 / psf/v1/frames/+
+    # 빈 값("")은 지정하지 않은 것으로 본다. 최종 값은 _resolve_mqtt()에서 mqtt_host/port/topic에 채운다.
     mqtt_enabled: bool = True
-    mqtt_host: str = "mqtt-broker"
-    mqtt_port: int = 1883
-    mqtt_topic: str = "psf/v1/frames/+"
+    mqtt_host: Optional[str] = None
+    mqtt_port: Optional[int] = None
+    mqtt_topic: Optional[str] = None
+    shared_mqtt_host: Optional[str] = Field(None, validation_alias="MQTT_HOST")
+    shared_mqtt_port: Optional[int] = Field(None, validation_alias="MQTT_PORT")
+    shared_mqtt_topic_prefix: Optional[str] = Field(None, validation_alias="MQTT_TOPIC_PREFIX")
     mqtt_qos: int = 0
     mqtt_keepalive_s: int = 30
     mqtt_client_id: Optional[str] = None      # 비우면 c2-preprocessing-<hostname>
@@ -61,10 +68,11 @@ class Settings(BaseSettings):
 
     validate_output: bool = True
 
-    @field_validator("expected_diameter_px", "mqtt_client_id", "event_log", mode="before")
+    @field_validator("expected_diameter_px", "mqtt_client_id", "event_log", "mqtt_host", "mqtt_port", "mqtt_topic",
+                     "shared_mqtt_host", "shared_mqtt_port", "shared_mqtt_topic_prefix", mode="before")
     @classmethod
     def _empty_is_none(cls, v):
-        return None if v == "" else v
+        return None if isinstance(v, str) and not v.strip() else v
 
     @field_validator("hsv_low", "hsv_high", mode="before")
     @classmethod
@@ -80,3 +88,12 @@ class Settings(BaseSettings):
     @classmethod
     def _lower(cls, v):
         return v.lower() if isinstance(v, str) else v
+
+    @model_validator(mode="after")
+    def _resolve_mqtt(self):
+        self.mqtt_host = self.mqtt_host or self.shared_mqtt_host or "mqtt-broker"
+        self.mqtt_port = self.mqtt_port or self.shared_mqtt_port or 1883
+        if not self.mqtt_topic:
+            prefix = (self.shared_mqtt_topic_prefix or "psf/v1").rstrip("/")
+            self.mqtt_topic = f"{prefix}/frames/+"
+        return self
