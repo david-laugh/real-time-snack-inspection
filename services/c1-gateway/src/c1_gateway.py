@@ -724,7 +724,7 @@ label{font-size:14px;color:var(--muted);display:flex;gap:6px;align-items:center}
 <div class="bar">
   <div class="row">
     <label>FPS <select id="fps"><option>5</option><option>10</option><option>15</option><option selected>30</option></select></label>
-    <label>해상도 <select id="w"><option>480</option><option selected>640</option><option>960</option><option>1280</option></select></label>
+    <label>해상도 <select id="w"><option>640</option><option selected>960</option><option>1280</option></select></label>
     <label>화질 <select id="q"><option value="0.5">낮음</option><option value="0.7" selected>보통</option><option value="0.85">높음</option></select></label>
   </div>
   <div class="row"><button id="go">촬영 시작</button></div>
@@ -801,7 +801,7 @@ def main():
                    help="C2 엔드포인트 (compose: http://c2-preprocessing:8001/preprocess). 비우면 에코 모드")
     s.add_argument("--public-url", default=env("C1_PUBLIC_URL", ""), help="QR에 넣을 외부 HTTPS 주소")
     s.add_argument("--max-inflight", type=int, default=int(env("C1_MAX_INFLIGHT", 2)),
-                   help="C2로 동시에 나가 있을 요청 수")
+                   help="C2로 동시에 나가 있을 요청 수. C2가 C3 응답까지 기다리므로 C3 복제 수 + 1 권장")
     s.add_argument("--timeout", type=float, default=float(env("C1_TIMEOUT", 5.0)), help="C2 응답 대기(초)")
     s.add_argument("--token", default=env("C1_TOKEN", ""), help="스트림 접속 토큰, 'auto'면 자동 생성")
     s.add_argument("--dashboard-url", default=env("C1_DASHBOARD_URL", ""), help="상태 페이지에 걸 C4 주소")
@@ -829,7 +829,7 @@ def main():
     g.add_argument("--fps", type=float, default=30)
     g.add_argument("--clients", type=int, default=1)
     g.add_argument("--duration", type=float, default=20)
-    g.add_argument("--width", type=int, default=640)
+    g.add_argument("--width", type=int, default=960)
     g.add_argument("--quality", type=int, default=70)
     g.add_argument("--max-frames", type=int, default=300)
     g.add_argument("--token", default="")
