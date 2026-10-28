@@ -46,13 +46,26 @@ services:
     image: pocket-smart-factory/c1-gateway:dev
     environment:
       SERVICE_NAME: c1-gateway
+      C1_TRANSPORT: ${C1_TRANSPORT:-mqtt}
+      MQTT_HOST: mqtt-broker
+      MQTT_PORT: "1883"
       C1_DOWNSTREAM: ${C1_DOWNSTREAM:-http://c2-preprocessing:8001/preprocess}
     ports:
       - "${C1_PORT:-8000}:8000"
     volumes:
       - ./benchmark/results:/app/results
     depends_on:
+      - mqtt-broker
       - c2-preprocessing
+
+  # C1 -> C2 프레임 전달용 MQTT 브로커 (docs/api-contract.md 참고)
+  mqtt-broker:
+    <<: *common-service
+    image: eclipse-mosquitto:2.0
+    ports:
+      - "${MQTT_HOST_PORT:-1883}:1883"
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
 
   c2-preprocessing:
     <<: *common-service

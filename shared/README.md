@@ -4,7 +4,8 @@
 
 | Schema | Producer → Consumer |
 |---|---|
-| [`schemas/frame-envelope.schema.json`](schemas/frame-envelope.schema.json) | C1 Gateway → C2 Preprocessing |
+| [`schemas/frame-envelope.schema.json`](schemas/frame-envelope.schema.json) | C1 Gateway → C2 Preprocessing (MQTT) |
+| [`schemas/frame-ack.schema.json`](schemas/frame-ack.schema.json) | C2 Preprocessing → C1 Gateway (MQTT ack) |
 | [`schemas/processed-frame.schema.json`](schemas/processed-frame.schema.json) | C2 Preprocessing → Nginx → C3 Inference |
 | [`schemas/detection-result.schema.json`](schemas/detection-result.schema.json) | C3 Inference → C4 Visualizer |
 

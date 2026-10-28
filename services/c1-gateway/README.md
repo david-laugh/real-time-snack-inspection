@@ -2,19 +2,22 @@
 
 **Owner:** Member A
 
-스마트폰(브라우저) 또는 Simulator의 프레임을 WebSocket으로 받아 `frame-envelope`로 감싸 C2 Preprocessing으로 전달한다. 코드는 `src/c1_gateway.py` 파일 하나이며 서브커맨드 세 개로 나뉜다. `serve`는 게이트웨이 본체, `stub`은 C2가 없을 때 쓰는 가짜 C2, `loadgen`은 재현 가능한 부하를 만드는 송출기다.
+스마트폰(브라우저) 또는 Simulator의 프레임을 WebSocket으로 받아 `frame-envelope`로 감싸 C2 Preprocessing으로 전달한다. C1 → C2 전송은 **MQTT**가 기본이고(HTTP는 예비), 나머지 구간은 HTTP다. 코드는 `src/c1_gateway.py` 파일 하나이며 서브커맨드 세 개로 나뉜다. `serve`는 게이트웨이 본체, `stub`은 C2가 없을 때 쓰는 가짜 C2(MQTT/HTTP), `loadgen`은 재현 가능한 부하를 만드는 송출기다.
 
 ## 실행
 
+로컬에서 MQTT로 돌리려면 브로커가 먼저 떠 있어야 한다. 레포 루트에서 `docker compose up -d mqtt-broker`로 브로커만 띄울 수 있다(호스트 1883 포트).
+
 ```bash
 pip install -r requirements.txt
-python src/c1_gateway.py serve                         # C1_DOWNSTREAM이 비어 있으면 에코 모드(수신만)
-python src/c1_gateway.py stub --port 8001              # 다른 터미널: 계약 검증용 가짜 C2
-python src/c1_gateway.py serve --downstream http://localhost:8001/preprocess
+python src/c1_gateway.py stub --save-dir check_frames        # 가짜 C2: MQTT 구독, 검증 후 ack
+python src/c1_gateway.py serve --transport mqtt               # C1: localhost:1883으로 발행
 python src/c1_gateway.py loadgen --fps 30 --duration 20 --reset
 ```
 
-Compose에서는 `docker compose up -d c1-gateway`로 뜨고, 기본 downstream은 `http://c2-preprocessing:8001/preprocess`다. 상태 페이지는 `http://<host>:8000/`, 폰 카메라 페이지는 `/cam`이다.
+`serve`만 실행하면(전송 방식 지정 없음) 에코 모드로 수신만 한다. HTTP로 돌리려면 `stub --transport http --port 8001`과 `serve --downstream http://localhost:8001/preprocess`를 쓴다.
+
+Compose에서는 `C1_TRANSPORT=mqtt`, `MQTT_HOST=mqtt-broker`로 뜬다. 상태 페이지는 `http://<host>:8000/`, 폰 카메라 페이지는 `/cam`이다. 상태 페이지 상단에 MQTT 연결 여부가 표시된다.
 
 폰 브라우저의 카메라는 HTTPS에서만 열린다. `cloudflared tunnel --url http://localhost:8000`처럼 터널을 띄우고 그 주소를 `.env`의 `C1_PUBLIC_URL`에 넣으면 상태 페이지의 QR이 그 주소를 가리킨다. 컨테이너 안에서는 LAN IP를 알 수 없으므로 Docker로 띄울 때는 이 값이 사실상 필수다.
 
@@ -22,15 +25,17 @@ Compose에서는 `docker compose up -d c1-gateway`로 뜨고, 기본 downstream�
 
 **Client → C1** `WS /ws/stream?s=<session_id>&t=<token>`. 바이너리 메시지 하나가 프레임 하나이며, 앞 8바이트는 big-endian uint64 `captured_at_ms`, 나머지는 JPEG이다. 8바이트 없이 JPEG만 보내도 되고 그때 `captured_at_ms`는 C1 수신 시각으로 채운다. 텍스트 메시지 `{"type":"ping","t0":<client_ms>}`를 보내면 `{"type":"pong","t0":..,"server_ms":..}`로 답하므로, 클라이언트는 이걸로 시계 오프셋을 보정해 `captured_at_ms`를 서버 시계 기준으로 보낼 수 있다(`/cam` 페이지는 5초마다 보정한다). 접속 직후 C1은 `{"type":"hello","session_id":..}`를 보낸다.
 
-**C1 → C2** `POST http://c2-preprocessing:8001/preprocess`, 본문은 [`frame-envelope`](../../shared/schemas/frame-envelope.schema.json) JSON이고 이미지는 `image_b64`(JPEG)로 싣는다. 헤더 `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`를 함께 보낸다. C2가 2xx로 응답하면 C1은 그 프레임을 전달 완료로 본다.
+**C1 → C2 (MQTT, 기본)** C1은 `{MQTT_TOPIC_PREFIX}/frames/{session_id}`(기본 `psf/v1/frames/...`)에 [`frame-envelope`](../../shared/schemas/frame-envelope.schema.json) JSON을 QoS 0으로 발행한다. 이미지는 `image_b64`(JPEG)이고 `source_width`/`source_height`는 그 JPEG의 실제 크기다. C2는 `psf/v1/frames/+`를 구독하고, 프레임 처리가 끝나면 `psf/v1/acks`에 [`frame-ack`](../../shared/schemas/frame-ack.schema.json)(`trace_id`, `session_id`, `frame_id`, `status`)을 발행한다. 자세한 규칙은 [`docs/api-contract.md`](../../docs/api-contract.md)의 1a절에 있다.
+
+**C1 → C2 (HTTP, 예비)** `C1_TRANSPORT=http`이면 `POST {C1_DOWNSTREAM}`으로 같은 JSON을 보내고 헤더 `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`를 붙인다. 2xx 응답이 ack 역할을 한다.
 
 **ID 규칙** `trace_id`는 프레임마다 UUID v4(hex), `session_id`는 WebSocket 연결 단위, `frame_id`는 세션 안에서 0부터 단조 증가하는 정수다.
 
-**기타** `GET /healthz`, `GET /api/metrics`(입력/전달 FPS, C1 drop, C1 대기·C2 응답 p50/p95), `POST /api/metrics/reset`, 상태 페이지 `GET /`, 카메라 페이지 `GET /cam`.
+**기타** `GET /healthz`(전송 방식, MQTT 연결 여부), `GET /api/metrics`(입력/전달 FPS, C1 drop, C1 대기·C2 ack p50/p95, MQTT 상태), `POST /api/metrics/reset`, 상태 페이지 `GET /`, 카메라 페이지 `GET /cam`.
 
 ## Backpressure 정책
 
-C1은 세션마다 아직 보내지 않은 최신 프레임 1장만 보관한다. 새 프레임이 오면 보관 중이던 프레임은 버리고(`dropped`) 새 것으로 바꾼다. C2로 동시에 나가 있는 요청은 `C1_MAX_INFLIGHT`개로 제한하고(C2가 C3 결과까지 받은 뒤 응답하므로 이 값이 파이프라인 전체의 동시 처리 상한이다. Scale-out 실험에서는 C3 복제 수 + 1로 맞춘다), `C1_TIMEOUT` 안에 응답이 없으면 실패로 기록하고 다음 프레임으로 넘어간다. 뒤쪽이 느려져도 C1에서 오래된 프레임이 쌓이지 않으므로 지연이 누적되지 않는다.
+C1은 세션마다 아직 보내지 않은 최신 프레임 1장만 보관한다. 새 프레임이 오면 보관 중이던 프레임은 버리고(`dropped`) 새 것으로 바꾼다. ack를 기다리는 프레임은 `C1_MAX_INFLIGHT`개로 제한하고, `C1_TIMEOUT` 안에 ack가 없으면 timeout으로 기록하고 다음 프레임으로 넘어간다. C2가 C3 결과까지 받은 뒤 ack하므로 이 값이 파이프라인 전체의 동시 처리 상한이며, Scale-out 실험에서는 C3 복제 수 + 1로 맞춘다. 뒤쪽이 느려져도 C1에서 오래된 프레임이 쌓이지 않으므로 지연이 누적되지 않는다.
 
 ## 측정
 
@@ -38,5 +43,5 @@ C1은 세션마다 아직 보내지 않은 최신 프레임 1장만 보관한다
 
 ## 남은 일
 
-- Overlay용 원본 프레임을 C4로 미러링할지 결정 (C4 open issue)
-- C2 실제 엔드포인트와 응답 형식 확정 후 통합 테스트
+- C2의 MQTT 구독·ack 구현 후 통합 테스트
+- Overlay용 원본 프레임: C4가 `psf/v1/frames/+`를 구독하면 C1 수정 없이 받을 수 있음 (C4와 논의)

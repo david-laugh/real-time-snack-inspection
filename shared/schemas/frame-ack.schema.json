@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pocket-smart-factory/schemas/frame-ack.schema.json",
+  "title": "FrameAck",
+  "description": "C2 Preprocessing -> C1 Gateway over MQTT ({prefix}/acks). Sent once per frame-envelope after C2 finished handling it (normally after the /infer response). C1 uses it for flow control (max in-flight) and drop accounting.",
+  "type": "object",
+  "required": ["trace_id", "session_id", "frame_id", "status"],
+  "properties": {
+    "trace_id": { "type": "string", "description": "trace_id of the acknowledged frame-envelope." },
+    "session_id": { "type": "string" },
+    "frame_id": { "type": "integer", "minimum": 0 },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "error"],
+      "description": "ok: frame processed and forwarded. error: rejected or failed (see detail)."
+    },
+    "detail": { "type": "string", "description": "Reason when status = error." },
+    "preprocess_started_at_ms": { "type": "integer" },
+    "preprocess_finished_at_ms": { "type": "integer" }
+  },
+  "additionalProperties": false
+}

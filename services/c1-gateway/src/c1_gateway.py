@@ -3,25 +3,30 @@
 C1 Gateway - pocket-smart-factory
 
 폰/Simulator 프레임을 WebSocket으로 받아 frame-envelope로 감싸 C2로 넘긴다.
-계약: shared/schemas/frame-envelope.schema.json, docs/api-contract.md
+계약: shared/schemas/frame-envelope.schema.json, frame-ack.schema.json, docs/api-contract.md
 
   serve    게이트웨이 본체 (상태 페이지 /, 폰 카메라 페이지 /cam, WS /ws/stream)
-  stub     가짜 C2. 받은 envelope를 검증하고, 원하면 가짜 detection-result를 C4로 보낸다
+  stub     가짜 C2. 받은 envelope와 이미지를 검증하고 ack를 돌려준다 (MQTT 또는 HTTP)
   loadgen  합성 프레임/영상/이미지 폴더를 지정 FPS로 /ws/stream에 송출 (벤치마크)
 
-Client → C1 프로토콜 (WS /ws/stream?s=<session_id>)
+Client → C1 (WS /ws/stream?s=<session_id>)
   binary 메시지 = [8바이트 big-endian uint64 captured_at_ms][JPEG 바이트]
     JPEG만 보내도 된다(FF D8로 시작). 그때 captured_at_ms = 수신 시각.
   text 메시지  = {"type":"ping","t0":<client_ms>}
     → {"type":"pong","t0":..,"server_ms":..}  (클라이언트가 시계 오프셋 보정에 사용)
 
-C1 → C2
-  POST {C1_DOWNSTREAM}  (기본 http://c2-preprocessing:8001/preprocess)
-  JSON frame-envelope, 헤더 X-Trace-Id / X-Frame-Id / X-Session-Id
-  C1은 C2 응답(2xx)을 받으면 그 프레임을 완료로 본다.
+C1 → C2 (C1_TRANSPORT=mqtt, 기본 전송 방식)
+  publish  {MQTT_TOPIC_PREFIX}/frames/{session_id}   QoS 0, payload = frame-envelope JSON (image_b64 포함)
+  C2 → C1 publish {MQTT_TOPIC_PREFIX}/acks           QoS 0, payload = frame-ack JSON
+  C1은 ack(status ok/error)를 받으면 그 프레임을 완료로 보고, C1_TIMEOUT 안에 ack가 없으면 timeout 처리.
+  동시에 ack를 기다리는 프레임은 C1_MAX_INFLIGHT개로 제한한다.
 
-환경 변수 (.env): C1_PORT, C1_DOWNSTREAM, C1_PUBLIC_URL, C1_MAX_INFLIGHT,
-  C1_TIMEOUT, C1_TOKEN, C1_DASHBOARD_URL, C1_EVENT_LOG, SCHEMA_VERSION, LOG_LEVEL
+C1 → C2 (C1_TRANSPORT=http, 예비)
+  POST {C1_DOWNSTREAM} JSON frame-envelope, 헤더 X-Trace-Id / X-Frame-Id / X-Session-Id. 2xx = 완료.
+
+환경 변수 (.env): C1_PORT, C1_TRANSPORT(echo|http|mqtt), C1_DOWNSTREAM, MQTT_HOST, MQTT_PORT,
+  MQTT_TOPIC_PREFIX, C1_PUBLIC_URL, C1_MAX_INFLIGHT, C1_TIMEOUT, C1_TOKEN, C1_DASHBOARD_URL,
+  C1_EVENT_LOG, SCHEMA_VERSION, LOG_LEVEL
 """
 
 import argparse
@@ -85,9 +90,98 @@ def split_message(data: bytes, received_ms: int):
     return None, None
 
 
+
+ENVELOPE_REQUIRED = ["schema_version", "trace_id", "session_id", "frame_id", "captured_at_ms",
+                     "source_width", "source_height", "format", "gateway_received_at_ms"]
+
+
+def validate_envelope(env):
+    """frame-envelope 필드와 image_b64를 검사한다. (jpeg_bytes, None) 또는 (None, 이유)."""
+    from PIL import Image
+    if not isinstance(env, dict):
+        return None, "JSON 객체가 아님"
+    missing = [k for k in ENVELOPE_REQUIRED if k not in env]
+    extra = [k for k in env if k not in ENVELOPE_REQUIRED + ["image_b64"]]
+    if missing or extra:
+        return None, f"필드 오류: 누락 {missing}, 정의 외 {extra}"
+    b64 = env.get("image_b64")
+    if not b64:
+        return None, "image_b64 없음"
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        return None, "base64 디코딩 실패"
+    if raw[:2] != b"\xff\xd8":
+        return None, "JPEG 시작 바이트(FF D8) 아님"
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im.load()
+    except Exception as e:
+        return None, f"이미지 열기 실패: {e}"
+    if im.format != "JPEG":
+        return None, f"형식이 JPEG 아님: {im.format}"
+    if (im.width, im.height) != (env["source_width"], env["source_height"]):
+        return None, (f"크기 불일치: 실제 {im.width}x{im.height}, "
+                      f"envelope {env['source_width']}x{env['source_height']}")
+    return raw, None
+
+
+class MqttLink:
+    """paho-mqtt 네트워크 스레드와 asyncio 루프를 잇는 얇은 래퍼. 끊기면 자동 재접속한다."""
+
+    def __init__(self, host, port, client_id, subscriptions=(), on_message=None):
+        import paho.mqtt.client as mqtt
+        self.host, self.port = host, port
+        self.loop = asyncio.get_running_loop()
+        self.subscriptions = list(subscriptions)
+        self.on_message = on_message
+        self.connected = False
+        self.last_error = ""
+        self.ok_rc = mqtt.MQTT_ERR_SUCCESS
+        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+        c.reconnect_delay_set(min_delay=1, max_delay=5)
+        c.on_connect = self._on_connect
+        c.on_disconnect = self._on_disconnect
+        c.on_message = self._on_message
+        self.client = c
+        c.connect_async(host, port, keepalive=30)
+        c.loop_start()
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        if reason_code.is_failure:
+            self.last_error = f"MQTT 접속 거부: {reason_code}"
+            return
+        self.connected = True
+        for t in self.subscriptions:
+            client.subscribe(t, qos=0)
+
+    def _on_disconnect(self, client, userdata, flags, reason_code, properties):
+        self.connected = False
+        if reason_code.is_failure:
+            self.last_error = f"MQTT 연결 끊김: {reason_code}"
+
+    def _on_message(self, client, userdata, msg):
+        if self.on_message:
+            self.loop.call_soon_threadsafe(self.on_message, msg.topic, msg.payload)
+
+    def publish(self, topic, payload):
+        """QoS 0 발행. 실패하면 이유 문자열, 성공하면 None."""
+        if not self.connected:
+            return f"MQTT 미연결 ({self.host}:{self.port})"
+        info = self.client.publish(topic, payload, qos=0)
+        return None if info.rc == self.ok_rc else f"MQTT publish 실패 rc={info.rc}"
+
+    def stop(self):
+        try:
+            self.client.disconnect()
+        finally:
+            self.client.loop_stop()
+
+
 # ════════════════════════════════════════════════════════════════════
 # serve
 # ════════════════════════════════════════════════════════════════════
+
 
 class Frame:
     __slots__ = ("envelope", "jpeg", "forwarded_at")
@@ -131,18 +225,22 @@ class EventLog:
 class Gateway:
     """
     ingest()     세션별 '최신 1장' 슬롯에 넣는다. 아직 안 보낸 프레임을 덮어쓰면 dropped.
-    dispatcher() C2로 나가 있는 요청이 max_inflight 미만일 때만 슬롯에서 꺼내 보낸다.
-    뒤쪽이 느리면 C1에서 오래된 프레임을 버리므로 지연이 쌓이지 않는다.
+    dispatcher() C2가 처리 중인 프레임이 max_inflight 미만일 때만 슬롯에서 꺼내 보낸다.
+    완료 판정: http는 C2의 2xx 응답, mqtt는 C2가 보낸 ack. 둘 다 C2가 C3 결과까지 받은 뒤 오므로
+    max_inflight가 파이프라인 전체의 동시 처리 상한이 된다 (C3 복제 수 + 1 권장).
     """
 
     def __init__(self, a):
         self.a = a
-        self.echo = not a.downstream
+        self.transport = a.transport
+        self.echo = self.transport == "echo"
         self.pending = collections.OrderedDict()   # session_id -> Frame
         self.sessions = {}                         # session_id -> next frame_id
+        self.awaiting = {}                         # trace_id -> (Frame, t0)  (mqtt ack 대기)
         self.viewers = set()
         self.preview = None
         self.last_error = ""
+        self.mq = None
         self.log = EventLog(a.event_log)
         self.reset()
 
@@ -153,23 +251,35 @@ class Gateway:
         self.rtt = collections.deque(maxlen=1000)
         self.wait = collections.deque(maxlen=1000)
         self.skew = collections.deque(maxlen=200)
-        self.c = collections.Counter(received=0, forwarded=0, dropped=0, error=0, timeout=0, bad=0)
+        self.c = collections.Counter(received=0, forwarded=0, dropped=0, error=0, timeout=0,
+                                     bad=0, late_ack=0)
 
     async def start(self):
-        import httpx
         self.window = asyncio.Semaphore(self.a.max_inflight)
         self.inflight = 0
         self.has_pending = asyncio.Event()
-        self.client = httpx.AsyncClient(timeout=self.a.timeout,
-                                        limits=httpx.Limits(max_connections=self.a.max_inflight + 4))
+        self.client = None
         self.tasks = [asyncio.create_task(self.stats_loop())]
+        if self.transport == "http":
+            import httpx
+            self.client = httpx.AsyncClient(timeout=self.a.timeout,
+                                            limits=httpx.Limits(max_connections=self.a.max_inflight + 4))
+        elif self.transport == "mqtt":
+            p = self.a.topic_prefix.rstrip("/")
+            self.frame_topic = p + "/frames/{}"
+            self.mq = MqttLink(self.a.mqtt_host, self.a.mqtt_port, f"c1-gateway-{secrets.token_hex(3)}",
+                               subscriptions=[p + "/acks"], on_message=self.on_ack)
+            self.tasks.append(asyncio.create_task(self.janitor()))
         if not self.echo:
             self.tasks.append(asyncio.create_task(self.dispatcher()))
 
     async def stop(self):
         for t in self.tasks:
             t.cancel()
-        await self.client.aclose()
+        if self.client:
+            await self.client.aclose()
+        if self.mq:
+            self.mq.stop()
         self.log.flush()
 
     # ── 입력 ─────────────────────────────────────────
@@ -216,34 +326,82 @@ class Gateway:
                 await self.has_pending.wait()
             _, f = self.pending.popitem(last=False)     # 세션 간 라운드로빈
             self.inflight += 1
-            asyncio.create_task(self.send(f))
+            f.forwarded_at = now_ms()
+            self.wait.append(f.forwarded_at - f.envelope["gateway_received_at_ms"])
+            if self.transport == "mqtt":
+                self.send_mqtt(f)
+            else:
+                asyncio.create_task(self.send_http(f))
 
-    async def send(self, f):
+    def finish(self, f, event, rtt=None, detail=""):
         env = f.envelope
-        body = dict(env, image_b64=base64.b64encode(f.jpeg).decode("ascii"))
-        t0 = time.perf_counter()
-        f.forwarded_at = now_ms()
-        self.wait.append(f.forwarded_at - env["gateway_received_at_ms"])
-        try:
-            r = await self.client.post(self.a.downstream, json=body, headers={
-                "X-Trace-Id": env["trace_id"], "X-Frame-Id": str(env["frame_id"]),
-                "X-Session-Id": env["session_id"]})
-            rtt = (time.perf_counter() - t0) * 1000
-            if r.status_code >= 300:
-                raise RuntimeError(f"C2 HTTP {r.status_code}: {r.text[:120]}")
+        if event == "forwarded":
             self.c["forwarded"] += 1
             self.fw_t.append(now_ms())
-            self.rtt.append(rtt)
-            self.log.write(env, "forwarded", rtt)
+            if rtt is not None:
+                self.rtt.append(rtt)
+        else:
+            self.c[event] += 1
+            self.last_error = detail[:200]
+        self.log.write(env, event, rtt, detail)
+        self.inflight -= 1
+        self.window.release()
+
+    def body_of(self, f):
+        return json.dumps(dict(f.envelope, image_b64=base64.b64encode(f.jpeg).decode("ascii")),
+                          separators=(",", ":"))
+
+    def send_mqtt(self, f):
+        env = f.envelope
+        err = self.mq.publish(self.frame_topic.format(env["session_id"]), self.body_of(f))
+        if err:
+            self.finish(f, "error", detail=err)
+            return
+        self.awaiting[env["trace_id"]] = (f, time.perf_counter())
+
+    def on_ack(self, topic, payload):
+        try:
+            ack = json.loads(payload)
+            tid = ack["trace_id"]
+        except Exception:
+            self.c["bad"] += 1
+            return
+        item = self.awaiting.pop(tid, None)
+        if item is None:
+            self.c["late_ack"] += 1          # timeout 뒤에 왔거나 다른 C1의 프레임
+            return
+        f, t0 = item
+        rtt = (time.perf_counter() - t0) * 1000
+        if ack.get("status") == "ok":
+            self.finish(f, "forwarded", rtt)
+        else:
+            self.finish(f, "error", rtt, f"C2 ack error: {ack.get('detail', '')}")
+
+    async def janitor(self):
+        while True:
+            await asyncio.sleep(0.2)
+            limit = time.perf_counter() - self.a.timeout
+            for tid, (f, t0) in list(self.awaiting.items()):
+                if t0 < limit:
+                    self.awaiting.pop(tid, None)
+                    self.finish(f, "timeout", detail=f"C2 ack 없음 ({self.a.timeout}s)")
+
+    async def send_http(self, f):
+        env = f.envelope
+        t0 = time.perf_counter()
+        try:
+            r = await self.client.post(self.a.downstream, content=self.body_of(f), headers={
+                "Content-Type": "application/json", "X-Trace-Id": env["trace_id"],
+                "X-Frame-Id": str(env["frame_id"]), "X-Session-Id": env["session_id"]})
+            rtt = (time.perf_counter() - t0) * 1000
+            if r.status_code >= 300:
+                self.finish(f, "error", rtt, f"C2 HTTP {r.status_code}: {r.text[:120]}")
+            else:
+                self.finish(f, "forwarded", rtt)
         except Exception as e:
             import httpx
             kind = "timeout" if isinstance(e, httpx.TimeoutException) else "error"
-            self.c[kind] += 1
-            self.last_error = f"{type(e).__name__}: {e}"[:200]
-            self.log.write(env, kind, detail=self.last_error)
-        finally:
-            self.inflight -= 1
-            self.window.release()
+            self.finish(f, kind, detail=f"{type(e).__name__}: {e}")
 
     # ── 상태 ─────────────────────────────────────────
     async def stats_loop(self):
@@ -268,6 +426,13 @@ class Gateway:
                     self.viewers.discard(v)
             self.preview = None
 
+    def mqtt_state(self):
+        if not self.mq:
+            return None
+        return {"connected": self.mq.connected, "broker": f"{self.a.mqtt_host}:{self.a.mqtt_port}",
+                "frame_topic": self.frame_topic.format("<session_id>"),
+                "ack_topic": self.a.topic_prefix.rstrip("/") + "/acks", "last_error": self.mq.last_error}
+
     def stats(self):
         t = now_ms()
         win = min(3000.0, max(1.0, t - self.t_reset))
@@ -283,8 +448,9 @@ class Gateway:
 
         rx = self.c["received"]
         return {
-            "mode": "echo" if self.echo else "forward",
-            "downstream": self.a.downstream or None,
+            "transport": self.transport, "mode": self.transport,
+            "downstream": self.a.downstream if self.transport == "http" else None,
+            "mqtt": self.mqtt_state(),
             "sessions": len(self.sessions), "viewers": len(self.viewers),
             "input_fps": fps(self.rx_t), "forwarded_fps": fps(self.fw_t),
             "drop_rate_c1": round(self.c["dropped"] / rx, 4) if rx else 0.0,
@@ -332,12 +498,14 @@ def build_app(a):
 
     @app.get("/healthz")
     async def healthz():
-        return {"status": "ok", "service": "c1-gateway", "mode": "echo" if gw.echo else "forward"}
+        return {"status": "ok", "service": "c1-gateway", "transport": gw.transport,
+                "mqtt_connected": gw.mq.connected if gw.mq else None}
 
     @app.get("/api/info")
     async def info(request: Request):
-        return {"cam_url": cam_url(request), "mode": "echo" if gw.echo else "forward",
-                "downstream": a.downstream or None, "dashboard_url": a.dashboard_url or None}
+        return {"cam_url": cam_url(request), "transport": gw.transport,
+                "downstream": a.downstream if gw.transport == "http" else None,
+                "mqtt": gw.mqtt_state(), "dashboard_url": a.dashboard_url or None}
 
     @app.get("/qr.png")
     async def qr(request: Request):
@@ -401,16 +569,30 @@ def build_app(a):
     return app
 
 
+
 def env(name, default):
     return os.getenv(name, default)
 
 
+def resolve_transport(a):
+    t = (a.transport or "auto").lower()
+    if t == "auto":
+        t = "http" if a.downstream else "echo"
+    if t == "http" and not a.downstream:
+        sys.exit("C1_TRANSPORT=http 이면 --downstream(C1_DOWNSTREAM)이 필요합니다.")
+    return t
+
+
 def cmd_serve(a):
     import uvicorn
+    a.transport = resolve_transport(a)
     if a.token == "auto":
         a.token = secrets.token_urlsafe(8)
     scheme = "https" if a.ssl_certfile else "http"
-    print(f"[C1] mode: {'forward → ' + a.downstream if a.downstream else 'echo (C1_DOWNSTREAM 비어 있음)'}")
+    target = {"echo": "echo (C2로 보내지 않음)",
+              "http": f"http → {a.downstream}",
+              "mqtt": f"mqtt → {a.mqtt_host}:{a.mqtt_port} {a.topic_prefix.rstrip('/')}/frames/<session>"}[a.transport]
+    print(f"[C1] transport: {target}")
     print(f"[C1] status: {scheme}://{lan_ip()}:{a.port}/   stream: /ws/stream")
     if a.public_url:
         print(f"[C1] public url: {a.public_url}")
@@ -421,107 +603,144 @@ def cmd_serve(a):
 
 
 # ════════════════════════════════════════════════════════════════════
-# stub: 가짜 C2 (+ 선택적으로 가짜 C3 결과를 C4로)
+# stub: 가짜 C2
 # ════════════════════════════════════════════════════════════════════
 
-ENVELOPE_REQUIRED = ["schema_version", "trace_id", "session_id", "frame_id", "captured_at_ms",
-                     "source_width", "source_height", "format", "gateway_received_at_ms"]
+class StubWorker:
+    """envelope 검증 → (선택) 이미지 저장 → 처리 시간 흉내 → 결과. HTTP/MQTT 스텁이 같이 쓴다."""
 
+    def __init__(self, a):
+        self.a = a
+        self.sem = asyncio.Semaphore(a.workers)
+        self.st = collections.Counter(ok=0, bad=0, saved=0)
+        self.last_image = None
+        self.client = None
+        if a.save_dir:
+            os.makedirs(a.save_dir, exist_ok=True)
 
-def cmd_stub(a):
-    import httpx
-    import uvicorn
-    from contextlib import asynccontextmanager
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse
+    async def handle(self, env):
+        """반환: (ack dict, 오류 이유 또는 None)"""
+        raw, why = await asyncio.to_thread(validate_envelope, env)
+        ack = {k: env.get(k) for k in ("trace_id", "session_id", "frame_id")} if isinstance(env, dict) else {}
+        if why:
+            self.st["bad"] += 1
+            print(f"[stub C2] 검증 실패 frame {ack.get('frame_id')}: {why}", file=sys.stderr)
+            return dict(ack, status="error", detail=why), why
+        self.last_image = {"session_id": env["session_id"], "frame_id": env["frame_id"],
+                           "size": f"{env['source_width']}x{env['source_height']}", "bytes": len(raw)}
+        if self.a.save_dir and env["frame_id"] % self.a.save_every == 0:
+            name = f"{env['session_id']}_{env['frame_id']:06d}.jpg"
+            with open(os.path.join(self.a.save_dir, name), "wb") as fp:
+                fp.write(raw)
+            self.st["saved"] += 1
+        async with self.sem:
+            started = now_ms()
+            await asyncio.sleep(max(0.0, random.gauss(self.a.delay_ms, self.a.jitter_ms)) / 1000.0)
+            finished = now_ms()
+        self.st["ok"] += 1
+        if self.a.c4:
+            asyncio.create_task(self.to_c4(env, started, finished))
+        return dict(ack, status="ok", preprocess_started_at_ms=started,
+                    preprocess_finished_at_ms=finished), None
 
-    st = {"bad": 0, "ok": 0, "image_ok": 0, "image_bad": 0, "saved": 0, "last_image": None}
-    if a.save_dir:
-        os.makedirs(a.save_dir, exist_ok=True)
-
-    def check_image(env):
-        """image_b64가 실제 JPEG인지, 크기가 envelope의 source_width/height와 같은지 확인."""
-        from PIL import Image
-        b64 = env.get("image_b64")
-        if not b64:
-            return None, "image_b64 없음"
-        try:
-            raw = base64.b64decode(b64, validate=True)
-        except Exception:
-            return None, "base64 디코딩 실패"
-        if raw[:2] != b"\xff\xd8":
-            return None, "JPEG 시작 바이트(FF D8) 아님"
-        try:
-            im = Image.open(io.BytesIO(raw))
-            im.load()
-        except Exception as e:
-            return None, f"이미지 열기 실패: {e}"
-        if im.format != "JPEG":
-            return None, f"형식이 JPEG 아님: {im.format}"
-        if (im.width, im.height) != (env["source_width"], env["source_height"]):
-            return None, (f"크기 불일치: 실제 {im.width}x{im.height}, "
-                          f"envelope {env['source_width']}x{env['source_height']}")
-        return raw, None
-
-    @asynccontextmanager
-    async def lifespan(_):
-        st["sem"] = asyncio.Semaphore(a.workers)
-        st["client"] = httpx.AsyncClient(timeout=5.0)
-        yield
-        await st["client"].aclose()
-
-    app = FastAPI(title="C2 stub", lifespan=lifespan)
-
-    async def to_c4(env, started, finished):
+    async def to_c4(self, env, started, finished):
+        import httpx
+        if self.client is None:
+            self.client = httpx.AsyncClient(timeout=5.0)
         res = {k: env[k] for k in ("schema_version", "trace_id", "session_id", "frame_id", "captured_at_ms")}
         res.update(inference_container_id="stub", inference_started_at_ms=started,
                    inference_finished_at_ms=finished, inference_latency_ms=float(finished - started),
                    detections=[])
         try:
-            await st["client"].post(a.c4.rstrip("/") + "/results", json=res)
+            await self.client.post(self.a.c4.rstrip("/") + "/results", json=res)
         except Exception as e:
             print(f"[stub] C4 post failed: {e}", file=sys.stderr)
 
+    def summary(self):
+        return {**self.st, "last_image": self.last_image}
+
+
+def cmd_stub(a):
+    head = (f"delay={a.delay_ms}±{a.jitter_ms}ms  workers={a.workers}"
+            + (f"  → C4 {a.c4}" if a.c4 else "")
+            + (f"  이미지 저장: {a.save_dir} ({a.save_every}장마다)" if a.save_dir else ""))
+    if a.transport == "mqtt":
+        stub_mqtt(a, head)
+    else:
+        stub_http(a, head)
+
+
+def stub_mqtt(a, head):
+    prefix = a.topic_prefix.rstrip("/")
+
+    async def main():
+        worker = StubWorker(a)
+        link = None
+
+        async def process(topic, payload):
+            try:
+                env = json.loads(payload)
+            except ValueError:
+                worker.st["bad"] += 1
+                print("[stub C2] JSON 파싱 실패", file=sys.stderr)
+                return
+            ack, _ = await worker.handle(env)
+            if isinstance(env, dict) and topic.rsplit("/", 1)[-1] != env.get("session_id"):
+                print(f"[stub C2] 경고: 토픽 세션({topic})과 envelope session_id 불일치", file=sys.stderr)
+            if ack.get("trace_id"):
+                link.publish(prefix + "/acks", json.dumps(ack))
+
+        def on_message(topic, payload):
+            asyncio.create_task(process(topic, payload))
+
+        link = MqttLink(a.mqtt_host, a.mqtt_port, f"c2-stub-{secrets.token_hex(3)}",
+                        subscriptions=[prefix + "/frames/+"], on_message=on_message)
+        print(f"[stub C2] mqtt {a.mqtt_host}:{a.mqtt_port}  sub {prefix}/frames/+  ack → {prefix}/acks  {head}")
+        last = None
+        while True:
+            await asyncio.sleep(2)
+            s = (link.connected, worker.st["ok"], worker.st["bad"], worker.st["saved"])
+            if s != last:
+                state = "연결됨" if link.connected else f"연결 안 됨 {link.last_error}"
+                print(f"[stub C2] {state}  ok={s[1]} bad={s[2]} saved={s[3]}")
+                last = s
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+
+
+def stub_http(a, head):
+    import uvicorn
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+
+    state = {}
+
+    @asynccontextmanager
+    async def lifespan(_):
+        state["w"] = StubWorker(a)
+        yield
+
+    app = FastAPI(title="C2 stub", lifespan=lifespan)
+
     @app.get("/healthz")
     async def healthz():
-        return {"status": "ok", "service": "c2-stub",
-                **{k: st[k] for k in ("ok", "bad", "image_ok", "image_bad", "saved", "last_image")}}
+        return {"status": "ok", "service": "c2-stub", **state["w"].summary()}
 
     @app.post("/preprocess")
     async def preprocess(request: Request):
         env = await request.json()
-        missing = [k for k in ENVELOPE_REQUIRED if k not in env]
-        extra = [k for k in env if k not in ENVELOPE_REQUIRED + ["image_b64"]]
-        hdr_ok = request.headers.get("x-trace-id") == env.get("trace_id")
-        if missing or extra or not hdr_ok:
-            st["bad"] += 1
-            return JSONResponse({"error": "contract violation", "missing": missing,
-                                 "extra": extra, "header_trace_match": hdr_ok}, status_code=422)
-        raw, why = await asyncio.to_thread(check_image, env)
+        if request.headers.get("x-trace-id") != (env or {}).get("trace_id"):
+            return JSONResponse({"error": "X-Trace-Id 헤더와 trace_id 불일치"}, status_code=422)
+        ack, why = await state["w"].handle(env)
         if why:
-            st["image_bad"] += 1
-            print(f"[stub C2] 이미지 오류 frame {env['frame_id']}: {why}", file=sys.stderr)
-            return JSONResponse({"error": "image check failed", "detail": why}, status_code=422)
-        st["image_ok"] += 1
-        st["last_image"] = {"session_id": env["session_id"], "frame_id": env["frame_id"],
-                            "size": f"{env['source_width']}x{env['source_height']}", "bytes": len(raw)}
-        if a.save_dir and env["frame_id"] % a.save_every == 0:
-            name = f"{env['session_id']}_{env['frame_id']:06d}.jpg"
-            with open(os.path.join(a.save_dir, name), "wb") as fp:
-                fp.write(raw)
-            st["saved"] += 1
-        async with st["sem"]:
-            started = now_ms()
-            await asyncio.sleep(max(0.0, random.gauss(a.delay_ms, a.jitter_ms)) / 1000.0)
-            finished = now_ms()
-        st["ok"] += 1
-        if a.c4:
-            asyncio.create_task(to_c4(env, started, finished))
-        return {"ok": True, "trace_id": env["trace_id"], "frame_id": env["frame_id"]}
+            return JSONResponse({"error": "contract violation", "detail": why}, status_code=422)
+        return ack
 
-    print(f"[stub C2] :{a.port}/preprocess  delay={a.delay_ms}±{a.jitter_ms}ms  workers={a.workers}"
-          + (f"  → C4 {a.c4}" if a.c4 else "")
-          + (f"  이미지 저장: {a.save_dir} ({a.save_every}장마다)" if a.save_dir else ""))
+    print(f"[stub C2] http :{a.port}/preprocess  {head}")
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")
 
 
@@ -661,7 +880,7 @@ dt{color:var(--muted)} dd{margin:0;text-align:right;font-weight:500}
     <dt>C2로 전달</dt><dd id="s-fw">0 fps</dd>
     <dt>C1에서 버린 프레임</dt><dd id="s-drop">0%</dd>
     <dt>C1 대기 p50 / p95</dt><dd id="s-wait">–</dd>
-    <dt>C2 응답 p50 / p95</dt><dd id="s-rtt">–</dd>
+    <dt>C2 응답(ack) p50 / p95</dt><dd id="s-rtt">–</dd>
     <dt>전달 중</dt><dd id="s-inf">0</dd>
     <dt>클라이언트 시계 차이 p50</dt><dd id="s-skew">–</dd>
   </dl></section>
@@ -672,7 +891,9 @@ dt{color:var(--muted)} dd{margin:0;text-align:right;font-weight:500}
 const $=id=>document.getElementById(id), ms=p=>p&&p.p50!=null?p.p50+' / '+p.p95+' ms':'–';
 fetch('/api/info').then(r=>r.json()).then(i=>{
   $('url').textContent=i.cam_url;
-  let m=i.mode==='echo'?'<b>에코 모드</b> C2로 보내지 않고 수신만 합니다':'<b>전달 중</b> '+i.downstream;
+  let m=i.transport==='echo'?'<b>에코 모드</b> C2로 보내지 않고 수신만 합니다'
+       :i.transport==='mqtt'?'<b>MQTT</b> '+i.mqtt.broker+' <span id="mq"></span>'
+       :'<b>HTTP</b> '+i.downstream;
   if(i.dashboard_url) m+=' <a href="'+i.dashboard_url+'">C4 대시보드 열기</a>';
   $('mode').innerHTML=m;
   const u=new URL(i.cam_url);
@@ -696,6 +917,7 @@ function stats(s){
   $('s-rtt').textContent=ms(s.c2_rtt_ms); $('s-inf').textContent=s.inflight+' / '+s.max_inflight;
   $('s-skew').textContent=s.client_clock_gap_ms.p50==null?'–':s.client_clock_gap_ms.p50+' ms';
   $('err').textContent=s.last_error?'최근 오류: '+s.last_error:'';
+  if(s.mqtt&&$('mq')){ $('mq').textContent=s.mqtt.connected?'연결됨':'연결 안 됨'; $('mq').style.color=s.mqtt.connected?'#3d7a57':'#c0412b'; }
 }
 connect();
 </script></body></html>"""
@@ -790,6 +1012,12 @@ $('go').onclick=async()=>{
 # CLI
 # ════════════════════════════════════════════════════════════════════
 
+def add_mqtt_args(p):
+    p.add_argument("--mqtt-host", default=env("MQTT_HOST", "localhost"), help="MQTT 브로커 (compose: mqtt-broker)")
+    p.add_argument("--mqtt-port", type=int, default=int(env("MQTT_PORT", 1883)))
+    p.add_argument("--topic-prefix", default=env("MQTT_TOPIC_PREFIX", "psf/v1"))
+
+
 def main():
     ap = argparse.ArgumentParser(description="C1 Gateway (serve / stub / loadgen)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -797,12 +1025,15 @@ def main():
     s = sub.add_parser("serve", help="게이트웨이 실행")
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=int(env("C1_PORT", 8000)))
+    s.add_argument("--transport", default=env("C1_TRANSPORT", "auto"), choices=["auto", "echo", "http", "mqtt"],
+                   help="C2로 보내는 방식. auto: --downstream 있으면 http, 없으면 echo (compose 기본은 mqtt)")
     s.add_argument("--downstream", default=env("C1_DOWNSTREAM", ""),
-                   help="C2 엔드포인트 (compose: http://c2-preprocessing:8001/preprocess). 비우면 에코 모드")
+                   help="http 전송 시 C2 엔드포인트 (예: http://c2-preprocessing:8001/preprocess)")
     s.add_argument("--public-url", default=env("C1_PUBLIC_URL", ""), help="QR에 넣을 외부 HTTPS 주소")
     s.add_argument("--max-inflight", type=int, default=int(env("C1_MAX_INFLIGHT", 2)),
                    help="C2로 동시에 나가 있을 요청 수. C2가 C3 응답까지 기다리므로 C3 복제 수 + 1 권장")
-    s.add_argument("--timeout", type=float, default=float(env("C1_TIMEOUT", 5.0)), help="C2 응답 대기(초)")
+    s.add_argument("--timeout", type=float, default=float(env("C1_TIMEOUT", 5.0)), help="C2 응답/ack 대기(초)")
+    add_mqtt_args(s)
     s.add_argument("--token", default=env("C1_TOKEN", ""), help="스트림 접속 토큰, 'auto'면 자동 생성")
     s.add_argument("--dashboard-url", default=env("C1_DASHBOARD_URL", ""), help="상태 페이지에 걸 C4 주소")
     s.add_argument("--event-log", default=env("C1_EVENT_LOG", ""), help="프레임 이벤트 CSV 경로")
@@ -812,9 +1043,11 @@ def main():
     s.add_argument("--log-level", default=env("LOG_LEVEL", "warning"))
     s.set_defaults(fn=cmd_serve)
 
-    t = sub.add_parser("stub", help="가짜 C2 (/preprocess)")
-    t.add_argument("--host", default="0.0.0.0")
-    t.add_argument("--port", type=int, default=8001)
+    t = sub.add_parser("stub", help="가짜 C2 (MQTT 구독 또는 HTTP /preprocess)")
+    t.add_argument("--transport", default="mqtt", choices=["mqtt", "http"])
+    t.add_argument("--host", default="0.0.0.0", help="http 스텁 바인드 주소")
+    t.add_argument("--port", type=int, default=8001, help="http 스텁 포트")
+    add_mqtt_args(t)
     t.add_argument("--delay-ms", type=float, default=60)
     t.add_argument("--jitter-ms", type=float, default=10)
     t.add_argument("--workers", type=int, default=1, help="동시 처리 수")
