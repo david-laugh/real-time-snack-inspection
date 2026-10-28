@@ -5,7 +5,18 @@ C1, C2, C4 코드는 실행만 하고 수정하지 않는다. 결과 해석은 [
 
 | 파일 | 내용 |
 |---|---|
-| `chain.override.yml` | 테스트 전용 compose override. C2를 uvicorn으로 실행(base는 아직 `sleep infinity`), C1에 C2 폰 fixture(`/frames`)를 mount, C3 → 호스트 C4(`host.docker.internal:8003`) |
+| `chain.override.yml` | 테스트 전용 compose override. C2를 uvicorn으로 실행(base는 아직 `sleep infinity`), C1에 C2 폰 fixture(`/frames`)를 mount, C3 → 호스트 C4(`host.docker.internal:8003`), C3 replica별 호스트 포트 공개(아래 표) |
+
+브라우저로 바로 열리는 주소 (이 PC에서만, `127.0.0.1`):
+
+| 서비스 | 주소 |
+|---|---|
+| C1 상태 페이지 | http://localhost:8000/ (`/api/metrics`) |
+| C2 | http://localhost:8001/stats |
+| C3 replica 1 / 2 / 3 | http://localhost:18021/metrics · http://localhost:18022/metrics · http://localhost:18023/metrics (`/healthz`도 같은 포트) |
+| Nginx (C3 앞단) | http://localhost:8080/healthz (Nginx 자체 상태, C3 상태 아님) |
+
+C3는 replica마다 따로 집계하므로 전체 수치는 replica별 값을 더한다. 운영 compose에는 C3 포트를 열지 않는다(요청은 Nginx를 거쳐야 하고, replica끼리 8002 포트가 겹친다).
 | `bench_chain.py` | 구성(replica 수 : `C2_MAX_INFLIGHT` : client 수)별로 컨테이너를 다시 띄우고 부하를 줘서 결과를 JSON으로 저장. 표준 라이브러리만 사용 |
 
 ## 준비
