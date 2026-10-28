@@ -63,7 +63,8 @@ services:
     <<: *common-service
     image: eclipse-mosquitto:2.0
     ports:
-      - "${MQTT_HOST_PORT:-1883}:1883"
+      # 인증 없는 브로커라 호스트의 localhost에만 연다. 1883은 다른 프로젝트 브로커와 충돌하기 쉬워 11883 사용
+      - "127.0.0.1:${MQTT_HOST_PORT:-11883}:1883"
     volumes:
       - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
 
@@ -74,12 +75,14 @@ services:
     image: pocket-smart-factory/c2-preprocessing:dev
     environment:
       SERVICE_NAME: c2-preprocessing
+      C2_EVENT_LOG: /app/results/c2_events.csv
     expose:
       - "${C2_PORT:-8001}"
+    volumes:
+      - ./benchmark/results:/app/results
     depends_on:
+      - mqtt-broker
       - nginx-inference-lb
-    # TODO(Member B): placeholder. Replace with preprocessing server entrypoint.
-    command: ["sleep", "infinity"]
 
   nginx-inference-lb:
     <<: *common-service

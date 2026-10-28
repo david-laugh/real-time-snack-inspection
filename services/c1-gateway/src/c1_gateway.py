@@ -3,7 +3,7 @@
 C1 Gateway - pocket-smart-factory
 
 폰/Simulator 프레임을 WebSocket으로 받아 frame-envelope로 감싸 C2로 넘긴다.
-계약: shared/schemas/frame-envelope.schema.json, frame-ack.schema.json, docs/api-contract.md
+계약: shared/schemas/frame-envelope.schema.json, docs/api-contract.md (1a절 MQTT)
 
   serve    게이트웨이 본체 (상태 페이지 /, 폰 카메라 페이지 /cam, WS /ws/stream)
   stub     가짜 C2. 받은 envelope와 이미지를 검증하고 ack를 돌려준다 (MQTT 또는 HTTP)
@@ -18,8 +18,11 @@ Client → C1 (WS /ws/stream?s=<session_id>)
 C1 → C2 (C1_TRANSPORT=mqtt, 기본 전송 방식)
   publish  {MQTT_TOPIC_PREFIX}/frames/{session_id}   QoS 0, retain 없음, payload = frame-envelope JSON
   C1은 받은 프레임을 즉시 발행한다(event: published). 밀린 프레임 드롭은 C2가 세션별 최신 1장만
-  처리하는 방식으로 담당한다. (실험용 옵션 C1_MQTT_ACK=1: C2가 {prefix}/acks로 ack를 보내면
-  C1이 C1_MAX_INFLIGHT 기준으로 흐름 제어. C2가 ack를 지원할 때만 사용)
+  처리하는 방식으로 담당한다. (실험용 옵션 C1_MQTT_ACK=1: {prefix}/acks로 ack가 오면 C1이
+  C1_MAX_INFLIGHT 기준으로 흐름 제어. 현재 C2는 ack를 보내지 않으므로 기본값 0 유지. 계약 외 기능)
+
+MQTT 브로커 주소: 컨테이너 안은 mqtt-broker:1883, 컨테이너 밖은 localhost:11883 (기본값).
+  호스트의 localhost:1883은 다른 프로젝트 브로커일 수 있어 접속을 거부한다.
 
 C1 → C2 (C1_TRANSPORT=http, 예비)
   POST {C1_DOWNSTREAM} JSON frame-envelope, 헤더 X-Trace-Id / X-Frame-Id / X-Session-Id. 2xx = 완료.
@@ -602,6 +605,8 @@ def resolve_transport(a):
 def cmd_serve(a):
     import uvicorn
     a.transport = resolve_transport(a)
+    if a.transport == "mqtt":
+        guard_mqtt_target(a.mqtt_host, a.mqtt_port)
     if a.token == "auto":
         a.token = secrets.token_urlsafe(8)
     scheme = "https" if a.ssl_certfile else "http"
@@ -682,6 +687,7 @@ def cmd_stub(a):
             + (f"  → C4 {a.c4}" if a.c4 else "")
             + (f"  이미지 저장: {a.save_dir} ({a.save_every}장마다)" if a.save_dir else ""))
     if a.transport == "mqtt":
+        guard_mqtt_target(a.mqtt_host, a.mqtt_port)
         stub_mqtt(a, head)
     else:
         stub_http(a, head)
@@ -1046,9 +1052,21 @@ $('go').onclick=async()=>{
 # CLI
 # ════════════════════════════════════════════════════════════════════
 
+LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+
+
+def guard_mqtt_target(host, port):
+    """컨테이너 밖에서 호스트의 localhost:1883에 붙으면 다른 프로젝트 브로커로 발행할 수 있어 거부한다."""
+    if host in LOCAL_HOSTS and port == 1883:
+        sys.exit("MQTT localhost:1883 접속은 거부합니다. 이 PC의 다른 프로젝트 브로커일 수 있어요.\n"
+                 "  팀 브로커는 'docker compose up -d mqtt-broker' 후 localhost:11883 (기본값)으로 접속하세요.\n"
+                 "  다른 포트를 쓰면 --mqtt-port 또는 MQTT_PORT로 지정하세요.")
+
+
 def add_mqtt_args(p):
-    p.add_argument("--mqtt-host", default=env("MQTT_HOST", "localhost"), help="MQTT 브로커 (compose: mqtt-broker)")
-    p.add_argument("--mqtt-port", type=int, default=int(env("MQTT_PORT", 1883)))
+    p.add_argument("--mqtt-host", default=env("MQTT_HOST", "localhost"), help="MQTT 브로커 (compose 안: mqtt-broker)")
+    p.add_argument("--mqtt-port", type=int, default=int(env("MQTT_PORT", 11883)),
+                   help="컨테이너 밖 기본 11883 (호스트 127.0.0.1:11883 → 브로커 1883). 컨테이너 안은 1883")
     p.add_argument("--topic-prefix", default=env("MQTT_TOPIC_PREFIX", "psf/v1"))
 
 
