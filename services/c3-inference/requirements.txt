@@ -6,6 +6,7 @@ uvicorn[standard]==0.34.2
 numpy==2.2.6
 opencv-python-headless==4.11.0.86
 pydantic==2.11.4
+httpx==0.28.1             # C3 -> C4 result delivery (POST /results)
 nvidia-ml-py==12.575.51   # whole-GPU memory/utilization in /metrics (optional at runtime)
 # SAM2 runtime deps (installed explicitly because sam2 is installed with --no-deps)
 hydra-core==1.3.2

@@ -63,7 +63,11 @@ def test_valid_frame_returns_schema_valid_detection_result(client, mock_predicto
     assert mock_predictor.predict_calls == 1
 
 
-def test_spot_defect_detected(client):
+def test_spot_defect_detected_when_enabled(make_client):
+    from src.config import Settings
+
+    client = make_client(MockPredictor(), settings_override=Settings.from_env(
+        {"C3_PREDICTOR": "mock", "C3_RESULTS_URL": "", "C3_SPOT_ENABLED": "1"}))
     image = make_image(discs=[(200, 240, 80)], spots=[(200, 240, 22)])
     r = client.post("/infer", json=make_frame(image))
     assert r.status_code == 200, r.text
@@ -269,3 +273,82 @@ def test_trace_header_mismatch_counted(client):
     assert r.status_code == 200
     assert r.headers["X-Trace-Id"] == "trace-abc"
     assert client.get("/metrics").json()["trace_header_mismatch_count"] == 1
+
+
+# ------------------------------------------------------------ C3 -> C4
+def _c4_settings(url="http://c4-visualizer:8003/results"):
+    from src.config import Settings
+
+    return Settings.from_env({"INFERENCE_CONTAINER_ID": "c3-inference-test", "C3_PREDICTOR": "mock", "C3_RESULTS_URL": url})
+
+
+def _c4_client(handler, url="http://c4-visualizer:8003/results"):
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from src.app import create_app
+
+    predictor = MockPredictor()
+    predictor.load()
+    app = create_app(settings=_c4_settings(url), predictor=predictor, load_model=False,
+                     results_transport=httpx.MockTransport(handler))
+    return TestClient(app)
+
+
+def test_result_is_delivered_to_c4():
+    import json
+
+    received = []
+
+    def c4(request):
+        received.append(request)
+        return __import__("httpx").Response(200, json={"ok": True})
+
+    with _c4_client(c4) as client:
+        frame = make_frame()
+        r = client.post("/infer", json=frame, headers=trace_headers(frame))
+        assert r.status_code == 200
+        assert len(received) == 1
+        req = received[0]
+        assert str(req.url) == "http://c4-visualizer:8003/results"
+        assert req.method == "POST"
+        assert json.loads(req.content) == r.json()  # exactly the DetectionResult returned to C2
+        assert_valid_result(json.loads(req.content))
+        assert req.headers["X-Trace-Id"] == "trace-abc" and req.headers["X-Frame-Id"] == "7"
+        m = client.get("/metrics").json()
+        assert (m["results_push_ok_count"], m["results_push_error_count"]) == (1, 0)
+        assert m["results_url"] == "http://c4-visualizer:8003/results"
+
+
+@pytest.mark.parametrize("failure, code", [("http_500", "http_500"), ("connect", "ConnectError"), ("timeout", "timeout")])
+def test_c4_failure_does_not_fail_infer(failure, code):
+    import httpx
+
+    def c4(request):
+        if failure == "http_500":
+            return httpx.Response(500)
+        if failure == "connect":
+            raise httpx.ConnectError("refused", request=request)
+        raise httpx.ReadTimeout("slow", request=request)
+
+    with _c4_client(c4) as client:
+        r = client.post("/infer", json=make_frame())
+        assert r.status_code == 200
+        assert r.json()["detections"][0]["status"] == "normal"
+        m = client.get("/metrics").json()
+        assert m["results_push_error_count"] == 1
+        assert m["results_push_errors"] == {code: 1}
+        assert m["error_count"] == 0  # /infer itself succeeded
+
+
+def test_c4_delivery_disabled_with_empty_url(client):
+    assert client.post("/infer", json=make_frame()).status_code == 200
+    m = client.get("/metrics").json()
+    assert (m["results_push_ok_count"], m["results_push_error_count"], m["results_url"]) == (0, 0, None)
+
+
+def test_errors_are_not_delivered_to_c4():
+    calls = []
+    with _c4_client(lambda req: calls.append(req) or __import__("httpx").Response(200)) as client:
+        assert client.post("/infer", json=make_frame(boxes=[(1, 1, 0, 0)])).status_code == 422
+        assert calls == []

@@ -4,6 +4,10 @@
     GET  /healthz  model readiness (200 ready / 503 loading|error)
     GET  /metrics  counters, per-stage latency window, model load time, GPU memory
 
+Each DetectionResult is also POSTed to C4 (`C3_RESULTS_URL`, C4 `POST /results`)
+as a background task AFTER the /infer response is sent, so C4 delivery never
+adds latency to C2 and a C4 failure never fails /infer (counted in /metrics).
+
 The model is loaded ONCE in a background thread at startup so /healthz can
 report "loading" while weights load and warm up.
 """
@@ -17,9 +21,11 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
 
+import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
@@ -74,7 +80,9 @@ def create_app(
     settings: Optional[Settings] = None,
     predictor: Optional[SegmentationPredictor] = None,
     load_model: bool = True,
+    results_transport: Optional[httpx.AsyncBaseTransport] = None,
 ) -> FastAPI:
+    """results_transport lets tests mock the C4 endpoint."""
     settings = settings or Settings.from_env()
     logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     predictor = predictor or build_predictor(settings)
@@ -88,7 +96,12 @@ def create_app(
     async def lifespan(_app: FastAPI):
         if load_model:
             threading.Thread(target=_load_model, args=(predictor, state), name="model-loader", daemon=True).start()
-        yield
+        if settings.results_url:
+            async with httpx.AsyncClient(timeout=settings.results_timeout_s, transport=results_transport) as client:
+                app.state.results_client = client
+                yield
+        else:
+            yield
 
     app = FastAPI(title="C3 SAM2 Inference", version=settings.schema_version, lifespan=lifespan)
     app.state.settings = settings
@@ -96,6 +109,24 @@ def create_app(
     app.state.pipeline = pipeline
     app.state.metrics = metrics
     app.state.model_state = state
+    app.state.results_client = None
+
+    async def push_result(body: bytes, trace: Dict[str, str]) -> None:
+        client: Optional[httpx.AsyncClient] = app.state.results_client
+        if client is None:
+            return
+        try:
+            resp = await client.post(
+                settings.results_url, content=body, headers={"Content-Type": "application/json", **trace}
+            )
+            error = None if resp.status_code < 400 else f"http_{resp.status_code}"
+        except httpx.TimeoutException:
+            error = "timeout"
+        except httpx.HTTPError as exc:
+            error = type(exc).__name__
+        metrics.record_push(error)
+        if error:
+            log.warning("C4 delivery failed url=%s error=%s trace=%s", settings.results_url, error, trace)
 
     def model_info() -> Dict[str, Any]:
         info: Dict[str, Any] = {
@@ -141,6 +172,7 @@ def create_app(
             "inference_container_id": settings.inference_container_id,
             "model": model_info(),
             "gpu_memory": predictor.gpu_memory(),
+            "results_url": settings.results_url or None,
         }
         return JSONResponse(metrics.snapshot(extra))
 
@@ -197,6 +229,12 @@ def create_app(
                 }
             )
         )
-        return JSONResponse(result.model_dump(mode="json"), headers=headers)
+        body_bytes = json.dumps(result.model_dump(mode="json"), separators=(",", ":")).encode()
+        return Response(
+            body_bytes,
+            media_type="application/json",
+            headers=headers,
+            background=BackgroundTask(push_result, body_bytes, trace),
+        )
 
     return app

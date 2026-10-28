@@ -83,6 +83,22 @@ def trace_headers(frame: dict) -> dict:
     }
 
 
+def load_c2_fixture() -> dict:
+    """Real SAM2 masks for C2-generated prompts on C2's fixtures (see tests/fixtures/README.md)."""
+    return json.loads((SERVICE_DIR / "tests" / "fixtures" / "c2_snack_masks.json").read_text(encoding="utf-8"))
+
+
+def fixture_mask(frame: dict, obj: dict) -> np.ndarray:
+    """Full-frame bool mask rebuilt from the cropped RLE stored in the fixture."""
+    from src.mask_codec import rle_decode
+
+    crop = rle_decode(obj["mask"])
+    full = np.zeros((frame["height"], frame["width"]), dtype=bool)
+    x0, y0 = obj["mask_offset"]
+    full[y0:y0 + crop.shape[0], x0:x0 + crop.shape[1]] = crop
+    return full
+
+
 def disc_mask(shape, cx, cy, r) -> np.ndarray:
     m = np.zeros(shape, dtype=np.uint8)
     cv2.circle(m, (cx, cy), r, 1, thickness=-1)
@@ -91,7 +107,8 @@ def disc_mask(shape, cx, cy, r) -> np.ndarray:
 
 @pytest.fixture
 def settings() -> Settings:
-    return Settings.from_env({"INFERENCE_CONTAINER_ID": "c3-inference-test", "C3_PREDICTOR": "mock"})
+    # C4 delivery off by default; tests that need it pass their own settings + mock transport.
+    return Settings.from_env({"INFERENCE_CONTAINER_ID": "c3-inference-test", "C3_PREDICTOR": "mock", "C3_RESULTS_URL": ""})
 
 
 def _client(settings: Settings, predictor: MockPredictor, load: bool) -> TestClient:
