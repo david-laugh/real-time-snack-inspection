@@ -6,7 +6,7 @@
 
 ## 실행
 
-로컬에서 MQTT로 돌리려면 브로커가 먼저 떠 있어야 한다. 레포 루트에서 `docker compose up -d mqtt-broker`로 브로커만 띄울 수 있다(호스트 1883 포트).
+로컬에서 MQTT로 돌리려면 브로커가 먼저 떠 있어야 한다. 레포 루트에서 `docker compose up -d mqtt-broker`로 브로커만 띄울 수 있다. 브로커는 호스트의 `127.0.0.1:11883`에만 열리고(`MQTT_HOST_PORT`), 컨테이너 밖에서 실행하는 C1과 stub은 기본값 `localhost:11883`으로 접속한다. 호스트의 `localhost:1883`은 다른 프로젝트 브로커일 수 있어 C1과 stub이 접속을 거부한다.
 
 ```bash
 pip install -r requirements.txt
@@ -27,7 +27,7 @@ Compose에서는 `C1_TRANSPORT=mqtt`, `MQTT_HOST=mqtt-broker`로 뜬다. 상태 
 
 **C1 → C2 (MQTT, 기본)** C1은 `{MQTT_TOPIC_PREFIX}/frames/{session_id}`(기본 `psf/v1/frames/...`)에 [`frame-envelope`](../../shared/schemas/frame-envelope.schema.json) JSON을 QoS 0, retain 없이 발행한다. 이미지는 `image_b64`(JPEG)이고 `source_width`/`source_height`는 그 JPEG의 실제 크기다. C2는 `psf/v1/frames/+`를 구독한다. C1은 받은 프레임을 즉시 발행하고 밀린 프레임 드롭은 C2가 담당한다. 자세한 규칙은 [`docs/api-contract.md`](../../docs/api-contract.md)의 1a절에 있다.
 
-실험용으로 `C1_MQTT_ACK=1`(`--mqtt-ack`)을 켜면, C2가 `{prefix}/acks`에 `{trace_id, session_id, frame_id, status}`를 보낼 때 C1이 아래 Backpressure 정책으로 흐름을 제어한다. C2가 ack를 지원할 때만 의미가 있으며 기본은 꺼져 있다(`stub --ack`로 흉내 낼 수 있다).
+실험용으로 `C1_MQTT_ACK=1`(`--mqtt-ack`)을 켜면, `{prefix}/acks`에 `{trace_id, session_id, frame_id, status}`가 올 때 C1이 아래 Backpressure 정책으로 흐름을 제어한다. 계약에 없는 실험 기능이며 현재 C2는 ack를 보내지 않으므로 기본값 0으로 둔다(`stub --ack`로만 흉내 낼 수 있다).
 
 **C1 → C2 (HTTP, 예비)** `C1_TRANSPORT=http`이면 `POST {C1_DOWNSTREAM}`으로 같은 JSON을 보내고 헤더 `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`를 붙인다. 2xx 응답이 ack 역할을 한다.
 

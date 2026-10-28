@@ -4,9 +4,10 @@
   MQTT  : C2_MQTT_TOPIC(psf/v1/frames/+) 구독. 페이로드는 frame-envelope JSON. 운영 경로.
   HTTP  : POST /preprocess (같은 frame-envelope JSON). 테스트·디버깅용.
 두 입력 모두 handle_frame() 하나로 처리한다: 전처리(스레드풀) -> processed-frame을 Nginx /infer로 전달 -> 이벤트 기록.
+C4 전송(C2_C4_FRAME_URL)을 켜면 같은 프레임(리사이즈 이미지 + prompts)을 C3 전송과 동시에 C4로도 보낸다 (c4_frames.py).
 
 GET /healthz : 상태 + MQTT 연결 상태
-GET /stats   : 이벤트 누적 수, MQTT 수신 수, 처리 중/대기 프레임 수
+GET /stats   : 이벤트 누적 수, MQTT 수신 수, 처리 중/대기 프레임 수, C4 전송 수(c4_sent/c4_skipped/c4_error)
 """
 import asyncio
 import json
@@ -24,6 +25,7 @@ from starlette.concurrency import run_in_threadpool
 
 from . import codec, schemas
 from .codec import DecodeError
+from .c4_frames import C4FrameSender
 from .config import Settings
 from .events import EventLog
 from .mqtt_ingest import FrameSlots, MqttIngest
@@ -133,6 +135,9 @@ async def handle_frame(app: FastAPI, envelope: dict, source: str) -> dict:
     log.debug("trace_id=%s frame_id=%s prompts=%d diameter=%s scale=%.3f roi=%s", msg["trace_id"],
               msg["frame_id"], len(det.boxes), det.diameter_px, det.scale, det.roi)
 
+    if st.c4 is not None:       # C3로 보내는 프레임만, C3 전송과 동시에 (기다리지 않음, prompts 0개여도 보냄)
+        st.c4.submit(msg, envelope, source)
+
     t0 = time.perf_counter()
     try:
         infer = await forward_to_infer(st.http_client, st.settings.infer_url, msg, content)
@@ -169,8 +174,9 @@ async def mqtt_worker(app: FastAPI, slots: FrameSlots):
 
 
 def create_app(settings: Optional[Settings] = None,
-               transport: Optional[httpx.AsyncBaseTransport] = None) -> FastAPI:
-    """transport는 테스트에서 /infer를 mock할 때 쓴다."""
+               transport: Optional[httpx.AsyncBaseTransport] = None,
+               c4_transport: Optional[httpx.AsyncBaseTransport] = None) -> FastAPI:
+    """transport / c4_transport는 테스트에서 /infer, C4를 mock할 때 쓴다."""
     settings = settings or Settings()
 
     @asynccontextmanager
@@ -178,6 +184,8 @@ def create_app(settings: Optional[Settings] = None,
         app.state.warmup_ms = await run_in_threadpool(warmup, settings)
         log.info("warm-up done in %.1f ms", app.state.warmup_ms)
         app.state.events = EventLog(settings.event_log)
+        if settings.c4_frame_url:
+            app.state.c4 = C4FrameSender(settings, app.state.events, c4_transport)
         workers = []
         async with httpx.AsyncClient(timeout=settings.infer_timeout_s, transport=transport) as client:
             app.state.http_client = client
@@ -195,6 +203,8 @@ def create_app(settings: Optional[Settings] = None,
                 for w in workers:
                     w.cancel()
                 await asyncio.gather(*workers, return_exceptions=True)
+                if app.state.c4 is not None:
+                    await app.state.c4.aclose()
                 app.state.events.close()
 
     app = FastAPI(title="C2 Preprocessing", lifespan=lifespan)
@@ -204,6 +214,7 @@ def create_app(settings: Optional[Settings] = None,
     app.state.slots = None
     app.state.inflight = 0
     app.state.events = EventLog(None)
+    app.state.c4 = None
 
     def mqtt_status() -> dict:
         return app.state.mqtt.status() if app.state.mqtt else {"enabled": False}
@@ -222,6 +233,9 @@ def create_app(settings: Optional[Settings] = None,
             "inflight": app.state.inflight,
             "max_inflight": settings.max_inflight,
             "pending_sessions": len(app.state.slots) if app.state.slots else 0,
+            "c4_enabled": app.state.c4 is not None,
+            **(app.state.c4.stats() if app.state.c4 is not None
+               else {"c4_sent": 0, "c4_skipped": 0, "c4_error": 0, "c4_inflight": 0}),
         }
 
     @app.post("/preprocess")

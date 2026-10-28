@@ -5,6 +5,9 @@ uvicorn[standard]==0.34.0
 opencv-python-headless==4.10.0.84
 numpy==2.2.1
 httpx==0.28.1
+# anyio 4.x no longer installs sniffio, but httpcore still tries `import sniffio` on every request.
+# Without it each request pays a failed import (sys.path scan) on the event loop.
+sniffio==1.3.1
 pydantic==2.10.4
 pydantic-settings==2.7.1
 jsonschema==4.23.0

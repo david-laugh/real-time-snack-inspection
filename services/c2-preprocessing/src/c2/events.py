@@ -6,6 +6,7 @@
   dropped_old    captured_at_ms 기준 C2_MAX_FRAME_AGE_MS보다 오래돼서 버림
   error          입력 오류(JSON/스키마/디코딩) 또는 /infer 실패(연결 실패, 4xx/5xx)
   timeout        /infer 타임아웃
+  c4_error       C4로 프레임 전송 실패 (CSV에만 기록. 누적 수는 /stats의 c4_error. C4 성공·skip은 기록하지 않음)
 
 컬럼은 C1 이벤트 로그(c1_events.csv)와 맞췄다. trace_id / frame_id로 C1·C4 로그와 조인한다.
 이벤트 루프 스레드에서만 호출한다.
@@ -35,8 +36,11 @@ class EventLog:
             if new:
                 self.w.writeheader()
 
-    def write(self, envelope, event: str, source: str, preprocess_ms=None, infer_rtt_ms=None, detail=""):
-        self.counts[event] += 1
+    def write(self, envelope, event: str, source: str, preprocess_ms=None, infer_rtt_ms=None, detail="",
+              count: bool = True):
+        """count=False면 CSV에만 남기고 프레임 이벤트 누적 수(counts)에는 넣지 않는다 (c4_error)."""
+        if count:
+            self.counts[event] += 1
         if not self.fp:
             return
         env = envelope if isinstance(envelope, dict) else {}

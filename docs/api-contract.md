@@ -41,11 +41,13 @@ C1 → C2 구간만 MQTT를 쓴다. C2 → Nginx → C3, C3 → C4는 HTTP를 �
 
 브로커는 compose 서비스 `mqtt-broker`(eclipse-mosquitto:2, 내부 포트 1883)이다. C1은 프레임마다 `psf/v1/frames/{session_id}`에 frame-envelope JSON을 발행하고, C2는 `psf/v1/frames/+`를 구독한다. 페이로드는 HTTP 시절 본문과 같은 frame-envelope JSON(`image_b64` JPEG 포함)이며 스키마 검증도 그대로 쓴다. QoS 0, retain 없음. MQTT에는 HTTP 헤더가 없으므로 `trace_id` 등은 JSON 본문에서만 읽는다.
 
-속도 조절은 C2가 맡는다. C1은 받은 프레임을 즉시 발행하고(C1 이벤트 로그 `published`), C2가 세션별 최신 프레임 1장만 처리하면서 오래된 프레임은 버리고 `dropped`로 기록한다(C2 이벤트 `forwarded` / `dropped` / `error`). Frame Drop Rate는 두 로그를 `trace_id`로 조인해 계산한다.
+속도 조절은 C2가 맡는다. C1은 받은 프레임을 즉시 발행한다(C1 이벤트 로그 `published`). C2는 세션별 최신 프레임 1장만 보관·처리하며 프레임별 이벤트를 `C2_EVENT_LOG`에 남긴다. C2 이벤트는 `forwarded`(C3로 전달 완료), `dropped_stale`(처리 전에 같은 세션의 새 프레임이 와서 버림), `dropped_old`(`captured_at_ms` 기준 `C2_MAX_FRAME_AGE_MS`(기본 500ms)보다 오래돼서 버림), `error`, `timeout`이다. Frame Drop Rate는 C1 `published`와 C2 이벤트를 `trace_id`로 조인해 계산한다.
+
+브로커는 호스트의 `127.0.0.1:${MQTT_HOST_PORT}`(기본 11883)에만 노출된다. 컨테이너 안의 서비스는 `mqtt-broker:1883`, 컨테이너 밖에서 실행하는 C1·stub·도구는 `localhost:11883`을 쓴다. 다른 프로젝트 브로커로 잘못 발행하지 않도록 C1/C2 도구는 호스트의 `localhost:1883` 접속을 거부한다.
 
 C1 latency(`preprocess_started_at_ms - gateway_received_at_ms`)에는 브로커 경유 시간과 C2 대기 시간이 포함된다. frame-envelope 필드는 변경 없음.
 
-## 2. processed-frame (C2 → C3)## 2. processed-frame (C2 → C3)
+## 2. processed-frame (C2 → C3)
 
 | Field | Type | 설명 |
 |---|---|---|
