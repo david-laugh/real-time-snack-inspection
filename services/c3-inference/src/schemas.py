@@ -75,6 +75,30 @@ class Detection(_Strict):
     mask: Optional[Mask]
 
 
+class LatencyBreakdown(_Strict):
+    """Per-frame pipeline segments computed by C3 (ms). null when a clock went backwards."""
+
+    capture_to_preprocess: Optional[float] = None  # C1 upload + C1 + MQTT + C2 slot wait
+    preprocess: Optional[float] = None  # C2 processing
+    c2_to_c3: Optional[float] = None  # C2 forward -> Nginx -> C3 request received
+    c3_queue: Optional[float] = None  # waiting for this replica's SAM2 predictor
+    c3_service: Optional[float] = None  # C3 processing without queue
+    c3_total: Optional[float] = None  # C3 received -> result built
+    capture_to_c3_done: Optional[float] = None
+
+
+class InferenceTimings(_Strict):
+    """C3 internal stage timings (ms), same values as the X-C3-*-Ms headers."""
+
+    lock_wait: float
+    decode: float
+    encoder: float
+    segmentation: float
+    defect_analysis: float
+    mask_encode: float
+    total: float
+
+
 class DetectionResult(_Strict):
     schema_version: str
     trace_id: str
@@ -86,3 +110,9 @@ class DetectionResult(_Strict):
     inference_finished_at_ms: int
     inference_latency_ms: float = Field(ge=0.0)
     detections: List[Detection]
+    # --- optional, detection-result 1.1.0 (latency breakdown for C4) ---
+    preprocess_started_at_ms: Optional[int] = None  # propagated from processed-frame
+    preprocess_finished_at_ms: Optional[int] = None  # propagated from processed-frame
+    inference_received_at_ms: Optional[int] = None  # C3 got the HTTP request
+    latency_breakdown_ms: Optional[LatencyBreakdown] = None
+    inference_timings_ms: Optional[InferenceTimings] = None

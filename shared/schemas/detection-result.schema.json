@@ -59,10 +59,58 @@
     "detections": {
       "type": "array",
       "items": { "$ref": "#/$defs/detection" }
-    }
+    },
+    "preprocess_started_at_ms": {
+      "type": "integer",
+      "description": "Optional (1.1.0). Propagated unchanged from ProcessedFrame."
+    },
+    "preprocess_finished_at_ms": {
+      "type": "integer",
+      "description": "Optional (1.1.0). Propagated unchanged from ProcessedFrame."
+    },
+    "inference_received_at_ms": {
+      "type": "integer",
+      "description": "Optional (1.1.0). Unix epoch ms when C3 received the /infer HTTP request (before parsing / queueing)."
+    },
+    "latency_breakdown_ms": { "$ref": "#/$defs/latency_breakdown" },
+    "inference_timings_ms": { "$ref": "#/$defs/inference_timings" }
   },
   "additionalProperties": false,
   "$defs": {
+    "segment_ms": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "Milliseconds; null if the end timestamp is earlier than the start (clock skew)."
+    },
+    "latency_breakdown": {
+      "type": "object",
+      "description": "Optional (1.1.0). Per-frame pipeline segments computed by C3 from the timestamps above.",
+      "properties": {
+        "capture_to_preprocess": { "$ref": "#/$defs/segment_ms", "description": "preprocess_started_at_ms - captured_at_ms: client upload + C1 + MQTT + C2 slot wait." },
+        "preprocess": { "$ref": "#/$defs/segment_ms", "description": "preprocess_finished_at_ms - preprocess_started_at_ms: C2 processing." },
+        "c2_to_c3": { "$ref": "#/$defs/segment_ms", "description": "inference_received_at_ms - preprocess_finished_at_ms: C2 forward -> Nginx -> C3." },
+        "c3_queue": { "$ref": "#/$defs/segment_ms", "description": "Waiting for the replica's SAM2 predictor (queueing inside C3)." },
+        "c3_service": { "$ref": "#/$defs/segment_ms", "description": "C3 processing excluding c3_queue." },
+        "c3_total": { "$ref": "#/$defs/segment_ms", "description": "inference_finished_at_ms - inference_received_at_ms." },
+        "capture_to_c3_done": { "$ref": "#/$defs/segment_ms", "description": "inference_finished_at_ms - captured_at_ms." }
+      },
+      "additionalProperties": false
+    },
+    "inference_timings": {
+      "type": "object",
+      "description": "Optional (1.1.0). C3 internal stage timings in ms (same values as the X-C3-*-Ms response headers).",
+      "required": ["lock_wait", "decode", "encoder", "segmentation", "defect_analysis", "mask_encode", "total"],
+      "properties": {
+        "lock_wait": { "type": "number", "minimum": 0 },
+        "decode": { "type": "number", "minimum": 0 },
+        "encoder": { "type": "number", "minimum": 0 },
+        "segmentation": { "type": "number", "minimum": 0 },
+        "defect_analysis": { "type": "number", "minimum": 0 },
+        "mask_encode": { "type": "number", "minimum": 0 },
+        "total": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
     "bbox": {
       "type": "array",
       "description": "[x1, y1, x2, y2] in pixel coordinates of the preprocessed image.",

@@ -9,6 +9,9 @@ from typing import Any, Deque, Dict, Optional
 import numpy as np
 
 STAGES = (
+    # Time a request waited for this replica's SAM2 predictor (queueing, not compute).
+    # total_inference_ms includes it; total - lock_wait = service time.
+    "lock_wait_ms",
     "decode_ms",
     "encoder_ms",
     "segmentation_ms",
@@ -26,6 +29,9 @@ class Metrics:
         self.error_count = 0
         self.errors_by_code: Counter = Counter()
         self.trace_header_mismatch_count = 0
+        self.results_push_ok_count = 0
+        self.results_push_error_count = 0
+        self.results_push_errors: Counter = Counter()
         self.status_counts: Counter = Counter()
         self._windows: Dict[str, Deque[float]] = {s: deque(maxlen=window) for s in STAGES}
         self.last_timings: Dict[str, float] = {}
@@ -49,6 +55,14 @@ class Metrics:
         with self._lock:
             self.trace_header_mismatch_count += 1
 
+    def record_push(self, error: Optional[str] = None) -> None:
+        with self._lock:
+            if error is None:
+                self.results_push_ok_count += 1
+            else:
+                self.results_push_error_count += 1
+                self.results_push_errors[error] += 1
+
     def snapshot(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         with self._lock:
             latency = {}
@@ -69,6 +83,9 @@ class Metrics:
                 "error_count": self.error_count,
                 "errors_by_code": dict(self.errors_by_code),
                 "trace_header_mismatch_count": self.trace_header_mismatch_count,
+                "results_push_ok_count": self.results_push_ok_count,
+                "results_push_error_count": self.results_push_error_count,
+                "results_push_errors": dict(self.results_push_errors),
                 "status_counts": dict(self.status_counts),
                 "last_timings_ms": self.last_timings,
                 "latency_window_ms": latency,

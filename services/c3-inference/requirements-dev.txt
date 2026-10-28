@@ -1,5 +1,4 @@
 # Tests (MockPredictor needs no torch / SAM2)
 -r requirements.txt
 pytest==8.3.5
-httpx==0.28.1
 jsonschema==4.23.0

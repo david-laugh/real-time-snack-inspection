@@ -9,6 +9,7 @@ JSON Schema 원본: [`shared/schemas/`](../shared/schemas/) (draft 2020-12). 이
 | 0 | Mobile/Simulator → C1 | `WS ws://c1-gateway:8000/ws/stream` | TBD (encoded frame) |
 | 1 | C1 → C2 | MQTT publish `psf/v1/frames/{session_id}` (QoS 0) | `frame-envelope` |
 | 2 | C2 → Nginx → C3 | `POST http://nginx-inference-lb:8080/infer` | `processed-frame` |
+| 2b | C2 → C4 | `POST http://c4-visualizer:8003/api/camera/frame` | `camera-frame` (신규) |
 | 3 | C3 → C4 | `POST http://c4-visualizer:8003/results` | `detection-result` |
 
 전파 HTTP header: `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id` (HTTP 구간, Nginx access log에서 추적용). MQTT 구간(C1 → C2)에는 header가 없으며 같은 값이 payload에 들어 있다.
@@ -66,6 +67,37 @@ C1 latency(`preprocess_started_at_ms - gateway_received_at_ms`)에는 브로커 
 | `type` | enum | `box` (TODO: `point` 추가 여부) |
 | `bbox` | number[4] | `[x1, y1, x2, y2]`, 전처리 후 이미지 pixel 좌표 |
 
+## 2b. camera-frame (C2 → C4)
+
+C2는 전처리한 이미지와 prompts를 C4로 직접 전달한다.
+
+- Endpoint: `POST http://c4-visualizer:8003/api/camera/frame`
+- 전송 형식: JSON (10개 필드)
+
+필드 구성:
+- `trace_id`: 프레임 고유 식별자
+- `session_id`: 스트리밍 세션 식별자
+- `frame_id`: 세션 내 프레임 번호
+- `gateway_received_at_ms`: C1 프레임 수신 시각
+- `preprocess_started_at_ms`: C2 전처리 시작 시각
+- `preprocess_finished_at_ms`: C2 전처리 완료 시각
+- `width`: 전처리 이미지 너비
+- `height`: 전처리 이미지 높이
+- `prompts`: C3에 전달하는 후보 객체 정보
+- `image_b64`: 전처리 이미지 (Base64 JPEG)
+
+### C2 → C4 전송 규칙
+
+- C2는 C3로 전달하는 프레임만 C4로 전송한다.
+- C2에서 드롭된 프레임(dropped_stale, dropped_old)은 C4로 보내지 않는다.
+- C3와 C4로 동시에 전송하며, 어느 쪽이 먼저 도착할지는 보장하지 않는다.
+- C4는 trace_id를 기준으로 이미지와 C3의 검출 결과를 짝지어야 한다.
+- C4 전송은 best-effort 방식으로, 실패해도 재시도하지 않는다.
+- C4 전송 실패가 C3의 추론 처리를 지연시키지 않도록 별도로 처리한다.
+- C4에 이미지가 도착하지 않고 C3 결과만 도착할 수 있다.
+- HTTP 헤더에 X-Trace-Id, X-Frame-Id, X-Session-Id를 포함한다.
+- C1과 C2가 서로 다른 컴퓨터에서 실행되는 경우 시계 차이로 latency 계산에 오차가 발생할 수 있다.
+
 ## 3. detection-result (C3 → C4)
 
 | Field | Type | 설명 |
@@ -75,6 +107,12 @@ C1 latency(`preprocess_started_at_ms - gateway_received_at_ms`)에는 브로커 
 | `inference_finished_at_ms` | integer | 추론 종료 시각 |
 | `inference_latency_ms` | number | 추론 소요 시간 |
 | `detections` | detection[] | 검출 결과 |
+| `preprocess_started_at_ms` / `preprocess_finished_at_ms` | integer (optional, 1.1.0) | processed-frame에서 전파한 C2 시각 |
+| `inference_received_at_ms` | integer (optional, 1.1.0) | C3가 `/infer` 요청을 받은 시각 |
+| `latency_breakdown_ms` | object (optional, 1.1.0) | C3가 계산한 구간별 지연: `capture_to_preprocess`, `preprocess`, `c2_to_c3`, `c3_queue`, `c3_service`, `c3_total`, `capture_to_c3_done` (ms, 시계 역전 시 null) |
+| `inference_timings_ms` | object (optional, 1.1.0) | C3 내부 단계: `lock_wait`, `decode`, `encoder`, `segmentation`, `defect_analysis`, `mask_encode`, `total` |
+
+C4 전달 방식, mask RLE 디코딩, frame drop 계산식은 [`c3-to-c4-handoff.md`](c3-to-c4-handoff.md)에 있다.
 
 **detection**
 
@@ -94,6 +132,7 @@ C1 latency(`preprocess_started_at_ms - gateway_received_at_ms`)에는 브로커 
 | C1 latency | `preprocess_started_at_ms - gateway_received_at_ms` (C1 처리 + C1→C2 전송) |
 | C2 latency | `preprocess_finished_at_ms - preprocess_started_at_ms` |
 | C3 inference latency | `inference_latency_ms` |
+| C2 → C3 전달 | `latency_breakdown_ms.c2_to_c3` (= `inference_received_at_ms - preprocess_finished_at_ms`, 1.1.0) |
 | End-to-End latency | `visualized_at_ms(C4) - captured_at_ms` |
 
 TODO: 정의는 구현 시 팀 합의로 확정한다.
@@ -104,3 +143,4 @@ TODO: 정의는 구현 시 팀 합의로 확정한다.
 |---|---|---|
 | 1.0.0 | 2026-10-28 | 초기 skeleton |
 | 1.1.0 (제안) | 2026-10-28 | C1 → C2 전송을 MQTT로 변경 (frame-envelope 필드 변경 없음, 드롭은 C2 담당) |
+| detection-result 1.1.0 | 2026-10-28 | optional 필드 추가: `preprocess_started/finished_at_ms`, `inference_received_at_ms`, `latency_breakdown_ms`, `inference_timings_ms` (C3 → C4 구간별 지연, 하위 호환) |

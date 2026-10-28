@@ -63,7 +63,11 @@ def test_valid_frame_returns_schema_valid_detection_result(client, mock_predicto
     assert mock_predictor.predict_calls == 1
 
 
-def test_spot_defect_detected(client):
+def test_spot_defect_detected_when_enabled(make_client):
+    from src.config import Settings
+
+    client = make_client(MockPredictor(), settings_override=Settings.from_env(
+        {"C3_PREDICTOR": "mock", "C3_RESULTS_URL": "", "C3_SPOT_ENABLED": "1"}))
     image = make_image(discs=[(200, 240, 80)], spots=[(200, 240, 22)])
     r = client.post("/infer", json=make_frame(image))
     assert r.status_code == 200, r.text
@@ -255,7 +259,7 @@ def test_latency_measurement_and_metrics(make_client):
     assert m["error_count"] == 1
     assert m["errors_by_code"] == {"invalid_bbox": 1}
     assert m["inference_container_id"] == "c3-inference-test"
-    for stage in ("decode_ms", "encoder_ms", "segmentation_ms", "defect_analysis_ms", "total_inference_ms"):
+    for stage in ("lock_wait_ms", "decode_ms", "encoder_ms", "segmentation_ms", "defect_analysis_ms", "total_inference_ms"):
         assert m["latency_window_ms"][stage]["count"] == 5
     assert m["latency_window_ms"]["encoder_ms"]["p50"] >= 30
     assert m["model"]["status"] == "ready" and m["model"]["model_ready"] is True
@@ -269,3 +273,127 @@ def test_trace_header_mismatch_counted(client):
     assert r.status_code == 200
     assert r.headers["X-Trace-Id"] == "trace-abc"
     assert client.get("/metrics").json()["trace_header_mismatch_count"] == 1
+
+
+# ------------------------------------------------------------ C3 -> C4
+def _c4_settings(url="http://c4-visualizer:8003/results"):
+    from src.config import Settings
+
+    return Settings.from_env({"INFERENCE_CONTAINER_ID": "c3-inference-test", "C3_PREDICTOR": "mock", "C3_RESULTS_URL": url})
+
+
+def _c4_client(handler, url="http://c4-visualizer:8003/results"):
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from src.app import create_app
+
+    predictor = MockPredictor()
+    predictor.load()
+    app = create_app(settings=_c4_settings(url), predictor=predictor, load_model=False,
+                     results_transport=httpx.MockTransport(handler))
+    return TestClient(app)
+
+
+def test_result_is_delivered_to_c4():
+    import json
+
+    received = []
+
+    def c4(request):
+        received.append(request)
+        return __import__("httpx").Response(200, json={"ok": True})
+
+    with _c4_client(c4) as client:
+        frame = make_frame()
+        r = client.post("/infer", json=frame, headers=trace_headers(frame))
+        assert r.status_code == 200
+        assert len(received) == 1
+        req = received[0]
+        assert str(req.url) == "http://c4-visualizer:8003/results"
+        assert req.method == "POST"
+        assert json.loads(req.content) == r.json()  # exactly the DetectionResult returned to C2
+        assert_valid_result(json.loads(req.content))
+        assert req.headers["X-Trace-Id"] == "trace-abc" and req.headers["X-Frame-Id"] == "7"
+        m = client.get("/metrics").json()
+        assert (m["results_push_ok_count"], m["results_push_error_count"]) == (1, 0)
+        assert m["results_url"] == "http://c4-visualizer:8003/results"
+
+
+@pytest.mark.parametrize("failure, code", [("http_500", "http_500"), ("connect", "ConnectError"), ("timeout", "timeout")])
+def test_c4_failure_does_not_fail_infer(failure, code):
+    import httpx
+
+    def c4(request):
+        if failure == "http_500":
+            return httpx.Response(500)
+        if failure == "connect":
+            raise httpx.ConnectError("refused", request=request)
+        raise httpx.ReadTimeout("slow", request=request)
+
+    with _c4_client(c4) as client:
+        r = client.post("/infer", json=make_frame())
+        assert r.status_code == 200
+        assert r.json()["detections"][0]["status"] == "normal"
+        m = client.get("/metrics").json()
+        assert m["results_push_error_count"] == 1
+        assert m["results_push_errors"] == {code: 1}
+        assert m["error_count"] == 0  # /infer itself succeeded
+
+
+def test_c4_delivery_disabled_with_empty_url(client):
+    assert client.post("/infer", json=make_frame()).status_code == 200
+    m = client.get("/metrics").json()
+    assert (m["results_push_ok_count"], m["results_push_error_count"], m["results_url"]) == (0, 0, None)
+
+
+def test_errors_are_not_delivered_to_c4():
+    calls = []
+    with _c4_client(lambda req: calls.append(req) or __import__("httpx").Response(200)) as client:
+        assert client.post("/infer", json=make_frame(boxes=[(1, 1, 0, 0)])).status_code == 422
+        assert calls == []
+
+
+# ------------------------------------------------- latency breakdown (1.1.0)
+def test_latency_breakdown_in_result(make_client):
+    client = make_client(MockPredictor(encoder_delay_ms=20, segment_delay_ms=10))
+    now = int(time.time() * 1000)
+    frame = make_frame(captured_at_ms=now - 300, preprocess_started_at_ms=now - 250, preprocess_finished_at_ms=now - 230)
+    r = client.post("/infer", json=frame, headers=trace_headers(frame))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert_valid_result(body)  # shared schema with the 1.1.0 optional fields
+    assert (body["preprocess_started_at_ms"], body["preprocess_finished_at_ms"]) == (now - 250, now - 230)
+    lb = body["latency_breakdown_ms"]
+    assert lb["capture_to_preprocess"] == 50.0
+    assert lb["preprocess"] == 20.0
+    # C2 finished 230 ms ago -> the C2 -> C3 hop is ~230 ms (request handled right away)
+    assert lb["c2_to_c3"] == body["inference_received_at_ms"] - (now - 230)
+    assert 230 <= lb["c2_to_c3"] < 1000
+    assert lb["c3_service"] >= 30  # mock encoder 20 + segment 10
+    assert lb["c3_queue"] == body["inference_timings_ms"]["lock_wait"]
+    assert lb["c3_total"] == body["inference_finished_at_ms"] - body["inference_received_at_ms"]
+    assert lb["capture_to_c3_done"] == body["inference_finished_at_ms"] - (now - 300)
+    t = body["inference_timings_ms"]
+    assert t["encoder"] == pytest.approx(float(r.headers["X-C3-Encoder-Ms"]), abs=0.01)
+    assert t["total"] == pytest.approx(body["inference_latency_ms"], abs=0.01)
+
+
+def test_latency_breakdown_clock_skew_is_null(client):
+    future = int(time.time() * 1000) + 60_000  # C2 clock ahead of C3 by a minute
+    frame = make_frame(captured_at_ms=future - 30, preprocess_started_at_ms=future - 20, preprocess_finished_at_ms=future)
+    body = client.post("/infer", json=frame).json()
+    assert_valid_result(body)
+    lb = body["latency_breakdown_ms"]
+    assert lb["c2_to_c3"] is None and lb["capture_to_c3_done"] is None
+    assert lb["preprocess"] == 20.0  # same-clock segments still reported
+
+
+def test_c4_receives_latency_breakdown():
+    import json
+
+    received = []
+    with _c4_client(lambda req: received.append(json.loads(req.content)) or __import__("httpx").Response(200)) as client:
+        client.post("/infer", json=make_frame())
+    assert set(received[0]["latency_breakdown_ms"]) == {
+        "capture_to_preprocess", "preprocess", "c2_to_c3", "c3_queue", "c3_service", "c3_total", "capture_to_c3_done"}

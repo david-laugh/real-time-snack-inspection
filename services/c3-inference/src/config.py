@@ -54,12 +54,20 @@ class DefectThresholds:
     min_mask_area_px: int = 100
 
     # --- BROKEN: outer contour shape ---
-    # 4*pi*A / P^2 of the largest component. Disc ~0.9 (raster), square ~0.78.
-    broken_circularity_min: float = 0.70
-    # A / convex_hull_area. Bites / chipped edges make the outline concave.
+    # Defaults calibrated on C2's fixtures (round chocolate-chip cookies, 42 objects with real
+    # SAM2 masks, tests/fixtures/c2_snack_masks.json). Separation is done by concavity (bite,
+    # wedge) and aspect ratio (cut, half); circularity is only a loose backstop because on a
+    # pixel grid even a perfect disc measures ~0.874 at 50 px diameter and ~0.855 at 30 px.
+    # Deepest notch of the outline / diameter of its convex hull. Normal <=0.013, bite >=0.049.
+    broken_concavity_max: float = 0.03
+    # Notches shallower than this many pixels are treated as edge noise (matters for small cookies).
+    broken_concavity_min_px: float = 2.0
+    # short_side / long_side of the min-area rectangle. Normal >=0.899 (phone perspective), cut <=0.839.
+    broken_aspect_ratio_min: float = 0.87
+    # 4*pi*A / P^2 of the largest component. Normal >=0.888, wedge ~0.63.
+    broken_circularity_min: float = 0.80
+    # A / convex_hull_area. Normal >=0.986, wedge ~0.89.
     broken_solidity_min: float = 0.90
-    # short_side / long_side of the min-area rectangle. Halves of round snacks ~0.5.
-    broken_aspect_ratio_min: float = 0.75
     # A component counts as a separate fragment if its area >= this fraction of the mask.
     broken_fragment_min_ratio: float = 0.05
     # Expected snack area in pixels (0 = disabled). Depends on camera distance / C2 resize.
@@ -68,6 +76,9 @@ class DefectThresholds:
     broken_area_tolerance: float = 0.25
 
     # --- SPOT_DEFECT: dark area inside the mask ---
+    # Off by default: the target snack is a chocolate-chip cookie, so dark spots are normal chips
+    # (normal cookies measure 2-5% dark area). Enable only for plain snacks.
+    spot_enabled: bool = False
     # A pixel is "dark" if its L (Lab lightness, 0-255) < median(L in mask) - delta.
     spot_dark_delta: float = 50.0
     # Maximum allowed dark pixel ratio inside the (eroded) mask.
@@ -84,12 +95,15 @@ class DefectThresholds:
         return cls(
             min_mask_score=_float(env, "C3_MIN_MASK_SCORE", d.min_mask_score),
             min_mask_area_px=_int(env, "C3_MIN_MASK_AREA_PX", d.min_mask_area_px),
+            broken_concavity_max=_float(env, "C3_BROKEN_CONCAVITY_MAX", d.broken_concavity_max),
+            broken_concavity_min_px=_float(env, "C3_BROKEN_CONCAVITY_MIN_PX", d.broken_concavity_min_px),
             broken_circularity_min=_float(env, "C3_BROKEN_CIRCULARITY_MIN", d.broken_circularity_min),
             broken_solidity_min=_float(env, "C3_BROKEN_SOLIDITY_MIN", d.broken_solidity_min),
             broken_aspect_ratio_min=_float(env, "C3_BROKEN_ASPECT_RATIO_MIN", d.broken_aspect_ratio_min),
             broken_fragment_min_ratio=_float(env, "C3_BROKEN_FRAGMENT_MIN_RATIO", d.broken_fragment_min_ratio),
             broken_expected_area_px=_float(env, "C3_BROKEN_EXPECTED_AREA_PX", d.broken_expected_area_px),
             broken_area_tolerance=_float(env, "C3_BROKEN_AREA_TOLERANCE", d.broken_area_tolerance),
+            spot_enabled=_bool(env, "C3_SPOT_ENABLED", d.spot_enabled),
             spot_dark_delta=_float(env, "C3_SPOT_DARK_DELTA", d.spot_dark_delta),
             spot_ratio_max=_float(env, "C3_SPOT_RATIO_MAX", d.spot_ratio_max),
             spot_erode_px=_int(env, "C3_SPOT_ERODE_PX", d.spot_erode_px),
@@ -118,6 +132,12 @@ class Settings:
     # --- request limits / output ---
     max_prompts: int = 64
     return_mask: bool = True
+
+    # --- C3 -> C4 result delivery ---
+    # Each DetectionResult is POSTed here after the /infer response is sent (C4 `POST /results`).
+    # Empty string disables delivery.
+    results_url: str = "http://c4-visualizer:8003/results"
+    results_timeout_s: float = 2.0
 
     # --- metrics ---
     metrics_window: int = 1000
@@ -153,6 +173,8 @@ class Settings:
             box_batch_size=max(1, _int(env, "C3_BOX_BATCH_SIZE", d.box_batch_size)),
             max_prompts=_int(env, "C3_MAX_PROMPTS", d.max_prompts),
             return_mask=_bool(env, "C3_RETURN_MASK", d.return_mask),
+            results_url=env.get("C3_RESULTS_URL", d.results_url).strip(),
+            results_timeout_s=_float(env, "C3_RESULTS_TIMEOUT_S", d.results_timeout_s),
             metrics_window=max(1, _int(env, "C3_METRICS_WINDOW", d.metrics_window)),
             mock_encoder_delay_ms=_float(env, "C3_MOCK_ENCODER_DELAY_MS", d.mock_encoder_delay_ms),
             mock_segment_delay_ms=_float(env, "C3_MOCK_SEGMENT_DELAY_MS", d.mock_segment_delay_ms),

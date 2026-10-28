@@ -27,7 +27,7 @@ from .config import Settings
 from .defects import DefectAnalyzer, DefectDecision
 from .mask_codec import rle_encode
 from .predictor import SegmentationPredictor
-from .schemas import Detection, DetectionResult, Mask, ProcessedFrame
+from .schemas import Detection, DetectionResult, InferenceTimings, LatencyBreakdown, Mask, ProcessedFrame
 
 
 class InferenceError(Exception):
@@ -52,6 +52,12 @@ def _now_ms() -> int:
 
 def _elapsed_ms(t0: float) -> float:
     return (time.perf_counter() - t0) * 1000.0
+
+
+def _span(end_ms: int, start_ms: int):
+    """end - start in ms across services; None if a clock went backwards (e.g. client clock skew)."""
+    value = end_ms - start_ms
+    return float(value) if value >= 0 else None
 
 
 class InferencePipeline:
@@ -114,11 +120,15 @@ class InferencePipeline:
         return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
     # ------------------------------------------------------------------- run
-    def run(self, frame: ProcessedFrame) -> Tuple[DetectionResult, Dict[str, float], List[DefectDecision]]:
+    def run(
+        self, frame: ProcessedFrame, received_at_ms: int | None = None
+    ) -> Tuple[DetectionResult, Dict[str, float], List[DefectDecision]]:
+        """received_at_ms: epoch ms when the HTTP request reached C3 (before body parsing / threadpool)."""
         if not self.predictor.is_ready:
             raise InferenceError("model_not_ready", "SAM2 model is not loaded yet", http_status=503)
 
         started_at_ms = _now_ms()
+        received_at_ms = started_at_ms if received_at_ms is None else received_at_ms
         t_total = time.perf_counter()
         timings: Dict[str, float] = {}
 
@@ -168,6 +178,17 @@ class InferencePipeline:
 
         total_ms = _elapsed_ms(t_total)
         timings["total_inference_ms"] = total_ms
+        finished_at_ms = _now_ms()
+        r = lambda v: None if v is None else round(v, 3)  # noqa: E731
+        breakdown = LatencyBreakdown(
+            capture_to_preprocess=r(_span(frame.preprocess_started_at_ms, frame.captured_at_ms)),
+            preprocess=r(_span(frame.preprocess_finished_at_ms, frame.preprocess_started_at_ms)),
+            c2_to_c3=r(_span(received_at_ms, frame.preprocess_finished_at_ms)),
+            c3_queue=r(timings["lock_wait_ms"]),
+            c3_service=r(total_ms - timings["lock_wait_ms"]),
+            c3_total=r(_span(finished_at_ms, received_at_ms)),
+            capture_to_c3_done=r(_span(finished_at_ms, frame.captured_at_ms)),
+        )
         result = DetectionResult(
             schema_version=frame.schema_version,
             trace_id=frame.trace_id,
@@ -176,9 +197,16 @@ class InferencePipeline:
             captured_at_ms=frame.captured_at_ms,
             inference_container_id=self.settings.inference_container_id,
             inference_started_at_ms=started_at_ms,
-            inference_finished_at_ms=_now_ms(),
+            inference_finished_at_ms=finished_at_ms,
             inference_latency_ms=round(total_ms, 3),
             detections=detections,
+            preprocess_started_at_ms=frame.preprocess_started_at_ms,
+            preprocess_finished_at_ms=frame.preprocess_finished_at_ms,
+            inference_received_at_ms=received_at_ms,
+            latency_breakdown_ms=breakdown,
+            inference_timings_ms=InferenceTimings(
+                **{k.removesuffix("_ms").replace("total_inference", "total"): round(v, 3) for k, v in timings.items()}
+            ),
         )
         timings = {k: round(v, 3) for k, v in timings.items()}
         return result, timings, decisions

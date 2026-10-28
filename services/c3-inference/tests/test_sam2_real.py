@@ -13,7 +13,7 @@ import statistics
 import jsonschema
 import pytest
 
-from conftest import SERVICE_DIR, disc_mask, load_schema, make_frame, make_image
+from conftest import BACKGROUND, REPO_DIR, SERVICE_DIR, disc_mask, load_c2_fixture, load_schema, make_frame, make_image
 from src.config import Settings
 
 sam2 = pytest.importorskip("sam2")
@@ -36,6 +36,7 @@ def real_client(request):
             "SAM2_CHECKPOINT_PATH": CKPT,
             "C3_DEVICE": request.param,
             "INFERENCE_CONTAINER_ID": "c3-inference-real",
+            "C3_RESULTS_URL": "",
             "C3_WARMUP_ITERS": "2",
         }
     )
@@ -49,7 +50,10 @@ def real_client(request):
 
 
 def test_real_sam2_segments_and_judges(real_client):
-    image = make_image(width=1024, height=1024, discs=[(300, 300, 120), (700, 650, 110)], spots=[(700, 650, 35)])
+    image = make_image(width=1024, height=1024, discs=[(300, 300, 120), (700, 650, 110)])
+    import cv2
+
+    cv2.circle(image, (700, 540), 30, BACKGROUND, thickness=-1)  # bite out of the second cookie
     frame = make_frame(image, boxes=[(170, 170, 430, 430), (580, 530, 820, 770)])
     r = real_client.post("/infer", json=frame)
     assert r.status_code == 200, r.text
@@ -64,7 +68,7 @@ def test_real_sam2_segments_and_judges(real_client):
     print(f"[sam2] disc IoU={iou:.3f} detections={[(d['status'], d['defect_type'], d['defect_score']) for d in body['detections']]}")
     assert iou > 0.85
     assert body["detections"][0]["status"] == "normal"
-    assert (body["detections"][1]["status"], body["detections"][1]["defect_type"]) == ("defect", "spot_defect")
+    assert (body["detections"][1]["status"], body["detections"][1]["defect_type"]) == ("defect", "broken")
 
 
 @pytest.mark.parametrize("n_boxes", [1, 4, 8])
@@ -82,3 +86,34 @@ def test_real_sam2_latency(real_client, n_boxes):
     summary = {k.removeprefix("X-C3-").removesuffix("-Ms"): round(statistics.median(v), 2) for k, v in samples.items()}
     gpu = real_client.get("/metrics").json()["gpu_memory"]
     print(f"[sam2] boxes={n_boxes} median ms over 20 frames: {summary} gpu_memory={gpu}")
+
+
+def test_real_sam2_on_c2_fixture_frames(real_client):
+    """End-to-end on real snack images: C2 fixture image -> C2-like resize/JPEG -> C3 -> labels."""
+    import base64
+
+    import cv2
+    import numpy as np
+
+    fixture = load_c2_fixture()
+    correct = total = 0
+    for frame in fixture["frames"]:
+        src = REPO_DIR / frame["source"]
+        if not src.is_file():
+            pytest.skip(f"C2 fixture image not found: {src}")
+        bgr = cv2.imdecode(np.fromfile(str(src), np.uint8), cv2.IMREAD_COLOR)  # unicode-safe path
+        bgr = cv2.resize(bgr, (frame["width"], frame["height"]), interpolation=cv2.INTER_AREA)  # C2: long side 1024
+        ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        msg = make_frame(np.zeros((1, 1, 3), np.uint8), boxes=[], width=frame["width"], height=frame["height"],
+                         image_b64=base64.b64encode(buf.tobytes()).decode())
+        msg["prompts"] = [{"candidate_id": o["candidate_id"], "type": "box", "bbox": o["bbox"]} for o in frame["objects"]]
+        r = real_client.post("/infer", json=msg)
+        assert r.status_code == 200, r.text
+        for o, d in zip(frame["objects"], r.json()["detections"]):
+            expected = ("normal", None) if o["label"] == "round" else ("defect", "broken")
+            total += 1
+            correct += (d["status"], d["defect_type"]) == expected
+            if (d["status"], d["defect_type"]) != expected:
+                print(f"[sam2] MISS {frame['name']} {o['candidate_id']} label={o['label']} got={d['status']}/{d['defect_type']}")
+    print(f"[sam2] C2 fixture frames: {correct}/{total} correct")
+    assert correct == total

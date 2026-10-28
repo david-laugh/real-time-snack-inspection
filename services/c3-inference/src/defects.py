@@ -21,12 +21,15 @@ For status == unknown, defect_score is 0.0 (no judgement was made).
 Rules
 -----
 BROKEN (outer shape of the mask)
+    concavity    = deepest notch / convex-hull diameter            > max -> broken  (bite, wedge)
+                   (notches shallower than concavity_min_px are ignored as edge noise)
+    aspect_ratio = short / long side of min-area rectangle         < min -> broken  (cut, half)
     circularity  = 4*pi*A / P^2            (largest component)   < min -> broken
     solidity     = A / convex_hull_area                            < min -> broken
     aspect_ratio = short / long side of min-area rectangle         < min -> broken
     fragments    = #components with area >= ratio * mask area      > 1   -> broken
     area         = |A - expected| / expected (only if expected > 0) > tol -> broken
-SPOT_DEFECT (inside the mask)
+SPOT_DEFECT (inside the mask; disabled by default, see DefectThresholds.spot_enabled)
     dark_ratio   = #dark px / #px in eroded mask                   > max -> spot_defect
     dark px      : Lab L < median(L in mask) - delta, then morphological opening
 """
@@ -72,6 +75,18 @@ def _severity_above(value: float, threshold: float) -> float:
     return 0.5 + 0.5 * min(1.0, (value - threshold) / threshold)
 
 
+def _max_notch_depth(cnt: np.ndarray) -> float:
+    """Depth (px) of the deepest concavity between the outline and its convex hull."""
+    try:
+        hull_idx = cv2.convexHull(cnt, returnPoints=False)
+        defects = cv2.convexityDefects(cnt, hull_idx) if len(hull_idx) > 3 else None
+    except cv2.error:  # rare non-monotonous hull indices on self-touching outlines
+        return 0.0
+    if defects is None:
+        return 0.0
+    return float(defects[:, 0, 3].max()) / 256.0  # fixed-point 8.8
+
+
 class DefectAnalyzer:
     def __init__(self, thresholds: DefectThresholds) -> None:
         self.t = thresholds
@@ -102,7 +117,7 @@ class DefectAnalyzer:
         broken_scores = self._broken_scores(m, area, features)
         if broken_scores is None:
             return DefectDecision(Status.UNKNOWN, None, 0.0, "no_contour", features)
-        spot_score = self._spot_score(rgb, m, features)
+        spot_score = self._spot_score(rgb, m, features) if t.spot_enabled else 0.0
 
         broken_score = max(broken_scores.values())
         features.update({f"severity_{k}": round(v, 4) for k, v in broken_scores.items()})
@@ -139,18 +154,28 @@ class DefectAnalyzer:
             return None
         hull_area = float(cv2.contourArea(cv2.convexHull(cnt)))
         (_, _), (rw, rh), _ = cv2.minAreaRect(cnt)
+        hull_diameter = 2.0 * math.sqrt(hull_area / math.pi) if hull_area > 0 else 0.0
+        depth_px = _max_notch_depth(cnt)
 
         circularity = min(1.0, 4.0 * math.pi * c_area / (perimeter * perimeter))
         solidity = min(1.0, c_area / hull_area) if hull_area > 0 else 0.0
         aspect = (min(rw, rh) / max(rw, rh)) if max(rw, rh) > 0 else 0.0
 
+        concavity = depth_px / hull_diameter if hull_diameter > 0 else 0.0
+        # A notch below the pixel floor cannot be told apart from mask edge noise.
+        effective_concavity = concavity if depth_px >= t.broken_concavity_min_px else min(
+            concavity, t.broken_concavity_max)
+
         features.update(
+            concavity=round(concavity, 4),
+            notch_depth_px=round(depth_px, 2),
             circularity=round(circularity, 4),
             solidity=round(solidity, 4),
             aspect_ratio=round(aspect, 4),
             fragments=fragments,
         )
         scores = {
+            "concavity": _severity_above(effective_concavity, t.broken_concavity_max),
             "circularity": _severity_below(circularity, t.broken_circularity_min),
             "solidity": _severity_below(solidity, t.broken_solidity_min),
             "aspect_ratio": _severity_below(aspect, t.broken_aspect_ratio_min),
