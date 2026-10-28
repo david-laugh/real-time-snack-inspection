@@ -86,10 +86,10 @@ test('renders a matched mask and removes it on an empty next frame', () => {
 test('metrics distinguish unavailable counters from zero', () => {
   const d = dashboard();
   d.run(`updateStats({total:0,pass_count:0,fail_count:0,defect_rate:0,fps:0});`);
-  assert.equal(d.run("id('pDrop').textContent"), '미수집');
-  assert.equal(d.run("id('pE2e').textContent"), '미수집');
+  assert.equal(d.run("id('pDrop').textContent"), '—');
+  assert.equal(d.run("id('pE2e').textContent"), '—');
   d.run(`updateStats({total:0,pass_count:0,fail_count:0,defect_rate:0,fps:0,
     c2_metrics:{dropped_stale:0,dropped_old:0,c4_skipped:null,c4_error:null}});`);
-  assert.equal(d.run("id('pDrop').textContent"), 0);
-  assert.equal(d.run("id('pImageLoss').textContent"), '미수집');
+  assert.equal(d.run("id('pDrop').textContent"), '0');
+  assert.equal(d.run("id('pLatencyTail').textContent"), '수신 대기');
 });

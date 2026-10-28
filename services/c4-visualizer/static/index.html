@@ -63,15 +63,26 @@ header h1 span { color: var(--accent); }
 
 .perf-row {
   grid-column: 1 / -1;
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px;
 }
 .perf-card {
-  background: var(--surface); border-radius: var(--radius);
-  padding: 12px 18px; text-align: center;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px 24px;
 }
-.perf-card .label { font-size: 10px; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }
-.perf-card .value { font-size: 20px; font-weight: 700; color: var(--info); margin: 2px 0; }
-.perf-card .unit { font-size: 11px; color: var(--text2); }
+.perf-heading, .perf-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.perf-card .label { font-size: 13px; font-weight: 600; color: var(--text); }
+.perf-tag { font-size: 10px; font-weight: 600; color: var(--text2); background: var(--surface2); padding: 4px 8px; border-radius: 5px; }
+.perf-reading { display: flex; align-items: baseline; gap: 8px; margin: 12px 0; }
+.perf-card .value { font-size: 34px; line-height: 1.15; font-weight: 650; letter-spacing: -1px; font-variant-numeric: tabular-nums; color: var(--info); }
+.perf-card .value.empty { color: var(--text2); }
+.perf-card .value.clear { color: var(--pass); }
+.perf-card .value.warning { color: var(--fail); }
+.perf-card .unit, .perf-footer { font-size: 11px; color: var(--text2); }
+.perf-footer { min-height: 16px; }
+@media (max-width: 560px) {
+  .perf-row { grid-template-columns: 1fr; }
+  .perf-card { padding: 18px 20px; }
+}
 
 .camera-panel {
   background: var(--surface); border-radius: var(--radius);
@@ -194,17 +205,15 @@ header h1 span { color: var(--accent); }
 
   <div class="perf-row">
     <div class="perf-card">
-      <div class="label">처리 FPS</div>
-      <div class="value" id="pFps">0</div>
-      <div class="unit">frames/sec</div>
+      <div class="perf-heading"><span class="label">Frame Drop</span><span class="perf-tag">C2</span></div>
+      <div class="perf-reading"><span class="value empty" id="pDrop">—</span><span class="unit">frames</span></div>
+      <div class="perf-footer"><span>C2 시작 이후 누적</span><span id="pDropStatus">수신 대기</span></div>
     </div>
-    <div class="perf-card"><div class="label">E2E 지연</div><div class="value" id="pE2e">미수집</div><div class="unit">캡처 → C4 수신</div></div>
-    <div class="perf-card"><div class="label">C3 추론</div><div class="value" id="pInference">미수집</div><div class="unit">C3 처리 시간</div></div>
-    <div class="perf-card"><div class="label">C3 → C4</div><div class="value" id="pC3C4">미수집</div><div class="unit">추론 종료 → C4 수신</div></div>
-    <div class="perf-card"><div class="label">C3 이전 전체</div><div class="value" id="pBeforeC3">미수집</div><div class="unit">캡처 → C3 추론 시작</div></div>
-    <div class="perf-card"><div class="label">C1 → C2 / C2 → C3</div><div class="value" id="pStages">미수집</div><div class="unit">구간 시각 전달 필요</div></div>
-    <div class="perf-card"><div class="label">C2 Frame Drop</div><div class="value" id="pDrop">미수집</div><div class="unit">stale + old · C2 기동 이후</div></div>
-    <div class="perf-card"><div class="label">화면용 이미지 전송 누락</div><div class="value" id="pImageLoss">미수집</div><div class="unit">C4 skipped + error · 추론 드롭과 별개</div></div>
+    <div class="perf-card" title="캡처부터 C4 결과 수신까지 · 최근 200개 프레임 · 호스트 간 시계 동기화 필요">
+      <div class="perf-heading"><span class="label">Latency</span><span class="perf-tag">E2E</span></div>
+      <div class="perf-reading"><span class="value empty" id="pE2e">—</span><span class="unit">ms</span></div>
+      <div class="perf-footer"><span>중앙값 · P50</span><span id="pLatencyTail">수신 대기</span></div>
+    </div>
   </div>
 
   <div class="camera-panel">
@@ -304,16 +313,16 @@ function updateStats(s) {
   el.textContent = r + '%';
   el.className = 'value ' + (r <= 3 ? 'pass' : 'fail');
 
-  id('pFps').textContent = s.fps || '0';
-  const latency = s.latency || {};
-  for (const [element, name] of [['pE2e', 'e2e'], ['pInference', 'inference'], ['pC3C4', 'c3_c4'], ['pBeforeC3', 'before_c3']]) {
-    const sample = latency[name];
-    id(element).textContent = sample?.p50_ms == null ? '미수집' : `${sample.p50_ms} / ${sample.p95_ms} ms`;
-    id(element).title = '최근 200개 프레임의 P50 / P95 · 호스트 간 시계 동기화 필요';
-  }
+  const sample = s.latency?.e2e;
+  const hasLatency = sample?.p50_ms != null;
+  id('pE2e').textContent = hasLatency ? sample.p50_ms.toLocaleString() : '—';
+  id('pE2e').className = 'value' + (hasLatency ? '' : ' empty');
+  id('pLatencyTail').textContent = sample?.p95_ms != null ? `P95  ${sample.p95_ms.toLocaleString()} ms` : '수신 대기';
   const c2 = s.c2_metrics;
-  id('pDrop').textContent = c2 ? c2.dropped_stale + c2.dropped_old : '미수집';
-  id('pImageLoss').textContent = c2?.c4_skipped != null && c2?.c4_error != null ? c2.c4_skipped + c2.c4_error : '미수집';
+  const drops = c2 ? c2.dropped_stale + c2.dropped_old : null;
+  id('pDrop').textContent = drops == null ? '—' : drops.toLocaleString();
+  id('pDrop').className = 'value ' + (drops == null ? 'empty' : drops === 0 ? 'clear' : 'warning');
+  id('pDropStatus').textContent = drops == null ? '수신 대기' : '실시간';
 
   const passRate = s.total > 0 ? (s.pass_count / s.total) : 1;
   const C = 327;
