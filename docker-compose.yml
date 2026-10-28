@@ -106,8 +106,11 @@ services:
       SERVICE_NAME: c4-visualizer
     ports:
       - "${C4_PORT:-8003}:8003"
-    # TODO(Member D): placeholder. Replace with visualizer/dashboard server entrypoint.
-    command: ["sleep", "infinity"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/healthz')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
 networks:
   smart-factory-net:
