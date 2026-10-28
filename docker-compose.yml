@@ -5,9 +5,7 @@
 # Scale-out : docker compose --profile scale-out up
 #             -> baseline + c3-inference-2, c3-inference-3
 #
-# NOTE: application source code does not exist yet.
-#       C1~C4 containers are kept alive with `sleep infinity` as placeholders.
-#       Replace `command` with the real entrypoint once each service is implemented.
+# Each service runs its real entrypoint (C4: Dockerfile CMD, uvicorn on 8003).
 
 x-common-service: &common-service
   env_file:

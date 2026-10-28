@@ -103,9 +103,9 @@ class PipelineMetrics:
         values = {name: events[name] for name in names}
         if any(type(v) is not int or v < 0 for v in values.values()):
             raise ValueError('Invalid C2 counters')
-        for name in ('c4_sent', 'c4_skipped', 'c4_error', 'forwarded', 'error', 'timeout',
+        for name in ('c4_sent', 'c4_skipped', 'c4_error', 'forwarded', 'skipped_empty', 'error', 'timeout',
                      'inflight', 'max_inflight'):
-            source = events if name in ('forwarded', 'error', 'timeout') else data
+            source = events if name in ('forwarded', 'skipped_empty', 'error', 'timeout') else data
             value = source.get(name)
             values[name] = value if type(value) is int and value >= 0 else None
         self.c2 = values
@@ -135,6 +135,8 @@ class PipelineMetrics:
         current = dict(received=self.c1['received'], c1_drop=self.c1['dropped'],
             c2_drop=self.c2['dropped_stale'] + self.c2['dropped_old'],
             forwarded=self.c2['forwarded'], errors=self.c2['error'] + self.c2['timeout'],
+            # Prompt-less frames are not sent to C3 (C2_SKIP_EMPTY), so no result is expected for them.
+            skipped_empty=self.c2['skipped_empty'] or 0,
             results=self.received_frames)
         if self.drop_baseline is None:
             self.drop_baseline = (now, current)
@@ -148,13 +150,17 @@ class PipelineMetrics:
             return
         def rate(n, d):
             return round(min(1, max(0, n / d)) * 100, 2) if d > 0 else None
+        seconds = now - before
         self.drop_window = {
-            'seconds': round(now - before, 2), 'estimated': True,
+            'seconds': round(seconds, 2), 'estimated': True,
             'c1_drop_pct': rate(delta['c1_drop'], delta['received']),
             'c2_drop_pct': rate(delta['c2_drop'], delta['received']),
             'c2_error_pct': rate(delta['errors'], delta['forwarded'] + delta['errors']),
             'result_gap_estimate': max(0, delta['forwarded'] - delta['results']),
-            'overall_loss_pct_estimate': rate(delta['received'] - delta['results'], delta['received']),
+            'overall_loss_pct_estimate': rate(delta['received'] - delta['results'] - delta['skipped_empty'],
+                                              delta['received']),
+            # C2 throughput: frames sent to C3 plus frames finished without C3 (no prompts).
+            'c2_processed_per_s': round((delta['forwarded'] + delta['skipped_empty']) / seconds, 2),
             'deltas': delta,
         }
         self.drop_baseline = (now, current)
