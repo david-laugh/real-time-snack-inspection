@@ -240,7 +240,8 @@ class Gateway:
         self.echo = self.transport == "echo"
         self.fire = self.transport == "mqtt" and not a.mqtt_ack     # 즉시 발행 모드
         self.pending = collections.OrderedDict()   # session_id -> Frame
-        self.sessions = {}                         # session_id -> next frame_id
+        self.sessions = {}                         # session_id -> next frame_id (접속 중인 세션)
+        self.used_sessions = set()                 # 서버가 켜진 뒤 한 번이라도 쓴 session_id (재사용 금지)
         self.awaiting = {}                         # trace_id -> (Frame, t0)  (mqtt ack 대기)
         self.viewers = set()
         self.preview = None
@@ -548,9 +549,13 @@ def build_app(a):
             await ws.close(code=4401)
             return
         await ws.accept()
-        session = (ws.query_params.get("s") or "s-" + secrets.token_hex(4))[:64]
-        if session in gw.sessions:                      # 같은 id 재접속이면 새 세션으로
-            session = f"{session}-{secrets.token_hex(2)}"
+        session = (ws.query_params.get("s") or "s-" + secrets.token_hex(4))[:58]
+        # 이미 쓴 id로 다시 접속하면(폰 재접속 등) 새 session_id를 발급한다.
+        # 같은 세션에서 frame_id가 0부터 다시 시작해 C2/C4의 세션별 상태가 이전 연결과 섞이는 것을 막는다.
+        base = session
+        while session in gw.used_sessions:
+            session = f"{base}-{secrets.token_hex(2)}"
+        gw.used_sessions.add(session)
         gw.sessions[session] = 0
         await ws.send_text(json.dumps({"type": "hello", "session_id": session, "server_ms": now_ms()}))
         try:

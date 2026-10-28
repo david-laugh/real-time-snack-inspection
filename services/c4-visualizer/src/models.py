@@ -5,20 +5,35 @@ shared/schemas/detection-result.schema.json 기준.
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class Prompt(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    candidate_id: str
+    type: Literal["box"]
+    bbox: list[float] = Field(min_length=4, max_length=4)
 
 
 class CameraFrame(BaseModel):
+    """shared/schemas/camera-frame.schema.json: 10 required fields, no extras."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     trace_id: str
     session_id: str
-    frame_id: int
-    width: int = Field(gt=0)
-    height: int = Field(gt=0)
-    gateway_received_at_ms: int | None = Field(default=None, ge=0)
-    preprocess_started_at_ms: int | None = Field(default=None, ge=0)
-    preprocess_finished_at_ms: int | None = Field(default=None, ge=0)
-    prompts: list[dict]
+    frame_id: int = Field(ge=0)
+    gateway_received_at_ms: int
+    preprocess_started_at_ms: int
+    preprocess_finished_at_ms: int
+    width: int = Field(ge=1)
+    height: int = Field(ge=1)
+    prompts: list[Prompt]
     image_b64: str = Field(min_length=1)
+
+
+class ScanLine(BaseModel):
+    ratio: float = Field(gt=0, lt=1)
 
 
 class Detection(BaseModel):

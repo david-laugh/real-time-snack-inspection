@@ -4,6 +4,7 @@ Port 8003 | POST /results (C3 → C4) | POST /api/camera/frame (C2 → C4) | WS 
 
 C4는 표시만 한다. 판정은 C3 결과(status/defect_type/defect_score)를, 지연은 C3의 latency_breakdown_ms와
 C2 camera_frame 시각을, drop은 C1 /api/metrics와 C2 /stats 카운터를 그대로 쓴다.
+쿠키 집계는 C3 판정을 프레임 간에 추적해 검사선 통과 시 1회 세는 것뿐이다(src/tracker.py, 다수결).
 """
 
 import asyncio
@@ -15,19 +16,24 @@ import json
 import logging
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from src.models import CameraFrame, DetectionResult
+from src.models import CameraFrame, DetectionResult, ScanLine
 from src.metrics import PipelineMetrics
-from src.config import C2_STATS_URL, C2_STATS_TIMEOUT_S, C2_STATS_INTERVAL_S, C1_METRICS_URL
+from src.config import (C2_STATS_URL, C2_STATS_TIMEOUT_S, C2_STATS_INTERVAL_S, C1_METRICS_URL,
+                        SCAN_LINE_RATIO, TRAVEL_DIRECTION, TRACK_VOTE_FRAMES, TRACK_REORDER_MS)
 from src.store import InspectionStore, InspectionRecord
+from src.tracker import CookieTracker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("c4")
 
 metrics = PipelineMetrics()
+tracker = CookieTracker(scan_line_ratio=SCAN_LINE_RATIO, direction=TRAVEL_DIRECTION,
+                        vote_frames=TRACK_VOTE_FRAMES, reorder_ms=TRACK_REORDER_MS)
+TRACK_FLUSH_INTERVAL_S = 0.2
 
 
 def fetch_c2_stats():
@@ -41,7 +47,22 @@ def fetch_c1_metrics():
 
 
 def dashboard_stats():
-    return {**store.get_stats(), **metrics.get_stats()}
+    return {**store.get_stats(), **metrics.get_stats(), "tracking": tracker.config()}
+
+
+async def publish_cookies(counted):
+    """Store and announce cookies the tracker has just counted (once per cookie)."""
+    for cookie in counted:
+        await broadcast({"type": "cookie_counted", "data": store.add_cookie(cookie)})
+    if counted:
+        await broadcast({"type": "stats", "data": dashboard_stats()})
+
+
+async def flush_tracker():
+    # Results wait in the tracker's reorder buffer; release them even when no new result arrives.
+    while True:
+        await publish_cookies(tracker.flush(time.time() * 1000))
+        await asyncio.sleep(TRACK_FLUSH_INTERVAL_S)
 
 
 async def poll_metrics():
@@ -63,13 +84,15 @@ async def poll_metrics():
 
 @asynccontextmanager
 async def lifespan(app):
-    task = asyncio.create_task(poll_metrics())
+    tasks = [asyncio.create_task(poll_metrics()), asyncio.create_task(flush_tracker())]
     try:
         yield
     finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError):
+                await task
 
 
 app = FastAPI(title="C4 Visualizer", lifespan=lifespan)
@@ -92,7 +115,8 @@ async def broadcast(payload: dict):
 @app.post("/results")
 async def receive_result(result: DetectionResult):
     """C3 Inference → C4: detection-result 수신."""
-    metrics.record(result, time.time() * 1000)
+    now_ms = time.time() * 1000
+    metrics.record(result, now_ms)
     overlays = []
     for det in result.detections:
         status = det.status
@@ -135,23 +159,36 @@ async def receive_result(result: DetectionResult):
     await broadcast({"type": "frame_result", "data": {
         "trace_id": result.trace_id, "session_id": result.session_id,
         "frame_id": result.frame_id, "captured_at_ms": result.captured_at_ms,
+        "inference_latency_ms": result.inference_latency_ms,
         "latency_breakdown_ms": result.latency_breakdown_ms,
         "inference_timings_ms": result.inference_timings_ms, "detections": overlays,
     }})
+
+    # Masks are encoded at the C2-resized size; otherwise the tracker uses the camera frame width.
+    width = next((d.mask.get("width") for d in result.detections
+                  if d.mask and isinstance(d.mask.get("width"), int)), None)
+    tracker.add_result(result.session_id, result.frame_id, overlays, now_ms, width=width)
+    counted = tracker.flush(now_ms)
+    for cookie in counted:
+        await broadcast({"type": "cookie_counted", "data": store.add_cookie(cookie)})
     stats = dashboard_stats()
     await broadcast({"type": "stats", "data": stats})
 
     return {"status": "ok", "detections_processed": len(result.detections)}
 
 
-@app.post("/api/camera/frame")
-async def receive_camera_frame(frame: CameraFrame):
-    """C2 → C4: relay the same resized image and prompts sent to C3."""
+@app.post("/api/camera/frame", status_code=202)
+async def receive_camera_frame(frame: CameraFrame, background: BackgroundTasks):
+    """C2 → C4: relay the same resized image and prompts sent to C3.
+
+    Answers 202 before the WebSocket relay so a slow browser never delays C2.
+    """
     metrics.record_camera(frame)
-    data = frame.model_dump(exclude_none=True)
+    tracker.note_width(frame.session_id, frame.width)
+    data = frame.model_dump()
     data["frame"] = data.pop("image_b64")
-    await broadcast({"type": "camera_frame", "data": data})
-    return {"status": "ok"}
+    background.add_task(broadcast, {"type": "camera_frame", "data": data})
+    return {"status": "accepted"}
 
 
 @app.get("/api/stats")
@@ -169,15 +206,43 @@ async def list_defects(limit: int = 50):
     return store.get_defects(limit)
 
 
+@app.get("/api/cookies")
+async def list_cookies(limit: int = 50):
+    """검사선을 통과해 1회 집계된 쿠키 목록 (최신순)."""
+    return store.get_cookies(limit)
+
+
 @app.get("/api/export/csv")
 async def export_csv():
-    """검사 결과를 CSV로 다운로드."""
-    csv_data = store.export_csv()
+    """추적 기준 CSV: 쿠키 1개당 1행."""
     return Response(
-        content=csv_data,
+        content=store.export_cookies_csv(),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=inspection-results.csv"},
+        headers={"Content-Disposition": "attachment; filename=inspection-cookies.csv"},
     )
+
+
+@app.get("/api/export/detections.csv")
+async def export_detections_csv():
+    """검출 단위 CSV: C3 결과의 프레임별 검출 1건당 1행 (같은 쿠키가 여러 행에 나옴)."""
+    return Response(
+        content=store.export_detections_csv(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=inspection-detections.csv"},
+    )
+
+
+@app.get("/api/scan-line")
+async def get_scan_line():
+    return tracker.config()
+
+
+@app.post("/api/scan-line")
+async def set_scan_line(body: ScanLine):
+    """대시보드 클릭으로 검사선 x(이미지 폭 대비 비율)를 바꾼다. 재시작하면 C4_SCAN_LINE_RATIO로 돌아간다."""
+    tracker.set_scan_line(body.ratio)
+    await broadcast({"type": "scan_line", "data": tracker.config()})
+    return tracker.config()
 
 
 @app.get("/api/connections")

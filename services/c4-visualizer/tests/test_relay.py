@@ -1,16 +1,107 @@
 import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
+
+from fastapi import BackgroundTasks
+from fastapi.testclient import TestClient
+
 from src import main
-from src.models import CameraFrame, DetectionResult
+from src.models import CameraFrame, DetectionResult, ScanLine
+from src.store import InspectionStore
+from src.tracker import CookieTracker
 from src.metrics import PipelineMetrics
+
+
+def camera_body(**changes):
+    body = dict(trace_id='t', session_id='s', frame_id=1, gateway_received_at_ms=100,
+                preprocess_started_at_ms=110, preprocess_finished_at_ms=120, width=3, height=2,
+                prompts=[dict(candidate_id='c0', type='box', bbox=[0, 0, 2, 1.5])],
+                image_b64='jpeg')
+    body.update(changes)
+    return body
+
+
+class CameraFrameHttpTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(main, 'broadcast', new_callable=AsyncMock)
+        self.send = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.client = TestClient(main.app)
+
+    def test_valid_frame_is_accepted_with_202_and_relayed(self):
+        response = self.client.post('/api/camera/frame', json=camera_body())
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(self.send.call_args.args[0]['type'], 'camera_frame')
+
+    def test_csv_exports_and_scan_line_endpoint(self):
+        cookies = self.client.get('/api/export/csv')
+        self.assertTrue(cookies.text.startswith('cookie_id,'))
+        self.assertIn('inspection-cookies.csv', cookies.headers['content-disposition'])
+        self.assertTrue(self.client.get('/api/export/detections.csv').text.startswith('item_id,'))
+        self.assertEqual(self.client.post('/api/scan-line', json={'ratio': 1.5}).status_code, 422)
+        self.assertEqual(self.client.get('/api/scan-line').json()['direction'], 'left')
+
+    def test_empty_prompts_are_valid(self):
+        self.assertEqual(self.client.post('/api/camera/frame', json=camera_body(prompts=[])).status_code, 202)
+
+    def test_schema_violations_are_rejected_with_422(self):
+        legacy = camera_body()
+        for name in ('gateway_received_at_ms', 'preprocess_started_at_ms', 'preprocess_finished_at_ms'):
+            legacy.pop(name)
+        bad_bodies = {
+            'legacy seven fields': legacy,
+            'extra field': camera_body(captured_at_ms=1),
+            'string integer': camera_body(frame_id='1'),
+            'negative frame_id': camera_body(frame_id=-1),
+            'zero width': camera_body(width=0),
+            'empty image': camera_body(image_b64=''),
+            'prompt type': camera_body(prompts=[dict(candidate_id='c0', type='point', bbox=[0, 0, 1, 1])]),
+            'prompt bbox length': camera_body(prompts=[dict(candidate_id='c0', type='box', bbox=[0, 0, 1])]),
+            'prompt extra field': camera_body(prompts=[dict(candidate_id='c0', type='box', bbox=[0, 0, 1, 1], score=1)]),
+        }
+        for name, body in bad_bodies.items():
+            with self.subTest(name):
+                self.assertEqual(self.client.post('/api/camera/frame', json=body).status_code, 422)
+        self.send.assert_not_called()
 
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        previous = main.metrics
-        main.metrics = PipelineMetrics()
-        self.addCleanup(setattr, main, 'metrics', previous)
+        for name, fresh in (('metrics', PipelineMetrics()), ('store', InspectionStore()),
+                            ('tracker', CookieTracker(reorder_ms=0, vote_frames=1))):
+            self.addCleanup(setattr, main, name, getattr(main, name))
+            setattr(main, name, fresh)
+
+    async def test_cookie_seen_in_many_frames_is_counted_once(self):
+        def frame(frame_id, x):
+            return DetectionResult(trace_id=f't{frame_id}', session_id='s', frame_id=frame_id,
+                captured_at_ms=0, inference_container_id='c3', inference_started_at_ms=0,
+                inference_finished_at_ms=1, inference_latency_ms=1,
+                detections=[dict(object_id='c0', bbox=[x - 10, 40, x + 10, 60], status='defect',
+                                 defect_type='broken', defect_score=0.9)])
+        await main.receive_camera_frame(CameraFrame(**camera_body(width=100, height=100)), BackgroundTasks())
+        with patch.object(main, 'broadcast', new_callable=AsyncMock) as send:
+            for frame_id, x in enumerate([60, 50, 40, 30, 20]):
+                await main.receive_result(frame(frame_id, x))
+        cookies = [c.args[0]['data'] for c in send.call_args_list if c.args[0]['type'] == 'cookie_counted']
+        self.assertEqual(len(cookies), 1)
+        self.assertEqual(cookies[0]['status'], 'defect')
+        stats = main.dashboard_stats()
+        self.assertEqual((stats['total'], stats['fail_count'], stats['detections']['total']), (1, 1, 5))
+        cookie_csv = main.store.export_cookies_csv().strip().splitlines()
+        self.assertEqual(len(cookie_csv), 2)
+        self.assertTrue(cookie_csv[0].startswith('cookie_id,'))
+        self.assertEqual(len(main.store.export_detections_csv().strip().splitlines()), 6)
+
+    async def test_scan_line_api_validates_and_broadcasts(self):
+        with patch.object(main, 'broadcast', new_callable=AsyncMock) as send:
+            reply = await main.set_scan_line(ScanLine(ratio=0.5))
+        self.assertEqual(reply['scan_line_ratio'], 0.5)
+        self.assertEqual(main.tracker.scan_line_ratio, 0.5)
+        self.assertEqual(send.call_args.args[0]['type'], 'scan_line')
+        for ratio in (0, 1, -0.1):
+            with self.assertRaises(ValueError):
+                ScanLine(ratio=ratio)
 
     async def test_poll_c2_failure_hides_stale_counters(self):
         main.metrics.update_c2({'events': {'dropped_stale': 1, 'dropped_old': 2}})
@@ -22,26 +113,17 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                 await main.poll_metrics()
         self.assertIsNone(send.call_args.args[0]['data']['c2_metrics'])
 
-    async def test_camera_preserves_coordinates_and_identity(self):
-        frame = CameraFrame(trace_id='t', session_id='s', frame_id=1,
-                            width=3, height=2, prompts=[], image_b64='jpeg')
-        with patch.object(main, 'broadcast', new_callable=AsyncMock) as send:
-            await main.receive_camera_frame(frame)
-        data = send.call_args.args[0]['data']
-        self.assertEqual(data, dict(trace_id='t', session_id='s', frame_id=1,
-                                   width=3, height=2, prompts=[], frame='jpeg'))
-
     async def test_main_ten_field_camera_contract(self):
-        frame = CameraFrame(trace_id='t', session_id='s', frame_id=1,
-            width=3, height=2, prompts=[], image_b64='jpeg',
-            gateway_received_at_ms=100, preprocess_started_at_ms=110,
-            preprocess_finished_at_ms=120)
+        background = BackgroundTasks()
         with patch.object(main, 'broadcast', new_callable=AsyncMock) as send:
-            await main.receive_camera_frame(frame)
+            reply = await main.receive_camera_frame(CameraFrame(**camera_body()), background)
+            send.assert_not_called()  # relayed after the 202 is sent
+            await background()
+        self.assertEqual(reply, {'status': 'accepted'})
         data = send.call_args.args[0]['data']
-        self.assertEqual(data['gateway_received_at_ms'], 100)
-        self.assertEqual(data['preprocess_started_at_ms'], 110)
-        self.assertEqual(data['preprocess_finished_at_ms'], 120)
+        expected = camera_body()
+        expected['frame'] = expected.pop('image_b64')
+        self.assertEqual(data, expected)
         connections = await main.connections()
         self.assertIsNotNone(connections['camera']['last_received_at_ms'])
         self.assertIsNone(connections['results']['last_received_at_ms'])
@@ -61,15 +143,15 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                         for status in ('normal', 'defect', 'unknown')])
         with patch.object(main, 'broadcast', new_callable=AsyncMock) as send:
             await main.receive_result(result)
-        stats = main.store.get_stats()
+        stats = main.store.get_stats()['detections']
         self.assertEqual((stats['pass_count'], stats['fail_count'], stats['unknown_count']), (1,1,1))
         rows = main.store.get_recent()
         self.assertEqual({r['status'] for r in rows}, {'normal','defect','unknown'})
         self.assertTrue(all('circularity' not in r for r in rows))  # C4 never re-judges
         self.assertEqual(rows[0]['bbox'], [0, 0, 10, 10])
-        self.assertNotIn('circularity', main.store.export_csv().splitlines()[0])
+        self.assertNotIn('circularity', main.store.export_detections_csv().splitlines()[0])
         self.assertEqual(main.store.get_defects()[0]['defect_type'], 'broken')
-        self.assertIn('broken', main.store.export_csv())
+        self.assertIn('broken', main.store.export_detections_csv())
         event = next(c.args[0] for c in send.call_args_list if c.args[0]['type']=='frame_result')
         self.assertEqual(event['data']['latency_breakdown_ms']['c3_service'], 10)
 
