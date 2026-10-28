@@ -37,7 +37,7 @@ def _client(fake, **settings):
 def test_healthz():
     with _client(FakeInfer()) as c:
         r = c.get("/healthz")
-    assert r.status_code == 200 and r.json() == {"status": "ok"}
+    assert r.status_code == 200 and r.json() == {"status": "ok", "mqtt": {"enabled": False}}
 
 
 @pytest.mark.parametrize("fmt", ["png", "jpeg"])

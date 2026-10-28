@@ -5,3 +5,4 @@ httpx>=0.28
 qrcode[pil]>=8.0
 pillow>=11.0
 websockets>=14.0
+paho-mqtt>=2.1
