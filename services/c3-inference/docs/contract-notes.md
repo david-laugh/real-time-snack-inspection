@@ -33,7 +33,7 @@ Nginx `client_max_body_size 20m`는 1024×1024 JPEG의 base64 크기(수백 KB)�
 | 항목 | 스키마 | C3 결정 |
 |---|---|---|
 | `status` | enum `normal`/`defect`/`unknown` (소문자) | 내부 enum은 `NORMAL/DEFECT/UNKNOWN`이고, wire 값은 **스키마의 소문자 그대로**다. |
-| `defect_type` | 문자열, taxonomy TODO | `broken`, `spot_defect`. `status != defect`이면 `null`. |
+| `defect_type` | 문자열, taxonomy TODO | `broken`(형태 불량: C2 라벨의 bite / wedge / cut / half를 모두 포함). `spot_defect`는 `C3_SPOT_ENABLED=1`일 때만 나온다(초코칩 쿠키는 기본 꺼짐). `status != defect`이면 `null`. |
 | `defect_score` | [0,1] "defect confidence" | 규칙 기반 severity의 최댓값이다. **SAM2 mask score(predicted IoU)와 다른 값이다.** `>0.5`이면 defect이고, `unknown`이면 `0.0`이다. 정의는 `src/defects.py` docstring 참고. |
 | `object_id` | "SAM2 tracking id, 세션 내 유지" | A안은 tracking을 하지 않으므로 **C2의 `candidate_id`를 그대로** 쓴다. 프레임 간 동일 id를 유지하려면 C2가 같은 객체에 같은 `candidate_id`를 부여해야 한다. **(합의 필요)** |
 | `bbox` | `[x1,y1,x2,y2]` | 입력 prompt bbox(clip 후)를 그대로 반환한다. 마스크의 외접 사각형이 아니다. |
@@ -74,5 +74,9 @@ COCO RLE(column-major)와는 순서가 다르다. decoder 예시는 `src/mask_co
 
 ## 6. 미해결 / 범위 밖
 
-- **C3 → C4 전달**: README의 `POST http://c4-visualizer:8003/results`(TBD)는 구현하지 않았다. 현재 DetectionResult는 `/infer`의 **응답**으로 C2(호출자)에게 돌아간다. 누가 C4로 전달할지(C2 relay vs C3 push)는 팀 결정이 필요하다.
+- ~~**C3 → C4 전달**~~ → **C3 push로 구현함 (2026-10-28)**.
+  - 근거: C2는 `/infer` 응답 body를 읽지 않고 상태 코드만 본다. C4(`C4-Visualizer` 브랜치)와 C1 stub은 모두 C3가 `POST /results`를 보내는 것을 전제로 한다.
+  - 동작: `/infer` 응답을 보낸 뒤 백그라운드로 `C3_RESULTS_URL`에 같은 JSON과 trace header를 POST한다. 실패는 `/metrics`에서 카운트하고 `/infer` 결과에는 영향을 주지 않는다.
+  - 연동 확인: C2(`origin/main`) → C3 → C4(`C4-Visualizer` 브랜치)를 로컬에서 연결해서 6프레임 42개 detection이 모두 C4에 도착했다.
+- **C4가 C3 판정을 쓰지 않음 (C4 owner 확인 필요)**: C4 `receive_result`는 `status`/`defect_type`을 무시하고, bbox 사각형의 w·h로 원형도(4π·wh/(2(w+h))²)를 계산해 pass/fail을 정한다. bbox가 정사각형이면 이 값은 항상 π/4 ≈ 0.785다. 그래서 연동 시험에서 정상 23개를 포함한 42개 모두 `fail`로 표시됐다. C3가 보내는 `status`를 그대로 쓰도록 C4를 바꾸는 것을 제안한다.
 - **Session affinity**: A안은 stateless라서 Nginx round-robin과 충돌하지 않는다. 나중에 Video Predictor(B안)로 전환하면 `hash $http_x_session_id consistent;`가 필요하다.

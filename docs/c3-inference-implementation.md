@@ -36,7 +36,7 @@ Video Predictor(B안, 세션 tracking)는 이번 범위에서 제외했다. 나�
 | 3 | `image_b64`가 optional이고 전송 방식이 TODO 상태 | C3는 필수로 요구한다(없으면 422). 스키마를 required로 바꾸는 것은 **C2 owner와 합의가 필요한 제안**으로 남겼다 |
 | 4 | `object_id`는 "SAM2 tracking id"로 정의되어 있지만 A안은 tracking을 하지 않음 | `object_id = candidate_id`. 프레임 간 동일성은 C2 쪽 책임 **(합의 필요)** |
 | 5 | mask encoding이 TODO 상태 | `rle`(row-major, 0의 run부터 시작하는 uncompressed counts)로 정하고 형식을 문서화했다 |
-| 6 | C3 → C4 `POST /results`가 TBD 상태 | 이번에는 `/infer` **응답**으로만 반환한다. 전달 주체는 미결정 |
+| 6 | C3 → C4 `POST /results`가 TBD 상태 | (1차) `/infer` 응답으로만 반환 → **(2차, §11) C3가 C4로 직접 전송**하도록 구현 |
 | 7 | Nginx `proxy_next_upstream http_503` 설정 | POST는 non-idempotent라서 다른 replica로 재시도되지 않는다. 모델 로딩 중인 replica의 503이 C2까지 전달된다(Nginx는 수정하지 않음) |
 | 8 | compose의 C3 `command: sleep infinity`, `.env.example`의 `SAM2_MODEL_CFG=TODO` | 둘 다 `TODO(Member C)` placeholder이므로 **이 부분만** 실제 값으로 교체했다 |
 
@@ -137,14 +137,16 @@ services/c3-inference/
 | 결과 | 조건 (기본 임계값) |
 |---|---|
 | `unknown` | SAM2 mask score < `0.5`, mask 면적 < `100px`, 또는 외곽선 없음 |
-| `defect` / `broken` | 원형도(4πA/P²) < `0.70`, solidity(A/convex hull) < `0.90`, 종횡비(minAreaRect 단변/장변) < `0.75`, 의미 있는 조각(면적 5% 이상) > 1개, (설정 시) 기대 면적 대비 편차 > `±25%` |
-| `defect` / `spot_defect` | 외곽선 내부를 채운 뒤 3px 침식한 영역에서 Lab L < median(L) − `50`인 픽셀(3px opening 적용) 비율 > `3%` |
+| `defect` / `broken` | 오목 깊이 ÷ 볼록 껍질 지름 > `0.03`(깊이 2px 미만 무시), 종횡비(minAreaRect 단변/장변) < `0.87`, 원형도(4πA/P²) < `0.80`, solidity(A/convex hull) < `0.90`, 의미 있는 조각(면적 5% 이상) > 1개, (설정 시) 기대 면적 대비 편차 > `±25%` |
+| `defect` / `spot_defect` | **기본 꺼짐**(`C3_SPOT_ENABLED=1`일 때만). 외곽선 내부를 채운 뒤 3px 침식한 영역에서 Lab L < median(L) − `50`인 픽셀(3px opening 적용) 비율 > `3%` |
 | `normal` | 위 조건에 하나도 해당하지 않음 |
 
 **`defect_score` 정의**
 - 규칙마다 측정값을 severity로 바꾼다. 이상적인 값은 0, 임계값에 정확히 걸리면 0.5, 크게 벗어나면 1이다.
 - `defect_score`는 그중 최댓값이다. 따라서 `defect ⇔ defect_score > 0.5`이고, `unknown`이면 `0.0`이다.
 - **SAM2 mask score(predicted IoU)는 `unknown` 판정에만 쓰며 `defect_score`와 섞지 않는다.** mask score가 달라도 defect_score가 같은지 테스트로 검증했다.
+
+> 2차 작업(§11)에서 C2 fixture의 실제 과자 이미지를 기준으로 위 임계값을 다시 정했다. 1차 기본값은 원형도 0.70, 종횡비 0.75, 오목 깊이 규칙 없음, 반점 규칙 켜짐이었다.
 
 모든 임계값은 `C3_MIN_MASK_*`, `C3_BROKEN_*`, `C3_SPOT_*` 환경변수로 조정한다. 전체 목록은 [C3 README](../services/c3-inference/README.md#환경변수)에 있다.
 
@@ -186,9 +188,9 @@ python services/c3-inference/scripts/send_frames.py --url http://localhost:8080/
 
 | 파일 | 개수 | 내용 |
 |---|---|---|
-| `tests/test_api.py` | 25 | Mock Predictor API 통합 테스트: 유효한 프레임(실제 JSON Schema 검증, trace 전파, header), spot/broken/unknown 판정, bbox 없는 요청, 잘못된 bbox 6종, 중복 id, clip, 손상된 JPEG 3종, 이미지 누락, 크기 불일치, 스키마 위반, 깨진 JSON, 모델 미준비, 백그라운드 로딩, 로드 실패, 지연 측정과 `/metrics`, header 불일치 |
-| `tests/test_defects.py` | 19 | 불량 규칙 단위 테스트(정상 원/사각형, 파손 3종, 반점, 작은 반점, 가장자리 그림자, mask 구멍으로 빠진 반점, unknown 4종, 환경변수 임계값, defect/mask score 독립성), RLE round-trip |
-| `tests/test_sam2_real.py` | 4 | 실제 SAM2 backend로 분할 정확도와 판정, bbox 1/4/8개 latency. torch, sam2, checkpoint가 없으면 skip |
+| `tests/test_api.py` | 29 | Mock Predictor API 통합 테스트: C4 전송(성공, C4 500, 연결 실패, timeout, 끔, 오류 요청은 미전송), 유효한 프레임(실제 JSON Schema 검증, trace 전파, header), spot(켰을 때)/broken/unknown 판정, bbox 없는 요청, 잘못된 bbox 6종, 중복 id, clip, 손상된 JPEG 3종, 이미지 누락, 크기 불일치, 스키마 위반, 깨진 JSON, 모델 미준비, 백그라운드 로딩, 로드 실패, 지연 측정과 `/metrics`, header 불일치 |
+| `tests/test_defects.py` | 71 | **C2 fixture 실제 SAM2 mask 42개 회귀**, 커버리지 확인, 불량 규칙 단위 테스트(정상 원, 사각형은 원형도 완화 필요, 파손 5종 wedge/bite/cut/half/두 조각, 초코칩 정상, 작은 쿠키 정상 3종, 작은 쿠키 bite, 반점(켰을 때) 4종, unknown 4종, 환경변수 임계값, defect/mask score 독립성), RLE round-trip |
+| `tests/test_sam2_real.py` | 5 | 실제 SAM2 backend로 분할 정확도와 판정, bbox 1/4/8개 latency, **C2 fixture 이미지 6장 E2E 판정**. torch, sam2, checkpoint가 없으면 skip |
 
 실행: `cd services/c3-inference && python -m pytest` (실제 SAM2 출력까지 보려면 `-s`). 결과는 [검증 보고서](c3-inference-validation-report.md)에 있다.
 
@@ -207,9 +209,48 @@ python services/c3-inference/scripts/send_frames.py --url http://localhost:8080/
 
 ## 10. 남은 과제
 
-- [ ] 실제 과자 영상으로 불량 임계값 보정(현재는 합성 이미지로만 검증)
-- [ ] C3 → C4 결과 전달 경로 결정(C2 relay vs C3 push)
+- [x] 실제 과자 영상으로 불량 임계값 보정 → C2 fixture 6장, 42개로 보정(§11). 새 촬영 데이터로 계속 확인 필요
+- [x] C3 → C4 결과 전달 경로 결정 → C3 push(§11)
+- [ ] C4가 C3의 `status`를 쓰도록 수정(C4 owner). 현재는 bbox로 다시 판정해서 모두 `fail`로 표시됨
 - [ ] `object_id` 프레임 간 유지 방식 C2와 합의
 - [ ] `image_b64`를 required로 바꾸는 스키마 변경 제안(C2 owner 리뷰)
 - [ ] 모델 로딩 중 503 처리: 모든 replica가 healthy가 된 뒤 트래픽을 보내거나 Nginx `non_idempotent` 검토
 - [ ] 동시 부하(30fps)에서 replica 1/2/3개 throughput 벤치마크([bottleneck-test-plan](bottleneck-test-plan.md))
+
+---
+
+## 11. 2차 작업: C1/C2 머지 후 연동 수정 (2026-10-28)
+
+C1(PR #1)과 C2(PR #2)가 `main`에 머지된 뒤, **C1과 C2 코드는 수정하지 않고** 분석과 실행만 했다. C3에서 고칠 부분을 찾아 수정했다. 검증 결과는 [검증 보고서 §9](c3-inference-validation-report.md#9-2차-검증-c1c2-머지-후-연동)에 있다.
+
+### 11.1 분석 결과
+
+| 항목 | 결과 |
+|---|---|
+| C2 → C3 요청 형식 | ✅ 그대로 동작. `image_b64`(JPEG q90), trace header 3개, 리사이즈 후 좌표의 bbox(긴 변 1024, 정사각형이 아님), `candidate_id = c0, c1, …` |
+| C2의 `/infer` 응답 처리 | 상태 코드만 확인하고 body는 버린다. 결과를 C4로 넘기는 주체가 없었다 |
+| C4(`C4-Visualizer` 브랜치)·C1 stub | 둘 다 C3가 `POST /results`를 보낸다고 전제한다 |
+| 대상 과자 | 원형 **초코칩 쿠키**. 불량 라벨은 bite / wedge / cut / half(형태)뿐이다 |
+| 1차 판정 규칙의 결과 | 상태와 유형 모두 맞은 것이 42개 중 **20개**뿐이었다. 시뮬레이터: 정상 8개 중 5개를 `spot_defect`로 오판, 파손 7개는 전부 `spot_defect`로 분류. 폰: 파손 12개 중 4개 놓침, 5개는 유형 오류(`spot_defect`), 정상 1개 오판 |
+| 지연 예산 | C2 → C3 timeout 3s, C1 → C2 5s. C3 처리 시간 53~69 ms라서 문제없다 |
+
+### 11.2 수정 내용 (C3만)
+
+| 수정 | 내용 |
+|---|---|
+| C3 → C4 전송 | `/infer` 성공 시 응답을 보낸 **뒤** 백그라운드로 `C3_RESULTS_URL`(기본 `http://c4-visualizer:8003/results`)에 같은 JSON과 trace header를 POST한다. C4 실패는 `/infer`에 영향을 주지 않고 `/metrics`의 `results_push_*`에 카운트된다. `httpx`를 runtime 의존성으로 옮겼다 |
+| 반점 규칙 기본 끔 | `C3_SPOT_ENABLED=0`. 초코칩 때문에 정상과 불량의 어두운 영역 비율이 겹친다(정상 0.021~0.047, 파손 0.041~0.063) |
+| 오목 깊이 규칙 추가 | `cv2.convexityDefects`로 구한 가장 깊은 오목부 ÷ 볼록 껍질 지름 > 0.03이면 broken(bite, wedge). 깊이 2px 미만은 노이즈로 무시한다 |
+| 종횡비 0.75 → 0.87 | cut(≤ 0.839), half(0.558)를 잡는다. 정상은 폰 원근을 포함해 ≥ 0.899 |
+| 원형도 0.70 → 0.80 (보조) | 픽셀 격자 특성상 완벽한 원도 지름 50px에서 0.874, 30px에서 0.855다. 그래서 주 판정 기준으로 쓰지 않는다 |
+| 회귀 fixture | `tests/fixtures/c2_snack_masks.json`: C2 산출 prompt에 실제 SAM2 mask를 붙인 42개 객체. 생성 절차는 `tests/fixtures/README.md` |
+
+### 11.3 C3 밖의 이슈 (보고만 함)
+
+| 대상 | 이슈 |
+|---|---|
+| C4 (Member D) | `receive_result`가 C3의 `status`/`defect_type`을 무시하고 bbox 사각형의 원형도로 pass/fail을 다시 정한다. 정사각형 bbox는 항상 π/4 ≈ 0.785라서 연동 시험에서 42개 모두 `fail`로 표시됐다 |
+| compose (Member A) | `main`에서 c2의 `command`가 아직 `sleep infinity`다(C2 PROPOSALS P4). compose만으로는 C2가 실행되지 않는다 |
+| C1 / C2 (A, B) | C1 `C1_MAX_INFLIGHT=2`이고 C2가 동기 방식이라 C3에 동시에 들어가는 요청이 최대 2개다. scale-out 효과가 측정되지 않는다(C2 PROPOSALS P3) |
+| C1 (A) | `main`의 `/cam` 기본 해상도는 640이다. 가로 촬영 시 쿠키 지름이 약 50px라서 bite 깊이가 2~3px밖에 안 된다. 960 상향 커밋은 아직 머지되지 않았다 |
+| 스키마 (공동) | C2가 제안한 `scale`, `crop_offset`, `expected_diameter_px`(P1, P2)가 추가되면, C3는 모르는 필드를 422로 거절하므로 함께 업데이트해야 한다 |

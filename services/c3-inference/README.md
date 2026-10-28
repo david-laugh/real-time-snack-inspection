@@ -2,7 +2,8 @@
 
 **Owner:** [이규혁](https://github.com/david-laugh)
 
-C2에서 매 프레임 받는 `image + prompts[]`로 **SAM2.1 `SAM2ImagePredictor` 프레임 독립 추론(A안)**을 수행하고, mask 기반 불량 판정 결과(`DetectionResult`)를 JSON으로 반환한다.
+C2에서 매 프레임 받는 `image + prompts[]`로 **SAM2.1 `SAM2ImagePredictor` 프레임 독립 추론(A안)**을 수행하고, mask 기반 불량 판정 결과(`DetectionResult`)를 만든다.
+결과는 `/infer` 응답으로 C2에 돌려주고, 같은 내용을 **C4 `POST /results`로도 전송**한다(응답 이후 백그라운드).
 Video Predictor의 `inference_state`나 세션 memory는 두지 않는다. 그래서 어떤 replica든 어떤 프레임이든 처리할 수 있고, Nginx round-robin과 충돌하지 않는다.
 
 계약 해석과 스키마 관련 결정: [`docs/contract-notes.md`](docs/contract-notes.md)
@@ -13,7 +14,13 @@ Video Predictor의 `inference_state`나 세션 memory는 두지 않는다. 그�
 |---|---|---|
 | `POST` | `/infer` | body: [`processed-frame`](../../shared/schemas/processed-frame.schema.json) (+ `image_b64` = base64 JPEG) → [`detection-result`](../../shared/schemas/detection-result.schema.json) |
 | `GET` | `/healthz` | 모델이 준비되면 `200`, `loading`/`error`/`not_started` 상태면 `503`. body에 status, device, amp, `model_load_ms`, `warmup_ms`, error 포함 |
-| `GET` | `/metrics` | `processed_frame_count`, `error_count`(+code별), stage별 latency window(mean/p50/p95/max), 모델 정보, GPU 메모리 |
+| `GET` | `/metrics` | `processed_frame_count`, `error_count`(+code별), stage별 latency window(mean/p50/p95/max), 모델 정보, GPU 메모리, C4 전송 성공/실패 수 |
+
+**C3 → C4 전송**: `/infer`가 성공하면 같은 `DetectionResult` JSON을 `C3_RESULTS_URL`(기본 `http://c4-visualizer:8003/results`)로 POST한다. trace header 3개도 함께 보낸다.
+- 응답을 C2에 보낸 **뒤에** 백그라운드로 전송하므로 C2가 체감하는 latency에 포함되지 않는다.
+- C4가 실패하거나(4xx/5xx, 연결 실패, timeout) 응답이 늦어도 `/infer`는 성공으로 처리한다. 실패는 `/metrics`의 `results_push_error_count`와 `results_push_errors`(원인별)로 확인한다.
+- 422/503 같은 오류 요청은 전송하지 않는다. `C3_RESULTS_URL=`(빈 값)이면 전송을 끈다.
+- 결과에는 detection-result 1.1.0의 optional 필드 `latency_breakdown_ms`(촬영 → C2 → **C2→C3 전달** → C3 대기/처리 구간별 지연), `preprocess_*_at_ms`, `inference_received_at_ms`, `inference_timings_ms`가 들어간다. C4 작업자용 사양과 frame drop 계산식은 [`docs/c3-to-c4-handoff.md`](../../docs/c3-to-c4-handoff.md)에 있다.
 
 - Trace header `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`를 받아 응답 header로 echo한다(body 값이 기준).
 - `DetectionResult`가 `additionalProperties:false`라서 per-frame timing은 **응답 header**로 보낸다. `X-C3-Decode-Ms`, `X-C3-Encoder-Ms`, `X-C3-Segmentation-Ms`, `X-C3-Defect-Analysis-Ms`, `X-C3-Total-Inference-Ms`, `Server-Timing`, `X-Inference-Container-Id`.
@@ -27,7 +34,7 @@ Video Predictor의 `inference_state`나 세션 memory는 두지 않는다. 그�
 | 2. JPEG decode | `src/pipeline.py` | `decode_ms` |
 | 3. SAM2 image embedding (**프레임당 1회**) | `src/predictor/sam2_predictor.py` | `encoder_ms` |
 | 4. bbox prompt segmentation (모든 bbox를 한 번에, `C3_BOX_BATCH_SIZE` 단위) | 〃 | `segmentation_ms` |
-| 5. 파손/색상 이상 분석 | `src/defects.py` | `defect_analysis_ms` |
+| 5. 파손 분석 (색상/반점 규칙은 기본 꺼짐) | `src/defects.py` | `defect_analysis_ms` |
 | 6. Mask RLE + 결과 생성 | `src/mask_codec.py`, `src/pipeline.py` | `mask_encode_ms` |
 | 전체 | | `total_inference_ms` (= `inference_latency_ms`) |
 
@@ -57,13 +64,30 @@ Mock과 SAM2는 같은 `SegmentationPredictor` 인터페이스를 쓰므로 `C3_
 | 결과 | 조건 |
 |---|---|
 | `unknown` | SAM2 mask score < `C3_MIN_MASK_SCORE`, 또는 mask 면적 < `C3_MIN_MASK_AREA_PX` |
-| `defect` / `broken` | 가장 큰 component의 원형도(4πA/P²) < min, solidity(A/convex hull) < min, 종횡비(minAreaRect 단변/장변) < min, 의미 있는 조각 수 > 1, (설정한 경우) 기대 면적 대비 편차 > tolerance |
-| `defect` / `spot_defect` | 침식(erode)한 mask 내부에서 Lab L < median(L) − delta인 픽셀(opening 적용) 비율 > `C3_SPOT_RATIO_MAX` |
+| `defect` / `broken` | 아래 형태 규칙 중 하나라도 위반 |
+| `defect` / `spot_defect` | **기본 꺼짐** (`C3_SPOT_ENABLED=1`일 때만). 침식(erode)한 mask 내부에서 Lab L < median(L) − delta인 픽셀(opening 적용) 비율 > `C3_SPOT_RATIO_MAX` |
 | `normal` | 위 조건에 하나도 해당하지 않음 |
+
+**형태(BROKEN) 규칙**: 대상은 원형 초코칩 쿠키이고, 라벨 체계는 bite / wedge / cut / half다.
+
+| 규칙 | 기본 임계값 | 잡는 불량 | 근거 (C2 fixture 실제 SAM2 mask 42개) |
+|---|---|---|---|
+| 오목 깊이 ÷ 볼록 껍질 지름 (`concavity`) | > `0.03` (깊이 `2px` 미만은 무시) | bite, wedge | 정상 ≤ 0.013 / bite ≥ 0.049 / wedge ≥ 0.31 |
+| 종횡비 (minAreaRect 단변/장변) | < `0.87` | cut, half | 정상 ≥ 0.899 (폰 원근 포함) / cut ≤ 0.839 / half 0.558 |
+| 원형도 (4πA/P²) | < `0.80` | 보조 | 정상 ≥ 0.888 / wedge ≈ 0.63. 픽셀 격자 특성상 완벽한 원도 지름 50px에서 0.874, 30px에서 0.855라서 낮게 둔다 |
+| solidity (A / convex hull) | < `0.90` | 보조 | 정상 ≥ 0.986 / wedge ≈ 0.89 |
+| 조각 수 | > 1 | 쪼개진 과자 | 면적 5% 이상 component만 셈 |
+| 기대 면적 편차 | `C3_BROKEN_EXPECTED_AREA_PX` > 0일 때만 | 결손 | 기본 꺼짐 (해상도마다 다름) |
+
+- 이 임계값으로 회귀 fixture(`tests/fixtures/c2_snack_masks.json`) 42개를 모두 맞게 분류한다.
+- 실제 SAM2로 C2 이미지부터 끝까지 판정해도 42/42다.
+- **주의**: 폰 프레임 27개의 라벨은 사람이 눈으로 붙였고, 임계값을 정한 데이터와 검증 데이터가 같다. 새 촬영 데이터로 계속 확인해야 한다.
+
+**반점 규칙을 기본으로 끈 이유**: 쿠키의 초코칩이 어두운 점이라 정상 쿠키도 어두운 영역이 2~5%다. 실측 결과 불량과 구분되지 않았다(정상 0.021~0.047, 파손 0.041~0.063). 칩이 없는 과자에서만 켠다.
 
 `defect_score`는 각 규칙의 severity 중 최댓값이다(이상적인 값 = 0, 임계값에 정확히 걸리면 = 0.5, 크게 벗어나면 = 1). 그래서 `defect ⇔ defect_score > 0.5`이고, `unknown`이면 `0.0`이다.
 **SAM2 mask score(predicted IoU)는 `unknown` 판정에만 쓰며 `defect_score`와 섞지 않는다.**
-기본 임계값은 둥근 과자를 기준으로 잡았다. 사각형 과자는 원형도가 약 0.78이므로 기본값 0.70으로 통과한다. 실제 과자와 카메라 조건에 맞춰 조정해야 한다.
+기본 임계값은 원형 쿠키 기준이다. 사각형 과자는 원형도가 약 0.785라서 `C3_BROKEN_CIRCULARITY_MIN`을 낮춰야 한다.
 
 ## 환경변수
 
@@ -83,15 +107,20 @@ Mock과 SAM2는 같은 `SegmentationPredictor` 인터페이스를 쓰므로 `C3_
 | `C3_BOX_BATCH_SIZE` | `16` | mask decoder 1회 호출에 넣는 bbox 수 |
 | `C3_MAX_PROMPTS` | `64` | 초과하면 422 |
 | `C3_RETURN_MASK` | `1` | `0`이면 `mask: null` (응답 크기/latency 절감) |
+| `C3_RESULTS_URL` | `http://c4-visualizer:8003/results` | DetectionResult 전송 대상(C4). 빈 값이면 전송하지 않음 |
+| `C3_RESULTS_TIMEOUT_S` | `2.0` | C4 전송 timeout(초) |
 | `C3_METRICS_WINDOW` | `1000` | `/metrics` percentile 계산에 쓰는 최근 프레임 수 |
 | `C3_MIN_MASK_SCORE` | `0.5` | 이 값 미만이면 unknown |
 | `C3_MIN_MASK_AREA_PX` | `100` | 이 값 미만이면 unknown |
-| `C3_BROKEN_CIRCULARITY_MIN` | `0.70` | |
-| `C3_BROKEN_SOLIDITY_MIN` | `0.90` | |
-| `C3_BROKEN_ASPECT_RATIO_MIN` | `0.75` | |
+| `C3_BROKEN_CONCAVITY_MAX` | `0.03` | 가장 깊은 오목부 ÷ 볼록 껍질 지름 (bite, wedge) |
+| `C3_BROKEN_CONCAVITY_MIN_PX` | `2.0` | 이보다 얕은 오목부는 mask 경계 노이즈로 무시 |
+| `C3_BROKEN_ASPECT_RATIO_MIN` | `0.87` | (cut, half) |
+| `C3_BROKEN_CIRCULARITY_MIN` | `0.80` | 보조 규칙 |
+| `C3_BROKEN_SOLIDITY_MIN` | `0.90` | 보조 규칙 |
 | `C3_BROKEN_FRAGMENT_MIN_RATIO` | `0.05` | mask 면적에서 이 비율 이상인 component만 조각으로 셈 |
 | `C3_BROKEN_EXPECTED_AREA_PX` | `0` | 0이면 면적 규칙을 쓰지 않음 |
 | `C3_BROKEN_AREA_TOLERANCE` | `0.25` | 기대 면적 대비 ±25% |
+| `C3_SPOT_ENABLED` | `0` | 반점 규칙 사용 여부 (초코칩 쿠키는 끔) |
 | `C3_SPOT_DARK_DELTA` | `50` | median L보다 이만큼 어두우면 dark 픽셀 |
 | `C3_SPOT_RATIO_MAX` | `0.03` | dark 픽셀 비율 상한 |
 | `C3_SPOT_ERODE_PX` | `3` | 가장자리 그림자를 제외하기 위한 침식 폭 |
@@ -144,6 +173,20 @@ python -m pytest                 # mock API 통합 + 불량 규칙 + RLE (torch 
 python -m pytest -s tests/test_sam2_real.py   # torch/sam2/checkpoint가 있으면 실제 SAM2로 실행, 없으면 skip
 ```
 
+## 권장 구성 (실측, RTX 5060 Ti 1장)
+
+C1 → MQTT → C2 → Nginx → C3 → C4 실제 체인 부하 시험 결과다([`docs/c3-inference-c2-integration-report.md`](../../docs/c3-inference-c2-integration-report.md)). 재현 도구는 [`dev/`](dev/README.md)에 있다.
+
+| 입력 | C3 replica | C2 `C2_MAX_INFLIGHT` | 결과 |
+|---|---|---|---|
+| 30 fps 1 스트림 | **2** | **3** | 30.0 fps 전달, Nginx p50/p95 43/47 ms, C3 대기 0 |
+| 60 fps (2 스트림) | 3 | 4 | 35.6 fps (단일 GPU 상한 약 30~36 fps) |
+
+- 규칙: `C2_MAX_INFLIGHT = replica 수 + 1`. 더 크게 잡으면 C3 안에서 대기와 GPU 경합만 늘어난다(×3, inflight 6: 31.1 fps, p50 179 ms).
+- replica 1개의 상한은 약 29 fps다(lock이 잡는 encoder + segmentation 약 34 ms).
+- Nginx timeout: `proxy_read_timeout`·`proxy_send_timeout` 2500ms, `proxy_connect_timeout` 1s. C2 `/infer` timeout 3 s보다 짧게 둔다.
+- `/metrics`의 `latency_window_ms.lock_wait_ms`는 replica 안에서 기다린 시간이다. `total_inference_ms`에 포함되므로, 처리가 느린 것인지 대기가 긴 것인지 이 값으로 구분한다.
+
 ## ⚠️ 단일 GPU Scale-out (자원 경합)
 
 `compose.gpu.yml`은 모든 replica에 **같은 GPU 0번**을 할당한다. 단일 GPU에서 replica를 늘리면 다음 문제가 생길 수 있다.
@@ -154,6 +197,7 @@ python -m pytest -s tests/test_sam2_real.py   # torch/sam2/checkpoint가 있으�
 - 한 replica 안에서는 SAM2 predictor가 프레임 단위 lock으로 직렬화된다. 동시에 들어온 요청은 대기하며, 대기 시간은 `Server-Timing`의 `lock_wait`로 확인할 수 있다.
 
 ## Open issues
-- C3 → C4 결과 전달 경로(현재는 `/infer` 응답으로만 반환)와 프레임 간 `object_id` 유지 방식. 자세한 내용은 [`docs/contract-notes.md`](docs/contract-notes.md).
+- 프레임 간 `object_id` 유지 방식(현재 `candidate_id` 그대로). 자세한 내용은 [`docs/contract-notes.md`](docs/contract-notes.md).
+- C4(`C4-Visualizer` 브랜치)는 C3의 `status`/`defect_type`을 쓰지 않고 bbox 사각형으로 원형도를 다시 계산해 pass/fail을 정한다. 2026-10-28 연동 시험에서 42개 모두 `fail`로 표시됐다. C4 쪽 수정이 필요하다.
 - Nginx `proxy_next_upstream`는 POST를 재시도하지 않으므로, 모델 로딩 중인 replica의 503이 C2까지 전달된다.
-- 불량 임계값은 합성 이미지로만 검증했다. 실제 과자 영상으로 보정해야 한다.
+- 불량 임계값은 C2 fixture(시뮬레이터 1장 + 폰 5장)로 보정했다. 촬영 조건(해상도, 각도, 조명)이 바뀌면 다시 확인해야 한다. 특히 C1 `/cam` 640px 가로 촬영처럼 쿠키 지름이 50px 안팎이면 bite 깊이가 2~3px에 불과하다.

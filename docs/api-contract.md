@@ -75,6 +75,12 @@ C1 latency(`preprocess_started_at_ms - gateway_received_at_ms`)에는 브로커 
 | `inference_finished_at_ms` | integer | 추론 종료 시각 |
 | `inference_latency_ms` | number | 추론 소요 시간 |
 | `detections` | detection[] | 검출 결과 |
+| `preprocess_started_at_ms` / `preprocess_finished_at_ms` | integer (optional, 1.1.0) | processed-frame에서 전파한 C2 시각 |
+| `inference_received_at_ms` | integer (optional, 1.1.0) | C3가 `/infer` 요청을 받은 시각 |
+| `latency_breakdown_ms` | object (optional, 1.1.0) | C3가 계산한 구간별 지연: `capture_to_preprocess`, `preprocess`, `c2_to_c3`, `c3_queue`, `c3_service`, `c3_total`, `capture_to_c3_done` (ms, 시계 역전 시 null) |
+| `inference_timings_ms` | object (optional, 1.1.0) | C3 내부 단계: `lock_wait`, `decode`, `encoder`, `segmentation`, `defect_analysis`, `mask_encode`, `total` |
+
+C4 전달 방식, mask RLE 디코딩, frame drop 계산식은 [`c3-to-c4-handoff.md`](c3-to-c4-handoff.md)에 있다.
 
 **detection**
 
@@ -94,6 +100,7 @@ C1 latency(`preprocess_started_at_ms - gateway_received_at_ms`)에는 브로커 
 | C1 latency | `preprocess_started_at_ms - gateway_received_at_ms` (C1 처리 + C1→C2 전송) |
 | C2 latency | `preprocess_finished_at_ms - preprocess_started_at_ms` |
 | C3 inference latency | `inference_latency_ms` |
+| C2 → C3 전달 | `latency_breakdown_ms.c2_to_c3` (= `inference_received_at_ms - preprocess_finished_at_ms`, 1.1.0) |
 | End-to-End latency | `visualized_at_ms(C4) - captured_at_ms` |
 
 TODO: 정의는 구현 시 팀 합의로 확정한다.
@@ -104,3 +111,4 @@ TODO: 정의는 구현 시 팀 합의로 확정한다.
 |---|---|---|
 | 1.0.0 | 2026-10-28 | 초기 skeleton |
 | 1.1.0 (제안) | 2026-10-28 | C1 → C2 전송을 MQTT로 변경 (frame-envelope 필드 변경 없음, 드롭은 C2 담당) |
+| detection-result 1.1.0 | 2026-10-28 | optional 필드 추가: `preprocess_started/finished_at_ms`, `inference_received_at_ms`, `latency_breakdown_ms`, `inference_timings_ms` (C3 → C4 구간별 지연, 하위 호환) |
