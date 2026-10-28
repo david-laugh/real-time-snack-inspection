@@ -15,7 +15,7 @@ function dashboard() {
   });
   const element = () => {
     const ctx = context2d();
-    return {style: {}, getContext: () => ctx, querySelector: () => null,
+    return {style: {}, setAttribute() {}, getContext: () => ctx, querySelector: () => null,
       appendChild() {}, getBoundingClientRect: () => ({width: 600, height: 400})};
   };
   const sandbox = {document: {
@@ -81,4 +81,15 @@ test('renders a matched mask and removes it on an empty next frame', () => {
   assert.equal(d.run('bboxOverlays[0].maskCanvas.width'), 3);
   d.run(`updateCamera(${frame(2)}); updateFrameResult(${result(2)});`); loaded(d);
   assert.equal(d.run('bboxOverlays.length'), 0);
+});
+
+test('metrics distinguish unavailable counters from zero', () => {
+  const d = dashboard();
+  d.run(`updateStats({total:0,pass_count:0,fail_count:0,defect_rate:0,fps:0});`);
+  assert.equal(d.run("id('pDrop').textContent"), '미수집');
+  assert.equal(d.run("id('pE2e').textContent"), '미수집');
+  d.run(`updateStats({total:0,pass_count:0,fail_count:0,defect_rate:0,fps:0,
+    c2_metrics:{dropped_stale:0,dropped_old:0,c4_skipped:null,c4_error:null}});`);
+  assert.equal(d.run("id('pDrop').textContent"), 0);
+  assert.equal(d.run("id('pImageLoss').textContent"), '미수집');
 });

@@ -63,7 +63,7 @@ header h1 span { color: var(--accent); }
 
 .perf-row {
   grid-column: 1 / -1;
-  display: grid; grid-template-columns: 1fr; gap: 12px;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px;
 }
 .perf-card {
   background: var(--surface); border-radius: var(--radius);
@@ -198,6 +198,13 @@ header h1 span { color: var(--accent); }
       <div class="value" id="pFps">0</div>
       <div class="unit">frames/sec</div>
     </div>
+    <div class="perf-card"><div class="label">E2E 지연</div><div class="value" id="pE2e">미수집</div><div class="unit">캡처 → C4 수신</div></div>
+    <div class="perf-card"><div class="label">C3 추론</div><div class="value" id="pInference">미수집</div><div class="unit">C3 처리 시간</div></div>
+    <div class="perf-card"><div class="label">C3 → C4</div><div class="value" id="pC3C4">미수집</div><div class="unit">추론 종료 → C4 수신</div></div>
+    <div class="perf-card"><div class="label">C3 이전 전체</div><div class="value" id="pBeforeC3">미수집</div><div class="unit">캡처 → C3 추론 시작</div></div>
+    <div class="perf-card"><div class="label">C1 → C2 / C2 → C3</div><div class="value" id="pStages">미수집</div><div class="unit">구간 시각 전달 필요</div></div>
+    <div class="perf-card"><div class="label">C2 Frame Drop</div><div class="value" id="pDrop">미수집</div><div class="unit">stale + old · C2 기동 이후</div></div>
+    <div class="perf-card"><div class="label">화면용 이미지 전송 누락</div><div class="value" id="pImageLoss">미수집</div><div class="unit">C4 skipped + error · 추론 드롭과 별개</div></div>
   </div>
 
   <div class="camera-panel">
@@ -298,6 +305,15 @@ function updateStats(s) {
   el.className = 'value ' + (r <= 3 ? 'pass' : 'fail');
 
   id('pFps').textContent = s.fps || '0';
+  const latency = s.latency || {};
+  for (const [element, name] of [['pE2e', 'e2e'], ['pInference', 'inference'], ['pC3C4', 'c3_c4'], ['pBeforeC3', 'before_c3']]) {
+    const sample = latency[name];
+    id(element).textContent = sample?.p50_ms == null ? '미수집' : `${sample.p50_ms} / ${sample.p95_ms} ms`;
+    id(element).title = '최근 200개 프레임의 P50 / P95 · 호스트 간 시계 동기화 필요';
+  }
+  const c2 = s.c2_metrics;
+  id('pDrop').textContent = c2 ? c2.dropped_stale + c2.dropped_old : '미수집';
+  id('pImageLoss').textContent = c2?.c4_skipped != null && c2?.c4_error != null ? c2.c4_skipped + c2.c4_error : '미수집';
 
   const passRate = s.total > 0 ? (s.pass_count / s.total) : 1;
   const C = 327;
@@ -483,6 +499,7 @@ function updateFrameResult(d) {
   const entry = frameEntry(d);
   if (!entry) return;
   entry.detections = d.detections;
+  if (!entry.image) id('camStatus').textContent = `결과 ${d.frame_id} 수신 · 이미지 대기/누락 (이전 화면 유지)`;
   presentFrame(entry);
 }
 

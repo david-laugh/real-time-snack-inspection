@@ -69,16 +69,27 @@ Circularity = 4π × area / perimeter²
 
 > 임계값은 `main.py`의 `CIRCULARITY_THRESHOLD = 0.85`에서 변경 가능.
 
-### 2. FPS 계산
+### 2. 처리량·지연·Frame Drop
 
-```python
-# store.py — get_stats()
-# 최근 5초 내 처리된 레코드 수 / 5.0
-recent = [t for t in fps_timestamps if now - t < 5.0]
-fps = len(recent) / 5.0
-```
+`metrics.py`는 객체 수와 별개로 C3 결과 프레임을 집계합니다. detection이 0개여도 한 프레임으로 세고, 최근 5,000개 추적 키 내 중복 결과는 성능 집계에서 제외합니다. FPS는 최근 5초의 수신 프레임 수 / 5입니다. 기존 검사 건수는 객체 단위로 유지합니다.
 
-`_fps_timestamps` 링 버퍼(최대 60건)에 각 레코드의 처리 시각을 저장하고, 최근 5초 윈도우의 처리량으로 FPS를 산출합니다.
+| 대시보드 항목 | 계산 / 출처 |
+|---|---|
+| E2E P50/P95 | C4 결과 수신 시각 − `captured_at_ms` |
+| C3 추론 P50/P95 | `inference_latency_ms` |
+| C3 → C4 P50/P95 | C4 결과 수신 시각 − `inference_finished_at_ms` |
+| C3 이전 전체 P50/P95 | `inference_started_at_ms` − `captured_at_ms` (전송·대기·전처리 포함) |
+| C1 → C2 / C2 → C3 | **미수집**: 현행 C3 결과에 구간별 시각이 없어 분리 계산 불가 |
+| C2 Frame Drop | C2 `/stats`의 `events.dropped_stale + events.dropped_old` |
+| 화면용 이미지 전송 누락 | C2 `/stats`의 `c4_skipped + c4_error` (PR #8 적용 시 제공) |
+
+지연은 최근 200개 결과 프레임의 유효 샘플로 계산합니다. 호스트 간 시각 차이를 계산하므로 시계 동기화가 필요합니다. 음수 지연 및 0인 기준 타임스탬프는 제외하고 샘플이 없으면 `미수집`을 표시합니다. C3→C4는 결과 전송·직렬화 등도 포함하므로 순수 네트워크 지연은 아닙니다.
+
+C4는 별도 백그라운드 작업으로 C2 `/stats`를 조회합니다 (요청 timeout 1초, 조회 후 2초 대기). 프레임 수신 경로에서 기다리지 않습니다. C2 접속 실패 시 카운터를 0으로 표시하지 않고 `미수집`으로 표시합니다. C2 재시작 시 카운터가 초기화됩니다. C2 드롭과 화면용 이미지 누락은 서로 다른 지표이며 C1/C3의 전체 드롭을 뜻하지 않습니다. `frame_id` 간격은 드롭으로 세지 않습니다.
+
+- `C4_C2_STATS_URL`: 기본 `http://c2-preprocessing:8001/stats`; 로컬 실행에서는 접근 가능한 C2 URL로 지정합니다. 빈 문자열이면 C2 조회를 끕니다.
+- 기존 C2 `/stats`도 지원합니다. PR #8 이전에는 C2 드롭만 표시하고 화면용 이미지 누락은 `미수집`으로 표시합니다.
+- C1→C2 및 C2→C3 개별 지연을 수집하려면 담당 서비스와 송·수신 시각 전달 계약을 추가로 합의해야 합니다. 이번 작업은 C4만 수정합니다.
 
 ### 3. BBox / RLE Mask Overlay 렌더링
 
@@ -96,7 +107,7 @@ fps = len(recent) / 5.0
 | 버퍼 | 최대 크기 | 용도 |
 |------|-----------|------|
 | `_records` | 500건 | 검사 이력 (deque, FIFO) |
-| `_fps_timestamps` | 60건 | FPS 산출용 타임스탬프 |
+| `PipelineMetrics.samples` | 200프레임 | 지연 P50/P95 집계 |
 
 컨테이너 재시작 시 데이터는 초기화됩니다 (stateless).
 
@@ -211,7 +222,10 @@ C3 Inference에서 detection 결과를 수신합니다.
 | `pass_count` | int | 양품 수 |
 | `fail_count` | int | 불량 수 |
 | `defect_rate` | float | 불량률 (%) |
-| `fps` | float | 최근 5초 기준 처리 FPS |
+| `fps` | float | 최근 5초 기준 C3 결과 프레임 FPS (객체 수 아님) |
+| `latency` | object | `e2e`, `before_c3`, `inference`, `c3_c4` 각각 `{p50_ms, p95_ms, samples}` |
+| `c2_metrics` | object? | `dropped_stale`, `dropped_old`, `c4_skipped`, `c4_error`; 미연결이면 null, 미제공 필드는 null |
+| `c2_updated_at_ms` | int? | 마지막 C2 조회 성공 시각 (Unix ms) |
 
 ---
 
@@ -319,7 +333,7 @@ defect_score, inference_latency_ms, container_id, timestamp
 }
 ```
 
-#### 2) `stats` — 통계 갱신 시 (연결 직후 + 매 detection 후)
+#### 2) `stats` — 통계 갱신 시 (연결 직후 + 결과 수신 후 + 백그라운드 주기 갱신)
 
 ```json
 {
@@ -512,7 +526,7 @@ docker compose --profile scale-out up --build
 | 영역 | 표시 항목 |
 |------|-----------|
 | **상단 통계 카드 (4개)** | 총 검사, 양품, 불량, 불량률 |
-| **성능 카드 (1개)** | 처리 FPS |
+| **성능 카드** | 프레임 FPS, 지연 P50/P95, C2 드롭, 화면용 이미지 전송 누락 |
 | **카메라 피드** | 원본 이미지 + canvas bbox overlay (pass=녹색, fail=빨간색) |
 | **검사 결과 피드** | 최근 60건 실시간 스크롤 목록 (아이템 ID, 원형도) |
 | **양품률 도넛 차트** | SVG 기반 pass/fail 비율 시각화 |
@@ -646,5 +660,5 @@ C4 Python 의존성이 설치된 환경에서 수신 핸들러/이벤트 테스�
 
 ```bash
 cd services/c4-visualizer
-python -m unittest discover -s tests -p test_relay.py -v
+python -m unittest discover -s tests -p 'test_*.py' -v
 ```

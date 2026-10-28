@@ -1,10 +1,27 @@
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 from src import main
 from src.models import CameraFrame, DetectionResult
+from src.metrics import PipelineMetrics
 
 
 class RelayTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        previous = main.metrics
+        main.metrics = PipelineMetrics()
+        self.addCleanup(setattr, main, 'metrics', previous)
+
+    async def test_poll_c2_failure_hides_stale_counters(self):
+        main.metrics.update_c2({'events': {'dropped_stale': 1, 'dropped_old': 2}})
+        with patch.object(main, 'C2_STATS_URL', 'http://c2/stats'), \
+             patch.object(main.asyncio, 'to_thread', new_callable=AsyncMock, side_effect=OSError), \
+             patch.object(main.asyncio, 'sleep', new_callable=AsyncMock, side_effect=asyncio.CancelledError), \
+             patch.object(main, 'broadcast', new_callable=AsyncMock) as send:
+            with self.assertRaises(asyncio.CancelledError):
+                await main.poll_metrics()
+        self.assertIsNone(send.call_args.args[0]['data']['c2_metrics'])
+
     async def test_camera_preserves_coordinates_and_identity(self):
         frame = CameraFrame(trace_id='t', session_id='s', frame_id=1,
                             width=3, height=2, prompts=[], image_b64='jpeg')

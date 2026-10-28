@@ -3,6 +3,12 @@ C4 Visualizer — 과자 크랙 검사 대시보드 + 모니터링
 Port 8003 | POST /results (C3 → C4) | WS /ws/dashboard | GET / (UI)
 """
 
+import asyncio
+import os
+import time
+from contextlib import asynccontextmanager, suppress
+from urllib.request import urlopen
+
 import json
 import math
 import logging
@@ -13,12 +19,48 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from src.models import CameraFrame, DetectionResult
+from src.metrics import PipelineMetrics
 from src.store import InspectionStore, InspectionRecord
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("c4")
 
-app = FastAPI(title="C4 Visualizer")
+metrics = PipelineMetrics()
+C2_STATS_URL = os.getenv("C4_C2_STATS_URL", "http://c2-preprocessing:8001/stats")
+
+
+def fetch_c2_stats():
+    with urlopen(C2_STATS_URL, timeout=1) as response:
+        return json.load(response)
+
+
+def dashboard_stats():
+    return {**store.get_stats(), **metrics.get_stats()}
+
+
+async def poll_metrics():
+    while True:
+        if C2_STATS_URL:
+            try:
+                metrics.update_c2(await asyncio.to_thread(fetch_c2_stats))
+            except Exception:
+                metrics.c2_available = False
+        await broadcast({"type": "stats", "data": dashboard_stats()})
+        await asyncio.sleep(2)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(poll_metrics())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+app = FastAPI(title="C4 Visualizer", lifespan=lifespan)
 store = InspectionStore(max_records=500)
 ws_clients: list[WebSocket] = []
 
@@ -28,13 +70,14 @@ CIRCULARITY_THRESHOLD = 0.85
 async def broadcast(payload: dict):
     msg = json.dumps(payload)
     dead = []
-    for ws in ws_clients:
+    for ws in list(ws_clients):
         try:
             await ws.send_text(msg)
         except Exception:
             dead.append(ws)
     for ws in dead:
-        ws_clients.remove(ws)
+        if ws in ws_clients:
+            ws_clients.remove(ws)
 
 
 def compute_circularity(area: float, perimeter: float) -> float:
@@ -46,6 +89,7 @@ def compute_circularity(area: float, perimeter: float) -> float:
 @app.post("/results")
 async def receive_result(result: DetectionResult):
     """C3 Inference → C4: detection-result 수신."""
+    metrics.record(result, time.time() * 1000)
     overlays = []
     for det in result.detections:
         bbox = det.bbox
@@ -99,7 +143,7 @@ async def receive_result(result: DetectionResult):
         "trace_id": result.trace_id, "session_id": result.session_id,
         "frame_id": result.frame_id, "detections": overlays,
     }})
-    stats = store.get_stats()
+    stats = dashboard_stats()
     await broadcast({"type": "stats", "data": stats})
 
     return {"status": "ok", "detections_processed": len(result.detections)}
@@ -116,7 +160,7 @@ async def receive_camera_frame(frame: CameraFrame):
 
 @app.get("/api/stats")
 async def get_stats():
-    return store.get_stats()
+    return dashboard_stats()
 
 
 @app.get("/api/inspections")
@@ -150,7 +194,7 @@ async def dashboard_ws(ws: WebSocket):
     await ws.accept()
     ws_clients.append(ws)
     try:
-        await ws.send_text(json.dumps({"type": "stats", "data": store.get_stats()}))
+        await ws.send_text(json.dumps({"type": "stats", "data": dashboard_stats()}))
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:

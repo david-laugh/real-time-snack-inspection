@@ -30,7 +30,6 @@ class InspectionStore:
         self._records: deque[InspectionRecord] = deque(maxlen=max_records)
         self._total = 0
         self._fail_count = 0
-        self._fps_timestamps: deque[float] = deque(maxlen=60)
 
     def add(self, rec: InspectionRecord):
         rec.timestamp = time.time()
@@ -38,7 +37,6 @@ class InspectionStore:
         self._total += 1
         if rec.status == "fail":
             self._fail_count += 1
-        self._fps_timestamps.append(rec.timestamp)
 
     def get_recent(self, limit: int = 50) -> list[dict]:
         out = []
@@ -90,14 +88,9 @@ class InspectionStore:
         pass_count = self._total - self._fail_count
         defect_rate = round(self._fail_count / self._total * 100, 1) if self._total > 0 else 0.0
 
-        now = time.time()
-        recent = [t for t in self._fps_timestamps if now - t < 5.0]
-        fps = len(recent) / 5.0 if recent else 0.0
-
         return {
             "total": self._total,
             "pass_count": pass_count,
             "fail_count": self._fail_count,
             "defect_rate": defect_rate,
-            "fps": round(fps, 1),
         }
