@@ -8,7 +8,7 @@ C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라�
 
 **역할:**
 - Detection 결과 실시간 표시 (WebSocket push)
-- 영상 위에 bbox / 불량 마킹 overlay (canvas 기반)
+- 영상 위에 bbox / RLE mask / 불량 마킹 overlay (canvas 기반)
 - 모니터링: Processed FPS, defect count
 
 ---
@@ -20,7 +20,7 @@ C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라�
 | # | 기존 TODO | 상태 | 구현 내용 |
 |---|-----------|------|-----------|
 | 1 | Dashboard 프레임워크 선정 | **완료** | FastAPI + vanilla JS + WebSocket 실시간 통신 |
-| 2 | Overlay 렌더링 | **완료** | HTML Canvas 기반 bbox overlay (아래 상세) |
+| 2 | Overlay 렌더링 | **완료** | HTML Canvas 기반 bbox + RLE mask overlay (아래 상세) |
 | 3 | 메트릭 집계 및 CSV export | **완료** | `GET /api/export/csv` + 대시보드 다운로드 버튼 |
 | 4 | Docker command를 실제 entrypoint로 교체 | **완료** | `uvicorn src.main:app --host 0.0.0.0 --port 8003` |
 
@@ -37,10 +37,8 @@ C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라�
 
 ## Open Issues (미해결)
 
-1. **카메라 프레임 중계 엔드포인트 미구현** — C1이 `{trace_id, session_id, frame_id, width, height, prompts, image_b64}` 형식으로 프레임을 전송하는 것은 확정. 프론트엔드 핸들러(`updateCamera`)는 구현 완료. 백엔드에 `POST /api/camera/frame` → WebSocket broadcast 엔드포인트 구현 필요.
-2. **C3 replica 결과 순서 문제** — C3가 여러 대일 때 결과가 `frame_id` 순서와 다르게 도착할 수 있음.
-   → `frame_id` 기준 재정렬 또는 late frame drop 정책 필요.
-   > 현재는 순서 무관하게 도착 순으로 처리.
+1. **C2 전송 연동 필요** — C4의 `POST /api/camera/frame` 수신·중계는 구현 완료. C2는 C3에 보내는 것과 같은 리사이즈 이미지와 prompts를 같은 시점에 C4로 비동기 전송합니다. C3 요청 경로에서 C4 응답을 기다리지 않습니다. C2 송신 구현은 C2 담당 범위입니다.
+2. **결과 지연/역순 도착** — 브라우저는 `(session_id, trace_id, frame_id)`로 이미지와 결과를 짝짓고, 최대 30개 프레임을 보관합니다. 짝이 맞는 결과를 표시한 뒤에는 다음 짝이 완성될 때까지 현재 화면을 유지합니다. 이미 선택한 이미지보다 먼저 수신된 이미지의 늦은 결과는 표시하지 않습니다. 버퍼에서 제거된 프레임은 표시하지 못할 수 있습니다.
 
 ---
 
@@ -82,16 +80,14 @@ fps = len(recent) / 5.0
 
 `_fps_timestamps` 링 버퍼(최대 60건)에 각 레코드의 처리 시각을 저장하고, 최근 5초 윈도우의 처리량으로 FPS를 산출합니다.
 
-### 3. BBox Overlay 렌더링
+### 3. BBox / RLE Mask Overlay 렌더링
 
-프론트엔드 `index.html`에서 HTML Canvas로 구현:
-
-- detection 결과가 도착하면 `bboxOverlays` 배열에 push (최대 20개 유지)
-- 카메라 피드 영역 위에 `<canvas>`를 절대 위치로 겹침
-- 각 bbox를 사각형으로 그림 (pass=녹색, fail=빨간색)
-- 상단에 라벨 표시: `{object_id} {상태} {circularity}`
-- 오래된 bbox는 투명도 점진 감소 (fade-out)
-- 카메라 이미지가 있으면 좌표를 이미지 비율에 맞게 스케일링
+- C3의 `mask`를 프레임 단위 `frame_result` WebSocket 이벤트로 전달합니다. 빈 detection 배열도 전달하여 이전 마스크를 지웁니다.
+- `index.html`에서 C2 이미지와 결과를 추적 ID·세션·프레임으로 매칭한 뒤 함께 표시합니다.
+- C3의 RLE는 `{"encoding":"rle","width":576,"height":1024,"data":{"order":"row-major","counts":[...]}}` 형식입니다. counts는 배경(0)부터 시작하여 배경/전경 길이가 번갈아 나오며, 합계는 width × height입니다.
+- 마스크는 pass=녹색, fail=빨간색의 반투명 영역으로 그립니다. bbox와 라벨도 유지합니다.
+- null, 미지원 인코딩, 잘못된 RLE, 이미지와 크기가 다른 마스크는 건너뛰고 bbox만 표시합니다.
+- C2와 C3는 같은 이미지 좌표계를 사용합니다. 화면에 맞추는 확대·축소와 여백만 이미지/bbox/mask에 동일하게 적용합니다.
 
 ### 4. 인메모리 저장소
 
@@ -111,7 +107,7 @@ fps = len(recent) / 5.0
 | 방향 | Endpoint | Payload / 설명 |
 |------|----------|----------------|
 | C3 → C4 | `POST /results` | [`detection-result.schema.json`](../../shared/schemas/detection-result.schema.json) |
-| C1 → C4 | `POST /api/camera/frame` | 카메라 프레임 + prompts 전송 (`image_b64`, `width`, `height`, `prompts`) — 미구현 |
+| C2 → C4 | `POST /api/camera/frame` | 리사이즈 프레임 + prompts 전송 (`trace_id`, `session_id`, `frame_id`, `width`, `height`, `prompts`, `image_b64`) |
 | Browser → C4 | `GET /` | 메인 대시보드 (port 8003) |
 | Browser → C4 | `GET /viewer` | 불량 확인 뷰어 |
 | Browser → C4 | `WS /ws/dashboard` | 실시간 WebSocket |
@@ -172,7 +168,7 @@ C3 Inference에서 detection 결과를 수신합니다.
 | `detections[].status` | string | O | `normal` / `defect` / `unknown` |
 | `detections[].defect_type` | string? | - | 불량 유형 (`crack`, `broken` 등), null 가능 |
 | `detections[].defect_score` | float | - | 불량 신뢰도 `[0, 1]` (기본 0.0) |
-| `detections[].mask` | object? | - | 세그멘테이션 마스크 (현재 미사용, null 가능) |
+| `detections[].mask` | object? | - | 세그멘테이션 마스크 (RLE 렌더링 지원, null 가능) |
 
 **Response** `200 OK`:
 
@@ -334,9 +330,11 @@ defect_score, inference_latency_ms, container_id, timestamp
 
 #### 3) `camera_frame` — 카메라 프레임 수신 시
 
-C1 Gateway가 전송하는 원본 프레임 데이터를 WebSocket으로 브라우저에 중계합니다.
+C2 Preprocessing이 C3에 보내는 것과 동일한 리사이즈 프레임 데이터를 WebSocket으로 브라우저에 중계합니다.
 
-**C1 → C4 전송 포맷 (원본):**
+**C2 → C4 전송 포맷 (`POST /api/camera/frame`):**
+
+응답: `200 OK`, `{"status":"ok"}`. C2는 C3 요청과 같은 시점에 별도 비동기 전송하며, 응답 대기로 추론 경로를 지연시키지 않습니다.
 
 ```json
 {
@@ -358,8 +356,8 @@ C1 Gateway가 전송하는 원본 프레임 데이터를 WebSocket으로 브라�
 | `trace_id` | string | O | 파이프라인 추적 ID (C1에서 발급) |
 | `session_id` | string | O | 세션 ID (예: `m-ab12cd`) |
 | `frame_id` | int | O | 프레임 번호 (순차 증가, C1이 부여) |
-| `width` | int | O | 원본 이미지 너비 (px) |
-| `height` | int | O | 원본 이미지 높이 (px) |
+| `width` | int | O | C2 리사이즈 이미지 너비 (px) |
+| `height` | int | O | C2 리사이즈 이미지 높이 (px) |
 | `prompts` | array | O | SAM2 프롬프트 목록 — 객체 후보별 bbox |
 | `prompts[].candidate_id` | string | O | 후보 객체 ID (예: `c0`, `c1`) |
 | `prompts[].type` | string | O | 프롬프트 유형 (`box`) |
@@ -372,6 +370,8 @@ C1 Gateway가 전송하는 원본 프레임 데이터를 WebSocket으로 브라�
 {
   "type": "camera_frame",
   "data": {
+    "trace_id": "trace-abc-123",
+    "session_id": "m-ab12cd",
     "frame_id": 297,
     "width": 576,
     "height": 1024,
@@ -390,46 +390,40 @@ C1 Gateway가 전송하는 원본 프레임 데이터를 WebSocket으로 브라�
 | `width` | int | 이미지 너비 (px) |
 | `height` | int | 이미지 높이 (px) |
 | `frame` | string | JPEG base64 문자열 — `data:image/jpeg;base64,` 접두사 포함/미포함 모두 허용 (프론트엔드에서 자동 보정) |
-| `prompts` | array | 객체 후보 bbox 목록 (C1이 보낸 원본 그대로 전달) |
+| `prompts` | array | 객체 후보 bbox 목록 (C2가 만든 후보 목록 그대로 전달) |
 
-**프론트엔드 처리 흐름 (`index.html` — `updateCamera()`):**
+**프론트엔드 처리 흐름:**
 
-```
-camera_frame 수신
-  ├── placeholder 숨김 ("C3 Inference 결과 대기 중" → 이미지)
-  ├── <img> 엘리먼트 생성/갱신
-  │   └── img.src = "data:image/jpeg;base64," + frame (접두사 자동 보정)
-  ├── img.onload → drawBboxOverlays() 호출
-  │   └── width/height로 bbox 좌표 스케일링
-  └── 카메라 상태 배지 → "수신 중"
-```
+`camera_frame`과 `frame_result`를 최대 30개 버퍼에서 매칭 → 이미지 디코딩 → 동일 프레임의 이미지/bbox/mask를 함께 갱신합니다. 결과가 먼저 도착해도 매칭할 수 있습니다. 매칭 전에는 첫 카메라 이미지만 미리 표시합니다.
 
-**BBox Overlay와 카메라 이미지 연동:**
+#### 4) `frame_result` — 프레임의 모든 detection 처리 후
 
-카메라 이미지가 있으면 bbox 좌표를 이미지 비율에 맞게 스케일링합니다:
-
-```
-이미지 aspect ratio vs 캔버스 aspect ratio 비교
-  ├── 이미지가 더 넓으면 → 캔버스 width 기준 스케일
-  └── 이미지가 더 높으면 → 캔버스 height 기준 스케일
-
-scaleX = drawWidth / naturalWidth
-scaleY = drawHeight / naturalHeight
-offsetX = (canvasWidth - drawWidth) / 2
-offsetY = (canvasHeight - drawHeight) / 2
-
-변환: screenX = bboxX × scaleX + offsetX
+```json
+{
+  "type": "frame_result",
+  "data": {
+    "trace_id": "trace-abc-123",
+    "session_id": "m-ab12cd",
+    "frame_id": 297,
+    "detections": [
+      {
+        "item_id": "c0", "bbox": [429, 591, 525, 681],
+        "status": "fail", "circularity": 0.78,
+        "mask": {"encoding": "rle", "width": 576, "height": 1024,
+                 "data": {"order": "row-major", "counts": [589824]}}
+      }
+    ]
+  }
+}
 ```
 
-이미지가 없으면 `width`×`height` 기준 좌표계로 fallback, 둘 다 없으면 1024×1024.
-
-**현재 구현 상태:**
+위 counts는 형식을 설명하기 위한 빈 마스크 예시입니다. `inspection_result`는 기존 검사 피드용으로 유지하며 `trace_id`, `session_id`도 전달합니다. 마스크는 중복 전송하지 않고 `frame_result`에 포함합니다.
 
 | 구성요소 | 상태 | 설명 |
 |----------|------|------|
-| 프론트엔드 핸들러 (`updateCamera`) | **구현 완료** | base64 이미지 표시, bbox 스케일링 포함 |
-| 백엔드 중계 (`main.py`) | **미구현** | C1 프레임 수신 → WebSocket broadcast 엔드포인트 필요 |
-| C1 → C4 전송 경로 | **확정** | C1이 `POST /api/camera/frame`으로 프레임 + prompts 전송 |
+| 프론트엔드 | **구현 완료** | 이미지/결과 매칭, RLE 마스크 + bbox 렌더링 |
+| 백엔드 중계 (`main.py`) | **구현 완료** | C2 프레임 수신 → WebSocket broadcast |
+| C2 → C4 송신 | **C2 담당** | 동일 리사이즈 이미지와 prompts를 비동기 전송 |
 
 ---
 
@@ -638,3 +632,19 @@ uvicorn src.main:app --host 0.0.0.0 --port 8003 --reload
 | port 8003 already in use | 다른 프로세스가 포트 사용 중 | `.env`에서 `C4_PORT=8004` 등으로 변경 |
 | CSV 다운로드가 빈 파일 | 아직 detection 결과가 없음 | curl로 테스트 데이터를 먼저 전송 |
 | bbox overlay가 안 보임 | 카메라 이미지 없이 좌표만 수신 | Open Issue #1 — 프레임 수신 경로 구현 후 표시 |
+
+
+## C4 회귀 테스트
+
+프로젝트 루트에서 프론트엔드 RLE/프레임 매칭 테스트:
+
+```bash
+node --test services/c4-visualizer/tests/test_dashboard.cjs
+```
+
+C4 Python 의존성이 설치된 환경에서 수신 핸들러/이벤트 테스트:
+
+```bash
+cd services/c4-visualizer
+python -m unittest discover -s tests -p test_relay.py -v
+```

@@ -3,7 +3,17 @@ detection-result 스키마에 대응하는 Pydantic 모델.
 shared/schemas/detection-result.schema.json 기준.
 """
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class CameraFrame(BaseModel):
+    trace_id: str
+    session_id: str
+    frame_id: int
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    prompts: list[dict]
+    image_b64: str = Field(min_length=1)
 
 
 class Detection(BaseModel):

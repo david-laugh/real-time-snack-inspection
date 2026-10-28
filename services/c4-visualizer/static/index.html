@@ -86,7 +86,7 @@ header h1 span { color: var(--accent); }
   flex: 1; display: flex; align-items: center; justify-content: center;
   background: #000; min-height: 340px; position: relative;
 }
-.camera-feed img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.camera-feed img { position: absolute; width: 100%; height: 100%; object-fit: contain; }
 .cam-placeholder { color: var(--text2); text-align: center; font-size: 13px; }
 .cam-placeholder .icon { font-size: 40px; margin-bottom: 10px; opacity: .3; }
 .det-overlay {
@@ -99,7 +99,7 @@ header h1 span { color: var(--accent); }
 
 .bbox-canvas {
   position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-  pointer-events: none;
+  pointer-events: none; z-index: 1;
 }
 
 .feed-panel {
@@ -265,7 +265,12 @@ let items = [];
 const BINS = 20;
 let circHist = new Array(BINS).fill(0);
 let bboxOverlays = [];
-const MAX_BBOXES = 20;
+const pendingFrames = new Map();
+const MAX_PENDING_FRAMES = 30;
+let arrivalSequence = 0;
+let selectedSequence = -1;
+let displayGeneration = 0;
+let currentFrame = null;
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -277,6 +282,7 @@ function connect() {
     if (msg.type === 'stats') updateStats(msg.data);
     else if (msg.type === 'inspection_result') addResult(msg.data);
     else if (msg.type === 'camera_frame') updateCamera(msg.data);
+    else if (msg.type === 'frame_result') updateFrameResult(msg.data);
   };
 }
 
@@ -311,18 +317,7 @@ function addResult(d) {
   circHist[bin]++;
   renderCircChart();
 
-  if (d.bbox) {
-    bboxOverlays.unshift({ bbox: d.bbox, status: d.status, item_id: d.item_id, circularity: d.circularity });
-    if (bboxOverlays.length > MAX_BBOXES) bboxOverlays.pop();
-    drawBboxOverlays();
-  }
 
-  const feed = id('camFeed');
-  let ov = feed.querySelector('.det-overlay');
-  if (!ov) { ov = document.createElement('div'); feed.appendChild(ov); }
-  const ok = d.status === 'pass';
-  ov.className = 'det-overlay ' + (ok ? 'pass' : 'fail');
-  ov.textContent = (ok ? '정상 ' : '불량 ') + d.circularity.toFixed(2);
 }
 
 function renderFeed() {
@@ -363,31 +358,20 @@ function drawBboxOverlays() {
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  if (bboxOverlays.length === 0) return;
+  if (!currentFrame || bboxOverlays.length === 0) return;
 
-  const img = feed.querySelector('img');
-  let scaleX = 1, scaleY = 1, offX = 0, offY = 0;
-  if (img && img.naturalWidth) {
-    const imgAspect = img.naturalWidth / img.naturalHeight;
-    const canAspect = canvas.width / canvas.height;
-    let drawW, drawH;
-    if (imgAspect > canAspect) {
-      drawW = canvas.width; drawH = canvas.width / imgAspect;
-    } else {
-      drawH = canvas.height; drawW = canvas.height * imgAspect;
-    }
-    scaleX = drawW / img.naturalWidth;
-    scaleY = drawH / img.naturalHeight;
-    offX = (canvas.width - drawW) / 2;
-    offY = (canvas.height - drawH) / 2;
-  } else {
-    scaleX = canvas.width / 1024;
-    scaleY = canvas.height / 1024;
-  }
+  const scale = Math.min(canvas.width / currentFrame.width, canvas.height / currentFrame.height);
+  const scaleX = scale, scaleY = scale;
+  const offX = (canvas.width - currentFrame.width * scale) / 2;
+  const offY = (canvas.height - currentFrame.height * scale) / 2;
 
-  bboxOverlays.forEach((b, i) => {
-    const alpha = Math.max(0.2, 1 - i * 0.1);
+  bboxOverlays.forEach(b => {
+    const alpha = 1;
     const color = b.status === 'pass' ? '0,184,148' : '225,112,85';
+    if (b.maskCanvas) {
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(b.maskCanvas, offX, offY, currentFrame.width * scale, currentFrame.height * scale);
+    }
     const x1 = b.bbox[0] * scaleX + offX;
     const y1 = b.bbox[1] * scaleY + offY;
     const x2 = b.bbox[2] * scaleX + offX;
@@ -400,7 +384,7 @@ function drawBboxOverlays() {
     ctx.strokeRect(x1, y1, w, h);
 
     ctx.fillStyle = `rgba(${color},${alpha * 0.15})`;
-    ctx.fillRect(x1, y1, w, h);
+    if (!b.maskCanvas) ctx.fillRect(x1, y1, w, h);
 
     const label = `${b.item_id} ${b.status === 'pass' ? '정상' : '불량'} ${b.circularity.toFixed(2)}`;
     ctx.font = '11px Segoe UI, system-ui, sans-serif';
@@ -412,17 +396,97 @@ function drawBboxOverlays() {
   });
 }
 
-function updateCamera(d) {
-  const feed = id('camFeed');
-  const ph = id('camPlaceholder');
-  if (ph) ph.style.display = 'none';
-  let img = feed.querySelector('img');
-  if (!img) { img = document.createElement('img'); feed.appendChild(img); }
-  if (d.frame) img.src = d.frame.startsWith('data:') ? d.frame : 'data:image/jpeg;base64,' + d.frame;
-  else if (d.image_url) img.src = d.image_url;
-  img.onload = () => drawBboxOverlays();
-  id('camStatus').textContent = '수신 중';
+// C3 encodes alternating background/foreground runs in row-major order.
+function decodeMask(mask, width, height, status) {
+  if (!mask || mask.encoding !== 'rle' || mask.width !== width || mask.height !== height) return null;
+  const counts = mask.data?.counts;
+  if (mask.data?.order !== 'row-major' || !Array.isArray(counts)) return null;
+  const pixels = width * height;
+  if (!Number.isSafeInteger(pixels) || pixels <= 0 || pixels > 16777216) return null;
+  let total = 0;
+  for (const count of counts) {
+    if (!Number.isSafeInteger(count) || count < 0 || count > pixels - total) return null;
+    total += count;
+  }
+  if (total !== pixels) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  const rgba = ctx.createImageData(width, height);
+  const color = status === 'pass' ? [0, 184, 148] : [225, 112, 85];
+  let offset = 0;
+  counts.forEach((count, run) => {
+    const end = offset + count;
+    if (run % 2 === 1) {
+      for (let pixel = offset; pixel < end; pixel++) {
+        const i = pixel * 4;
+        rgba.data[i] = color[0];
+        rgba.data[i + 1] = color[1];
+        rgba.data[i + 2] = color[2];
+        rgba.data[i + 3] = 96;
+      }
+    }
+    offset = end;
+  });
+  ctx.putImageData(rgba, 0, 0);
+  return canvas;
 }
+
+function frameEntry(d) {
+  if (!d.trace_id || !d.session_id || !Number.isInteger(d.frame_id)) return null;
+  const key = JSON.stringify([d.session_id, d.trace_id, d.frame_id]);
+  if (!pendingFrames.has(key)) pendingFrames.set(key, {});
+  while (pendingFrames.size > MAX_PENDING_FRAMES) pendingFrames.delete(pendingFrames.keys().next().value);
+  return pendingFrames.get(key);
+}
+
+function presentFrame(entry) {
+  if (!entry.image) return;
+  const matched = Array.isArray(entry.detections);
+  if (matched && entry.sequence < selectedSequence) return;
+  if (!matched && (currentFrame || selectedSequence >= 0)) return;
+  if (matched) selectedSequence = entry.sequence;
+  const generation = ++displayGeneration;
+  const img = new Image();
+  img.onload = () => {
+    if (generation !== displayGeneration) return;
+    const d = entry.image;
+    // Reject a broken coordinate contract instead of stretching a mask onto it.
+    if (img.naturalWidth !== d.width || img.naturalHeight !== d.height) return;
+    const feed = id('camFeed');
+    const previous = feed.querySelector('img');
+    if (previous) previous.remove();
+    feed.appendChild(img);
+    id('camPlaceholder').style.display = 'none';
+    currentFrame = d;
+    bboxOverlays = (entry.detections || []).map(b => ({
+      ...b, maskCanvas: decodeMask(b.mask, d.width, d.height, b.status),
+    }));
+    drawBboxOverlays();
+    id('camStatus').textContent = matched ? `프레임 ${d.frame_id} · 결과 수신` : '이미지 수신 · 결과 대기';
+  };
+  const frame = entry.image.frame;
+  img.src = frame.startsWith('data:') ? frame : 'data:image/jpeg;base64,' + frame;
+}
+
+function updateCamera(d) {
+  if (!d.frame || !Number.isInteger(d.width) || !Number.isInteger(d.height) || d.width <= 0 || d.height <= 0) return;
+  const entry = frameEntry(d);
+  if (!entry) return;
+  entry.image = d;
+  entry.sequence = ++arrivalSequence;
+  presentFrame(entry);
+}
+
+function updateFrameResult(d) {
+  const entry = frameEntry(d);
+  if (!entry) return;
+  entry.detections = d.detections;
+  presentFrame(entry);
+}
+
+new ResizeObserver(drawBboxOverlays).observe(id('camFeed'));
 
 async function loadInitial() {
   try {

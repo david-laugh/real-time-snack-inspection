@@ -12,7 +12,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from src.models import DetectionResult
+from src.models import CameraFrame, DetectionResult
 from src.store import InspectionStore, InspectionRecord
 
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +46,7 @@ def compute_circularity(area: float, perimeter: float) -> float:
 @app.post("/results")
 async def receive_result(result: DetectionResult):
     """C3 Inference → C4: detection-result 수신."""
+    overlays = []
     for det in result.detections:
         bbox = det.bbox
         w = abs(bbox[2] - bbox[0])
@@ -69,11 +70,17 @@ async def receive_result(result: DetectionResult):
             container_id=result.inference_container_id,
         )
         store.add(rec)
+        overlays.append({
+            "item_id": det.object_id, "bbox": det.bbox, "mask": det.mask,
+            "status": status, "circularity": round(circ, 4),
+        })
 
         await broadcast({
             "type": "inspection_result",
             "data": {
                 "item_id": det.object_id,
+                "trace_id": result.trace_id,
+                "session_id": result.session_id,
                 "status": status,
                 "circularity": round(circ, 4),
                 "area": round(area, 1),
@@ -87,10 +94,24 @@ async def receive_result(result: DetectionResult):
             },
         })
 
+    # Send one complete frame, including empty detections, for atomic overlays.
+    await broadcast({"type": "frame_result", "data": {
+        "trace_id": result.trace_id, "session_id": result.session_id,
+        "frame_id": result.frame_id, "detections": overlays,
+    }})
     stats = store.get_stats()
     await broadcast({"type": "stats", "data": stats})
 
     return {"status": "ok", "detections_processed": len(result.detections)}
+
+
+@app.post("/api/camera/frame")
+async def receive_camera_frame(frame: CameraFrame):
+    """C2 → C4: relay the same resized image and prompts sent to C3."""
+    data = frame.model_dump()
+    data["frame"] = data.pop("image_b64")
+    await broadcast({"type": "camera_frame", "data": data})
+    return {"status": "ok"}
 
 
 @app.get("/api/stats")
