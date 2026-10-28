@@ -21,10 +21,10 @@
 - [x] 불량 확인 뷰어 (`/viewer`) — 테이블 + 상세 패널
 - [x] 원형도(Circularity) 기반 양품/불량 판정
 - [x] WebSocket 브로드캐스트 (`/ws/dashboard`)
-- [ ] Overlay 렌더링 — 영상 위에 mask/bbox/불량 마킹 (현재는 pass/fail 배지만 표시)
-- [ ] 구간별 Latency 모니터링 (C1/C2/C3 개별) — 현재 E2E만 표시
-- [ ] frame drop 감지 및 모니터링
-- [ ] 메트릭 집계 및 `benchmark/results/`로 CSV export
+- [x] Overlay 렌더링 — canvas 기반 bbox overlay (pass/fail 색상 구분, 라벨 표시, fade-out)
+- [x] 구간별 Latency 모니터링 — E2E / Inference(C3) / Network 각각 P50·P95 표시
+- [x] frame drop 감지 및 모니터링 — `frame_id` 갭 감지, 대시보드 카드 + 서버 로그
+- [x] 메트릭 집계 및 CSV export — `GET /api/export/csv` 엔드포인트 + 대시보드 다운로드 버튼
 
 ## Open Issues
 
@@ -46,6 +46,7 @@
 | Browser → C4 | `GET /api/stats` | 통계 JSON |
 | Browser → C4 | `GET /api/inspections` | 검사 이력 |
 | Browser → C4 | `GET /api/defects` | 불량 목록 |
+| Browser → C4 | `GET /api/export/csv` | 검사 결과 CSV 다운로드 |
 | — | `GET /healthz` | 헬스체크 |
 
 ## 아키텍처
@@ -135,6 +136,7 @@ docker compose --profile scale-out up --build
 | `GET` | `/api/stats` | 현재 통계 (총 검사, 양품/불량, 불량률, FPS, latency) |
 | `GET` | `/api/inspections?limit=50` | 최근 검사 결과 목록 |
 | `GET` | `/api/defects?limit=50` | 불량 항목만 필터링 |
+| `GET` | `/api/export/csv` | 검사 결과 CSV 다운로드 |
 | `GET` | `/healthz` | 헬스체크 (`{"status": "healthy"}`) |
 | `WS` | `/ws/dashboard` | 실시간 WebSocket (inspection_result, stats, camera_frame 이벤트) |
 
