@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pocket-smart-factory/schemas/processed-frame.schema.json",
+  "title": "ProcessedFrame",
+  "description": "C2 Preprocessing -> Nginx (/infer) -> C3 SAM2 Inference. Preprocessed frame with SAM2 prompts for snack candidates.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "trace_id",
+    "session_id",
+    "frame_id",
+    "captured_at_ms",
+    "preprocess_started_at_ms",
+    "preprocess_finished_at_ms",
+    "width",
+    "height",
+    "prompts"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "examples": ["1.0.0"]
+    },
+    "trace_id": {
+      "type": "string",
+      "description": "Propagated unchanged from FrameEnvelope."
+    },
+    "session_id": {
+      "type": "string",
+      "description": "Propagated unchanged from FrameEnvelope."
+    },
+    "frame_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Propagated unchanged from FrameEnvelope."
+    },
+    "captured_at_ms": {
+      "type": "integer",
+      "description": "Propagated unchanged from FrameEnvelope."
+    },
+    "preprocess_started_at_ms": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when C2 started preprocessing."
+    },
+    "preprocess_finished_at_ms": {
+      "type": "integer",
+      "description": "Unix epoch milliseconds when C2 finished preprocessing."
+    },
+    "width": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Width of the preprocessed image in pixels."
+    },
+    "height": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Height of the preprocessed image in pixels."
+    },
+    "prompts": {
+      "type": "array",
+      "description": "SAM2 prompts, one per snack candidate. May be empty.",
+      "items": { "$ref": "#/$defs/prompt" }
+    },
+    "image_b64": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "description": "TODO: preprocessed image transport is not decided (same decision as FrameEnvelope.image_b64)."
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "bbox": {
+      "type": "array",
+      "description": "[x1, y1, x2, y2] in pixel coordinates of the preprocessed image (width x height).",
+      "items": { "type": "number" },
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "prompt": {
+      "type": "object",
+      "required": ["candidate_id", "type", "bbox"],
+      "properties": {
+        "candidate_id": {
+          "type": "string",
+          "description": "Candidate id assigned by C2, unique within the frame."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["box"],
+          "description": "SAM2 prompt type. TODO: add 'point' if point prompts are needed."
+        },
+        "bbox": { "$ref": "#/$defs/bbox" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

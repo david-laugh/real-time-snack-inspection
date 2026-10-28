@@ -1,8 +1,10 @@
-# C2 Preprocessing dependencies
-# TODO(Member B): uncomment and pin versions when implementation starts.
-# fastapi
-# uvicorn[standard]
-# opencv-python-headless
-# numpy
-# httpx
-# pydantic
+# C2 Preprocessing runtime dependencies (Python 3.11)
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+# headless build: no libGL / GUI system libraries needed in the slim image
+opencv-python-headless==4.10.0.84
+numpy==2.2.1
+httpx==0.28.1
+pydantic==2.10.4
+pydantic-settings==2.7.1
+jsonschema==4.23.0
