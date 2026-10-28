@@ -1,4 +1,5 @@
 import base64
+import csv
 import json
 
 import cv2
@@ -94,6 +95,34 @@ def test_session_diameter_is_smoothed_across_frames():
         assert r.status_code == 200
         tracker = c.app.state.diameter_tracker
         assert tracker.update("sess-test", None) is not None   # 이전 값을 유지
+
+
+def test_empty_frame_is_not_forwarded(tmp_path):
+    """prompts 0개 프레임은 /infer로 보내지 않고 skipped_empty로 기록한다 (기본 C2_SKIP_EMPTY=true)."""
+    img, _ = load_fixture()
+    blank = np.full_like(img, 40)
+    log_path = tmp_path / "c2_events.csv"
+    fake = FakeInfer()
+    with _client(fake, event_log=str(log_path)) as c:
+        r = c.post("/preprocess", json=make_envelope(blank, frame_id=1))
+        assert r.status_code == 200, r.text
+        assert r.json()["num_prompts"] == 0 and r.json()["infer_status"] is None
+        assert not fake.requests
+        assert c.post("/preprocess", json=make_envelope(img, frame_id=2)).status_code == 200
+        assert len(fake.requests) == 1                   # 쿠키가 있는 프레임은 그대로 전달
+        stats = c.get("/stats").json()
+    assert stats["events"]["skipped_empty"] == 1 and stats["events"]["forwarded"] == 1
+    assert stats["skip_empty"] is True
+    rows = list(csv.DictReader(log_path.open(encoding="utf-8")))
+    assert [(r["trace_id"], r["event"]) for r in rows] == [("trace-000001", "skipped_empty"),
+                                                          ("trace-000002", "forwarded")]
+    assert rows[0]["preprocess_ms"] != "" and rows[0]["infer_rtt_ms"] == ""
+
+
+def test_skip_empty_setting_from_env(monkeypatch):
+    assert Settings().skip_empty is True
+    monkeypatch.setenv("C2_SKIP_EMPTY", "false")
+    assert Settings().skip_empty is False
 
 
 def test_invalid_envelope_rejected():

@@ -4,10 +4,13 @@
   MQTT  : C2_MQTT_TOPIC(psf/v1/frames/+) 구독. 페이로드는 frame-envelope JSON. 운영 경로.
   HTTP  : POST /preprocess (같은 frame-envelope JSON). 테스트·디버깅용.
 두 입력 모두 handle_frame() 하나로 처리한다: 전처리(스레드풀) -> processed-frame을 Nginx /infer로 전달 -> 이벤트 기록.
+prompts가 0개면 /infer로 보내지 않고 skipped_empty로 기록한다(C2_SKIP_EMPTY, 기본 true).
 C4 전송(C2_C4_FRAME_URL)을 켜면 같은 프레임(리사이즈 이미지 + prompts)을 C3 전송과 동시에 C4로도 보낸다 (c4_frames.py).
+skipped_empty 프레임도 C4로는 보낸다.
 
 GET /healthz : 상태 + MQTT 연결 상태
-GET /stats   : 이벤트 누적 수, MQTT 수신 수, 처리 중/대기 프레임 수, C4 전송 수(c4_sent/c4_skipped/c4_error)
+GET /stats   : 이벤트 누적 수(skipped_empty 포함), MQTT 수신 수, 처리 중/대기 프레임 수, skip_empty 설정,
+               C4 전송 수(c4_sent/c4_skipped/c4_error)
 """
 import asyncio
 import json
@@ -135,8 +138,18 @@ async def handle_frame(app: FastAPI, envelope: dict, source: str) -> dict:
     log.debug("trace_id=%s frame_id=%s prompts=%d diameter=%s scale=%.3f roi=%s", msg["trace_id"],
               msg["frame_id"], len(det.boxes), det.diameter_px, det.scale, det.roi)
 
-    if st.c4 is not None:       # C3로 보내는 프레임만, C3 전송과 동시에 (기다리지 않음, prompts 0개여도 보냄)
+    if st.c4 is not None:       # 전처리를 마친 프레임은 모두, C3 전송과 동시에 (기다리지 않음, prompts 0개여도 보냄)
         st.c4.submit(msg, envelope, source)
+
+    if st.settings.skip_empty and not msg["prompts"]:     # C3가 할 일이 없으므로 /infer로 보내지 않는다
+        st.events.write(envelope, "skipped_empty", source, preprocess_ms=preprocess_ms)
+        return {
+            "trace_id": msg["trace_id"],
+            "frame_id": msg["frame_id"],
+            "num_prompts": 0,
+            "preprocess_ms": preprocess_ms,
+            "infer_status": None,
+        }
 
     t0 = time.perf_counter()
     try:
@@ -233,6 +246,7 @@ def create_app(settings: Optional[Settings] = None,
             "inflight": app.state.inflight,
             "max_inflight": settings.max_inflight,
             "pending_sessions": len(app.state.slots) if app.state.slots else 0,
+            "skip_empty": settings.skip_empty,
             "c4_enabled": app.state.c4 is not None,
             **(app.state.c4.stats() if app.state.c4 is not None
                else {"c4_sent": 0, "c4_skipped": 0, "c4_error": 0, "c4_inflight": 0}),

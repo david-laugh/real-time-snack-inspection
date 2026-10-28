@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     mqtt_reconnect_min_s: float = 1.0
     mqtt_reconnect_max_s: float = 10.0
 
+    # prompts가 0개인 프레임은 /infer로 보내지 않고 C4로만 보낸다(skipped_empty). false면 0개여도 /infer로 보낸다.
+    skip_empty: bool = True
+
     # 동시에 처리·전달하는 프레임 수(워커 수). C3 복제본 수 이상 권장.
     max_inflight: int = 4
     # captured_at_ms 기준으로 이보다 오래된 프레임은 버린다. 0이면 끔.
