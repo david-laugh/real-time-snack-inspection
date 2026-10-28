@@ -5,7 +5,8 @@ C3 없이 C1 -> C2 통합 테스트를 할 때 C2_INFER_URL을 이 서버로 돌
 추론은 하지 않으며 detection-result도 C4로 보내지 않는다.
 
   python dev/fake_infer.py --port 8080 [--delay-ms 0]
-  GET /stats  : 받은 프레임 수, 스키마 위반 수, 세션별 마지막 frame_id
+  GET /stats  : 받은 프레임 수, 스키마 위반 수, 세션별 마지막 frame_id,
+               도착 시점 프레임 나이(now - captured_at_ms) 최근 값·최대값
 """
 import argparse
 import asyncio
@@ -13,7 +14,7 @@ import logging
 import os
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -30,6 +31,7 @@ def create_app(delay_ms: float = 0.0) -> FastAPI:
     app = FastAPI(title="fake /infer")
     stats = Counter()
     last_frame = {}
+    ages = deque(maxlen=200)          # (frame_id, 도착 시점 나이 ms)
 
     @app.get("/healthz")
     async def healthz():
@@ -37,7 +39,9 @@ def create_app(delay_ms: float = 0.0) -> FastAPI:
 
     @app.get("/stats")
     async def get_stats():
-        return {**stats, "last_frame_id": last_frame}
+        recent = [a for _, a in ages]
+        return {**stats, "last_frame_id": last_frame,
+                "age_ms": {"max": max(recent, default=None), "recent": list(ages)[-20:]}}
 
     @app.post("/infer")
     async def infer(request: Request):
@@ -56,6 +60,7 @@ def create_app(delay_ms: float = 0.0) -> FastAPI:
 
         stats["received"] += 1
         last_frame[msg["session_id"]] = msg["frame_id"]
+        ages.append((msg["frame_id"], received - msg["captured_at_ms"]))
         hdr = request.headers
         header_ok = (hdr.get("x-trace-id") == msg["trace_id"] and hdr.get("x-frame-id") == str(msg["frame_id"])
                      and hdr.get("x-session-id") == msg["session_id"])
