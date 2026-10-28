@@ -128,8 +128,6 @@ tr.selected td { background: rgba(108,92,231,.1); }
           <th>Object ID</th>
           <th>상태</th>
           <th>원형도</th>
-          <th>면적</th>
-          <th>둘레</th>
           <th>Defect Score</th>
         </tr>
       </thead>
@@ -182,8 +180,6 @@ function render() {
       <td>${d.item_id}</td>
       <td><span class="status-badge ${ok ? 'sb-pass' : 'sb-fail'}">${ok ? '정상' : '불량'}</span></td>
       <td><span class="circ-val ${d.circularity >= 0.85 ? 'high' : 'low'}">${circ}</span></td>
-      <td>${d.area != null ? Math.round(d.area).toLocaleString() : '-'}</td>
-      <td>${d.perimeter != null ? Math.round(d.perimeter).toLocaleString() : '-'}</td>
       <td>${d.defect_score != null ? (d.defect_score * 100).toFixed(1) + '%' : '-'}</td>
     </tr>`;
   }).join('');
@@ -222,24 +218,6 @@ function showDetail(idx) {
         <div class="gauge-marker" style="left:85%;"></div>
       </div>
       <div class="gauge-labels"><span>0.0</span><span style="color:var(--fail);">← 0.85 기준</span><span>1.0</span></div>
-    </div>
-
-    <div style="font-size:12px; color:var(--text2); margin-bottom:8px;">분석 데이터</div>
-    <div class="detail-grid">
-      <div class="detail-field">
-        <div class="fl">면적 (Area)</div>
-        <div class="fv">${d.area != null ? Math.round(d.area).toLocaleString() + ' px²' : '-'}</div>
-      </div>
-      <div class="detail-field">
-        <div class="fl">둘레 (Perimeter)</div>
-        <div class="fv">${d.perimeter != null ? Math.round(d.perimeter).toLocaleString() + ' px' : '-'}</div>
-      </div>
-      <div class="detail-field wide">
-        <div class="fl">판정 공식</div>
-        <div class="fv" style="font-size:12px; font-weight:400; font-family:Consolas,monospace;">
-          4&pi; &times; ${d.area != null ? Math.round(d.area) : '?'} / ${d.perimeter != null ? Math.round(d.perimeter) : '?'}&sup2; = <strong style="color:${fillColor};">${circ.toFixed(3)}</strong>
-        </div>
-      </div>
     </div>
 
     <div style="font-size:12px; color:var(--text2); margin: 16px 0 8px;">파이프라인 정보</div>
