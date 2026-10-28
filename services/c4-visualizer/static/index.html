@@ -63,7 +63,7 @@ header h1 span { color: var(--accent); }
 
 .perf-row {
   grid-column: 1 / -1;
-  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+  display: grid; grid-template-columns: 1fr; gap: 12px;
 }
 .perf-card {
   background: var(--surface); border-radius: var(--radius);
@@ -198,16 +198,6 @@ header h1 span { color: var(--accent); }
       <div class="value" id="pFps">0</div>
       <div class="unit">frames/sec</div>
     </div>
-    <div class="perf-card">
-      <div class="label">Latency P50</div>
-      <div class="value" id="pP50">0</div>
-      <div class="unit">ms (E2E)</div>
-    </div>
-    <div class="perf-card">
-      <div class="label">Latency P95</div>
-      <div class="value" id="pP95">0</div>
-      <div class="unit">ms (E2E)</div>
-    </div>
   </div>
 
   <div class="camera-panel">
@@ -301,10 +291,7 @@ function updateStats(s) {
   el.textContent = r + '%';
   el.className = 'value ' + (r <= 3 ? 'pass' : 'fail');
 
-  // performance metrics
   id('pFps').textContent = s.fps || '0';
-  id('pP50').textContent = s.latency_p50_ms || '0';
-  id('pP95').textContent = s.latency_p95_ms || '0';
 
   const passRate = s.total > 0 ? (s.pass_count / s.total) : 1;
   const C = 327;

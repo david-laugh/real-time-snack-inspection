@@ -9,8 +9,7 @@ C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라�
 **역할:**
 - Detection 결과 실시간 표시 (WebSocket push)
 - 영상 위에 bbox / 불량 마킹 overlay (canvas 기반)
-- 모니터링: Processed FPS, E2E latency (P50/P95), defect count
-- End-to-End latency 계산 지점 (`now - captured_at_ms`)
+- 모니터링: Processed FPS, defect count
 
 ---
 
@@ -74,22 +73,7 @@ Circularity = 4π × area / perimeter²
 
 > 임계값은 `main.py`의 `CIRCULARITY_THRESHOLD = 0.85`에서 변경 가능.
 
-### 2. Latency 계산 구조
-
-```
-시점            C1 캡처  ──────────────────────────────────────────────────────  C4 수신
-타임스탬프      captured_at_ms                                                  now (C4)
-                │                                                                │
-                └────────────── E2E Latency = now - captured_at_ms ─────────────┘
-```
-
-| 지표 | 산출 방법 | 설명 |
-|------|-----------|------|
-| **E2E Latency** | `현재시각(ms) - captured_at_ms` | 카메라 캡처 → C4 수신 전체 |
-
-최근 200건 기준 **P50 (중앙값)** 과 **P95**를 계산합니다.
-
-### 3. FPS 계산
+### 2. FPS 계산
 
 ```python
 # store.py — get_stats()
@@ -100,7 +84,7 @@ fps = len(recent) / 5.0
 
 `_fps_timestamps` 링 버퍼(최대 60건)에 각 레코드의 처리 시각을 저장하고, 최근 5초 윈도우의 처리량으로 FPS를 산출합니다.
 
-### 4. BBox Overlay 렌더링
+### 3. BBox Overlay 렌더링
 
 프론트엔드 `index.html`에서 HTML Canvas로 구현:
 
@@ -111,14 +95,13 @@ fps = len(recent) / 5.0
 - 오래된 bbox는 투명도 점진 감소 (fade-out)
 - 카메라 이미지가 있으면 좌표를 이미지 비율에 맞게 스케일링
 
-### 5. 인메모리 저장소
+### 4. 인메모리 저장소
 
 `InspectionStore` — SQLite 없이 메모리에서 최근 N건만 유지하는 경량 구조.
 
 | 버퍼 | 최대 크기 | 용도 |
 |------|-----------|------|
 | `_records` | 500건 | 검사 이력 (deque, FIFO) |
-| `_latency_buf` | 200건 | E2E latency percentile 계산 |
 | `_fps_timestamps` | 60건 | FPS 산출용 타임스탬프 |
 
 컨테이너 재시작 시 데이터는 초기화됩니다 (stateless).
@@ -224,9 +207,7 @@ C3 Inference에서 detection 결과를 수신합니다.
   "pass_count": 142,
   "fail_count": 8,
   "defect_rate": 5.3,
-  "fps": 12.4,
-  "latency_p50_ms": 85.0,
-  "latency_p95_ms": 142.0
+  "fps": 12.4
 }
 ```
 
@@ -237,8 +218,6 @@ C3 Inference에서 detection 결과를 수신합니다.
 | `fail_count` | int | 불량 수 |
 | `defect_rate` | float | 불량률 (%) |
 | `fps` | float | 최근 5초 기준 처리 FPS |
-| `latency_p50_ms` | float | E2E latency 중앙값 (ms) |
-| `latency_p95_ms` | float | E2E latency P95 (ms) |
 
 ---
 
@@ -458,7 +437,7 @@ docker compose --profile scale-out up --build
 | 영역 | 표시 항목 |
 |------|-----------|
 | **상단 통계 카드 (4개)** | 총 검사, 양품, 불량, 불량률 |
-| **성능 카드 (3개)** | 처리 FPS, E2E Latency P50, E2E Latency P95 |
+| **성능 카드 (1개)** | 처리 FPS |
 | **카메라 피드** | 원본 이미지 + canvas bbox overlay (pass=녹색, fail=빨간색) |
 | **검사 결과 피드** | 최근 60건 실시간 스크롤 목록 (아이템 ID, 원형도, latency) |
 | **양품률 도넛 차트** | SVG 기반 pass/fail 비율 시각화 |

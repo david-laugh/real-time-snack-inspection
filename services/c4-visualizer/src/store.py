@@ -5,7 +5,6 @@
 
 import csv
 import io
-import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -32,7 +31,6 @@ class InspectionStore:
         self._records: deque[InspectionRecord] = deque(maxlen=max_records)
         self._total = 0
         self._fail_count = 0
-        self._latency_buf: deque[float] = deque(maxlen=200)
         self._fps_timestamps: deque[float] = deque(maxlen=60)
 
     def add(self, rec: InspectionRecord):
@@ -41,7 +39,6 @@ class InspectionStore:
         self._total += 1
         if rec.status == "fail":
             self._fail_count += 1
-        self._latency_buf.append(rec.e2e_latency_ms)
         self._fps_timestamps.append(rec.timestamp)
 
     def get_recent(self, limit: int = 50) -> list[dict]:
@@ -96,12 +93,6 @@ class InspectionStore:
         pass_count = self._total - self._fail_count
         defect_rate = round(self._fail_count / self._total * 100, 1) if self._total > 0 else 0.0
 
-        # latency percentiles
-        sorted_lat = sorted(self._latency_buf) if self._latency_buf else [0]
-        p50 = sorted_lat[len(sorted_lat) // 2]
-        p95 = sorted_lat[min(len(sorted_lat) - 1, int(len(sorted_lat) * 0.95))]
-
-        # processed FPS (from last 5 seconds)
         now = time.time()
         recent = [t for t in self._fps_timestamps if now - t < 5.0]
         fps = len(recent) / 5.0 if recent else 0.0
@@ -112,6 +103,4 @@ class InspectionStore:
             "fail_count": self._fail_count,
             "defect_rate": defect_rate,
             "fps": round(fps, 1),
-            "latency_p50_ms": round(p50, 1),
-            "latency_p95_ms": round(p95, 1),
         }
