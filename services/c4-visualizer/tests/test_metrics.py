@@ -123,3 +123,22 @@ class MetricsTests(unittest.TestCase):
             update(0,0,0,97)
             m.sample_drop_window()
         self.assertIsNone(m.get_stats()['drop_window'])
+
+    def test_skipped_empty_frames_count_as_c2_throughput_not_loss(self):
+        m = PipelineMetrics()
+        def update(received, forwarded, skipped_empty, results):
+            m.update_c1({'counters': {'received': received, 'dropped': 0}})
+            m.update_c2({'events': {'dropped_stale': 0, 'dropped_old': 0, 'forwarded': forwarded,
+                                    'skipped_empty': skipped_empty, 'error': 0, 'timeout': 0}})
+            m.received_frames = results
+        with patch('src.metrics.time.monotonic', return_value=0):
+            update(0, 0, 0, 0)
+            m.sample_drop_window()
+        with patch('src.metrics.time.monotonic', return_value=5):
+            update(100, 60, 40, 60)
+            m.sample_drop_window()
+        window = m.get_stats()['drop_window']
+        self.assertEqual(window['overall_loss_pct_estimate'], 0)
+        self.assertEqual(window['c2_processed_per_s'], 20)
+        self.assertEqual(window['result_gap_estimate'], 0)
+        self.assertEqual(m.get_stats()['c2_metrics']['skipped_empty'], 40)

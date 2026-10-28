@@ -79,6 +79,13 @@ header h1 span { color: var(--accent); }
 .perf-card .value.warning { color: var(--fail); }
 .perf-card .unit, .perf-footer { font-size: 11px; color: var(--text2); }
 .perf-footer { min-height: 16px; }
+.perf-footer + .perf-footer { margin-top: 4px; }
+.frame-latency {
+  display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 8px 18px;
+  border-top: 1px solid var(--border); font-size: 11px; color: var(--text2);
+  font-variant-numeric: tabular-nums;
+}
+.frame-latency b { color: var(--text); font-weight: 600; }
 @media (max-width: 560px) {
   .perf-row { grid-template-columns: 1fr; }
   .perf-card { padding: 18px 20px; }
@@ -108,6 +115,7 @@ header h1 span { color: var(--accent); }
 .det-overlay.pass { background: rgba(0,184,148,.2); color: var(--pass); }
 .det-overlay.fail { background: rgba(225,112,85,.2); color: var(--fail); }
 
+.camera-feed.scan-edit { cursor: crosshair; }
 .bbox-canvas {
   position: absolute; top: 0; left: 0; width: 100%; height: 100%;
   pointer-events: none; z-index: 1;
@@ -177,7 +185,8 @@ header h1 span { color: var(--accent); }
 <header>
   <h1>C4 <span>Visualizer</span> — 크랙 검사</h1>
   <div class="header-right">
-    <a href="/api/export/csv" class="nav-link" download>CSV 내보내기</a>
+    <a href="/api/export/csv" class="nav-link" download title="쿠키 1개당 1행 (검사선 통과 시 1회 집계)">CSV 내보내기</a>
+    <a href="/api/export/detections.csv" class="nav-link" download title="C3 프레임별 검출 1건당 1행">검출 CSV</a>
     <a href="/viewer" class="nav-link">불량 뷰어</a>
     <div class="conn-badge" id="connBadge">연결 끊김</div>
   </div>
@@ -185,7 +194,7 @@ header h1 span { color: var(--accent); }
 
 <div class="layout">
 
-  <div class="stats-row">
+  <div class="stats-row" title="쿠키 추적 기준: 검사선을 넘을 때 1회 집계, 판정은 검사선 전후 프레임 다수결">
     <div class="stat-card">
       <div class="label">총 검사</div>
       <div class="value" id="sTotal">0</div>
@@ -209,6 +218,7 @@ header h1 span { color: var(--accent); }
       <div class="perf-heading"><span class="label">Frame Drop</span><span class="perf-tag">C2</span></div>
       <div class="perf-reading"><span class="value empty" id="pDrop">—</span><span class="unit">frames</span></div>
       <div class="perf-footer"><span>C2 시작 이후 누적</span><span id="pDropStatus">수신 대기</span></div>
+      <div class="perf-footer" title="C1/C2 카운터를 1초마다 조회해 약 5초 구간 증가분으로 계산 · 처리 중 프레임이 섞일 수 있는 추정값"><span id="pDropRates">구간 drop률 수집 중</span><span id="pC2Rate"></span></div>
     </div>
     <div class="perf-card" title="캡처부터 C4 결과 수신까지 · 최근 200개 프레임 · 호스트 간 시계 동기화 필요">
       <div class="perf-heading"><span class="label">Latency</span><span class="perf-tag">E2E</span></div>
@@ -219,15 +229,18 @@ header h1 span { color: var(--accent); }
 
   <div class="camera-panel">
     <div class="panel-hdr">
-      <span>카메라 피드</span>
+      <span>카메라 피드 <span id="scanLineInfo" style="font-size:11px; color:var(--text2);" title="카메라 화면을 클릭하면 검사선을 옮깁니다">· 검사선 —</span></span>
       <span id="camStatus" style="font-size:11px; color:var(--text2);">대기</span>
     </div>
-    <div class="camera-feed" id="camFeed">
+    <div class="camera-feed scan-edit" id="camFeed">
       <canvas class="bbox-canvas" id="bboxCanvas"></canvas>
       <div class="cam-placeholder" id="camPlaceholder">
         <div class="icon">📷</div>
         <div>C3 Inference 결과 대기 중</div>
       </div>
+    </div>
+    <div class="frame-latency" id="frameLatency" title="표시 중인 프레임의 구간별 지연 · 서비스 간 시계 동기화 필요">
+      <span>C1 <b>—</b></span><span>C2 <b>—</b></span><span>C3 <b>—</b></span><span>E2E <b>—</b></span>
     </div>
   </div>
 
@@ -282,13 +295,16 @@ let items = [];
 const BINS = 20;
 let circHist = new Array(BINS).fill(0);
 let bboxOverlays = [];
+// Images and C3 results are paired by (session_id, trace_id, frame_id) for 2 seconds.
 const pendingFrames = new Map();
-const MAX_PENDING_FRAMES = 30;
-let arrivalSequence = 0;
-let selectedSequence = -1;
+const MATCH_WINDOW_MS = 2000;
+const MAX_PENDING_FRAMES = 300;
+let clock = () => Date.now();
+let shownFrame = null;  // last matched frame on screen; display only moves forward in frame_id
 let displayGeneration = 0;
 let currentFrame = null;
 const displayLatencies = [];
+let tracking = null;  // {scan_line_ratio, direction, ...} from the server
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -301,18 +317,20 @@ function connect() {
     else if (msg.type === 'inspection_result') addResult(msg.data);
     else if (msg.type === 'camera_frame') updateCamera(msg.data);
     else if (msg.type === 'frame_result') updateFrameResult(msg.data);
+    else if (msg.type === 'scan_line') updateTracking(msg.data);
   };
 }
 
 function statusView(status) {
   return status === 'normal' ? {css:'pass', label:'정상', icon:'✅', rgb:[0,184,148]} :
-    status === 'defect' ? {css:'fail', label:'불량', icon:'❌', rgb:[225,112,85]} :
+    status === 'defect' ? {css:'fail', label:'불량', icon:'❌', rgb:[235,59,59]} :
     {css:'unknown', label:'판정 보류', icon:'◌', rgb:[150,160,180]};
 }
 
 function id(x) { return document.getElementById(x); }
 
 function updateStats(s) {
+  if (s.tracking) updateTracking(s.tracking);
   id('sTotal').textContent = s.total.toLocaleString();
   id('sPass').textContent = s.pass_count.toLocaleString();
   id('sFail').textContent = s.fail_count.toLocaleString();
@@ -331,6 +349,12 @@ function updateStats(s) {
   id('pDrop').className = 'value ' + (drops == null ? 'empty' : drops === 0 ? 'clear' : 'warning');
   id('pDropStatus').textContent = drops == null ? '수신 대기' : '실시간';
   const window = s.drop_window;
+  const pct = v => v == null ? '—' : v + '%';
+  id('pDropRates').textContent = window ?
+    `C1 ${pct(window.c1_drop_pct)} · C2 ${pct(window.c2_drop_pct)} · 전체 유실 ${pct(window.overall_loss_pct_estimate)} (추정)` :
+    '구간 drop률 수집 중';
+  id('pC2Rate').textContent = window ? `C2 처리 ${window.c2_processed_per_s} fps` : '';
+  id('pC2Rate').title = 'C2 처리량 = forwarded + skipped_empty (prompts 0개라 C3로 보내지 않은 프레임 포함)';
   id('pDrop').title = window ? `최근 ${window.seconds}초 · 전체 유실 추정 ${window.overall_loss_pct_estimate ?? '—'}% · C2 오류 ${window.c2_error_pct ?? '—'}% (처리 중 프레임 포함 가능)` : 'C2 누적 드롭 · 구간 비교 데이터 수집 중';
 
   const passRate = s.total > 0 ? (s.pass_count / s.total) : 1;
@@ -401,12 +425,11 @@ function drawBboxOverlays() {
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  if (!currentFrame || bboxOverlays.length === 0) return;
+  if (!currentFrame) return;
 
-  const scale = Math.min(canvas.width / currentFrame.width, canvas.height / currentFrame.height);
+  const {scale, offX, offY} = imageBox(canvas.width, canvas.height);
   const scaleX = scale, scaleY = scale;
-  const offX = (canvas.width - currentFrame.width * scale) / 2;
-  const offY = (canvas.height - currentFrame.height * scale) / 2;
+  drawScanLine(ctx, scale, offX, offY);
 
   bboxOverlays.forEach(b => {
     const alpha = 1;
@@ -437,6 +460,50 @@ function drawBboxOverlays() {
     ctx.fillStyle = `rgba(255,255,255,${alpha})`;
     ctx.fillText(label, x1 + 4, y1 - 4);
   });
+}
+
+// Where the object-fit: contain image sits inside the feed box.
+function imageBox(boxWidth, boxHeight) {
+  const scale = Math.min(boxWidth / currentFrame.width, boxHeight / currentFrame.height);
+  return {scale, offX: (boxWidth - currentFrame.width * scale) / 2, offY: (boxHeight - currentFrame.height * scale) / 2};
+}
+
+function drawScanLine(ctx, scale, offX, offY) {
+  if (!tracking) return;
+  const x = offX + tracking.scan_line_ratio * currentFrame.width * scale;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,214,0,.9)';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([8, 6]);
+  ctx.beginPath();
+  ctx.moveTo(x, offY);
+  ctx.lineTo(x, offY + currentFrame.height * scale);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = 'rgba(255,214,0,.9)';
+  ctx.font = '11px Segoe UI, system-ui, sans-serif';
+  ctx.fillText(tracking.direction === 'right' ? '검사선 →' : '← 검사선', x + 4, offY + 14);
+  ctx.restore();
+}
+
+function updateTracking(t) {
+  tracking = t;
+  id('scanLineInfo').textContent = `· 검사선 ${Math.round(t.scan_line_ratio * 100)}% · 진행 ${t.direction === 'right' ? '→' : '←'}`;
+  drawBboxOverlays();
+}
+
+// Clicking the camera image moves the scan line (fraction of the image width).
+async function moveScanLine(event) {
+  if (!currentFrame) return;
+  const rect = id('camFeed').getBoundingClientRect();
+  const {scale, offX} = imageBox(rect.width, rect.height);
+  const ratio = (event.clientX - rect.left - offX) / (currentFrame.width * scale);
+  if (!(ratio > 0 && ratio < 1)) return;
+  try {
+    const res = await fetch('/api/scan-line', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ratio: Math.round(ratio * 1000) / 1000})});
+    if (res.ok) updateTracking(await res.json());
+  } catch (e) {}
 }
 
 // C3 encodes alternating background/foreground runs in row-major order.
@@ -479,22 +546,33 @@ function decodeMask(mask, width, height, status) {
 function frameEntry(d) {
   if (!d.trace_id || !d.session_id || !Number.isInteger(d.frame_id)) return null;
   const key = JSON.stringify([d.session_id, d.trace_id, d.frame_id]);
-  if (!pendingFrames.has(key)) pendingFrames.set(key, {});
+  const now = clock();
+  for (const [k, entry] of pendingFrames) {
+    if (now - entry.arrivedAt <= MATCH_WINDOW_MS) break;  // Map keeps arrival order
+    if (k !== key) pendingFrames.delete(k);
+  }
+  if (!pendingFrames.has(key)) pendingFrames.set(key, {arrivedAt: now});
   while (pendingFrames.size > MAX_PENDING_FRAMES) pendingFrames.delete(pendingFrames.keys().next().value);
   return pendingFrames.get(key);
 }
 
+function isAtOrAfterShown(d) {
+  return !shownFrame || d.session_id !== shownFrame.session_id || d.frame_id >= shownFrame.frame_id;
+}
+
 function presentFrame(entry) {
   if (!entry.image) return;
+  const d = entry.image;
   const matched = Array.isArray(entry.detections);
-  if (matched && entry.sequence < selectedSequence) return;
-  if (!matched && (currentFrame || selectedSequence >= 0)) return;
-  if (matched) selectedSequence = entry.sequence;
+  // An unmatched image is only a preview before the first matched frame.
+  if (!matched && (currentFrame || shownFrame)) return;
+  // A late result for an older frame never rolls the screen back.
+  if (matched && !isAtOrAfterShown(d)) return;
+  if (matched) shownFrame = {session_id: d.session_id, frame_id: d.frame_id};
   const generation = ++displayGeneration;
   const img = new Image();
   img.onload = () => {
     if (generation !== displayGeneration) return;
-    const d = entry.image;
     // Reject a broken coordinate contract instead of stretching a mask onto it.
     if (img.naturalWidth !== d.width || img.naturalHeight !== d.height) return;
     const feed = id('camFeed');
@@ -508,15 +586,38 @@ function presentFrame(entry) {
     }));
     drawBboxOverlays();
     const displayedLatency = Date.now() - entry.captured_at_ms;
+    showFrameLatency(entry, matched ? displayedLatency : null);
     if (matched && entry.captured_at_ms > 0 && displayedLatency >= 0) {
       displayLatencies.push(displayedLatency);
       if (displayLatencies.length > 200) displayLatencies.shift();
       showLatency();
     }
-    id('camStatus').textContent = matched ? `프레임 ${d.frame_id} · 결과 수신` : '이미지 수신 · 결과 대기';
+    id('camStatus').textContent = !matched ? '이미지 수신 · 결과 대기' :
+      entry.noPrompts && !entry.result ? `프레임 ${d.frame_id} · 객체 없음` : `프레임 ${d.frame_id} · 결과 수신`;
   };
-  const frame = entry.image.frame;
+  const frame = d.frame;
   img.src = frame.startsWith('data:') ? frame : 'data:image/jpeg;base64,' + frame;
+}
+
+function elapsedMs(end, start) {
+  return Number.isFinite(end) && Number.isFinite(start) && start > 0 && end >= start ? Math.round(end - start) : null;
+}
+
+// Per-frame segments: C1 = C1 receive → C2 start (includes MQTT and C2 slot wait),
+// C2 = preprocessing, C3 = inference_latency_ms (includes waiting for the replica), E2E = capture → drawn.
+function showFrameLatency(entry, displayed) {
+  const d = entry.image;
+  const ms = v => v == null ? '—' : `${Math.round(v).toLocaleString()} ms`;
+  const c3 = entry.result && Number.isFinite(entry.inference_latency_ms) ? entry.inference_latency_ms : null;
+  const wait = entry.inference_timings_ms?.lock_wait;
+  const c3Note = entry.noPrompts && !entry.result ? ' (C3 미전송)' :
+    c3 == null ? '' : Number.isFinite(wait) ? ` (대기 ${Math.round(wait)} 포함)` : ' (대기 포함)';
+  const e2e = displayed != null && entry.captured_at_ms > 0 && displayed >= 0 ? displayed : null;
+  id('frameLatency').innerHTML =
+    `<span title="preprocess_started − gateway_received: C1 처리 + MQTT + C2 대기">C1 <b>${ms(elapsedMs(d.preprocess_started_at_ms, d.gateway_received_at_ms))}</b></span>` +
+    `<span title="preprocess_finished − preprocess_started">C2 <b>${ms(elapsedMs(d.preprocess_finished_at_ms, d.preprocess_started_at_ms))}</b></span>` +
+    `<span title="C3 inference_latency_ms: replica 대기 시간이 섞여 있음">C3 <b>${ms(c3)}</b>${c3Note}</span>` +
+    `<span title="화면 표시 시각 − 촬영 시각">E2E <b>${ms(e2e)}</b></span>`;
 }
 
 function updateCamera(d) {
@@ -524,20 +625,28 @@ function updateCamera(d) {
   const entry = frameEntry(d);
   if (!entry) return;
   entry.image = d;
-  entry.sequence = ++arrivalSequence;
+  // C2 does not send prompt-less frames to C3 (C2_SKIP_EMPTY), so no result will come.
+  if (Array.isArray(d.prompts) && d.prompts.length === 0 && !entry.result) {
+    entry.noPrompts = true;
+    entry.detections = [];
+  }
   presentFrame(entry);
 }
 
 function updateFrameResult(d) {
   const entry = frameEntry(d);
   if (!entry) return;
+  entry.result = true;
   entry.detections = d.detections;
   entry.captured_at_ms = d.captured_at_ms;
+  entry.inference_latency_ms = d.inference_latency_ms;
+  entry.inference_timings_ms = d.inference_timings_ms;
   if (!entry.image) id('camStatus').textContent = `결과 ${d.frame_id} 수신 · 이미지 대기/누락 (이전 화면 유지)`;
   presentFrame(entry);
 }
 
 new ResizeObserver(drawBboxOverlays).observe(id('camFeed'));
+id('camFeed').addEventListener('click', moveScanLine);
 
 async function loadInitial() {
   try {
