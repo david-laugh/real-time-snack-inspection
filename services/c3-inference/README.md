@@ -20,6 +20,7 @@ Video Predictor의 `inference_state`나 세션 memory는 두지 않는다. 그�
 - 응답을 C2에 보낸 **뒤에** 백그라운드로 전송하므로 C2가 체감하는 latency에 포함되지 않는다.
 - C4가 실패하거나(4xx/5xx, 연결 실패, timeout) 응답이 늦어도 `/infer`는 성공으로 처리한다. 실패는 `/metrics`의 `results_push_error_count`와 `results_push_errors`(원인별)로 확인한다.
 - 422/503 같은 오류 요청은 전송하지 않는다. `C3_RESULTS_URL=`(빈 값)이면 전송을 끈다.
+- 결과에는 detection-result 1.1.0의 optional 필드 `latency_breakdown_ms`(촬영 → C2 → **C2→C3 전달** → C3 대기/처리 구간별 지연), `preprocess_*_at_ms`, `inference_received_at_ms`, `inference_timings_ms`가 들어간다. C4 작업자용 사양과 frame drop 계산식은 [`docs/c3-to-c4-handoff.md`](../../docs/c3-to-c4-handoff.md)에 있다.
 
 - Trace header `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id`를 받아 응답 header로 echo한다(body 값이 기준).
 - `DetectionResult`가 `additionalProperties:false`라서 per-frame timing은 **응답 header**로 보낸다. `X-C3-Decode-Ms`, `X-C3-Encoder-Ms`, `X-C3-Segmentation-Ms`, `X-C3-Defect-Analysis-Ms`, `X-C3-Total-Inference-Ms`, `Server-Timing`, `X-Inference-Container-Id`.
@@ -171,6 +172,20 @@ cd services/c3-inference
 python -m pytest                 # mock API 통합 + 불량 규칙 + RLE (torch 불필요)
 python -m pytest -s tests/test_sam2_real.py   # torch/sam2/checkpoint가 있으면 실제 SAM2로 실행, 없으면 skip
 ```
+
+## 권장 구성 (실측, RTX 5060 Ti 1장)
+
+C1 → MQTT → C2 → Nginx → C3 → C4 실제 체인 부하 시험 결과다([`docs/c3-inference-c2-integration-report.md`](../../docs/c3-inference-c2-integration-report.md)). 재현 도구는 [`dev/`](dev/README.md)에 있다.
+
+| 입력 | C3 replica | C2 `C2_MAX_INFLIGHT` | 결과 |
+|---|---|---|---|
+| 30 fps 1 스트림 | **2** | **3** | 30.0 fps 전달, Nginx p50/p95 43/47 ms, C3 대기 0 |
+| 60 fps (2 스트림) | 3 | 4 | 35.6 fps (단일 GPU 상한 약 30~36 fps) |
+
+- 규칙: `C2_MAX_INFLIGHT = replica 수 + 1`. 더 크게 잡으면 C3 안에서 대기와 GPU 경합만 늘어난다(×3, inflight 6: 31.1 fps, p50 179 ms).
+- replica 1개의 상한은 약 29 fps다(lock이 잡는 encoder + segmentation 약 34 ms).
+- Nginx timeout: `proxy_read_timeout`·`proxy_send_timeout` 2500ms, `proxy_connect_timeout` 1s. C2 `/infer` timeout 3 s보다 짧게 둔다.
+- `/metrics`의 `latency_window_ms.lock_wait_ms`는 replica 안에서 기다린 시간이다. `total_inference_ms`에 포함되므로, 처리가 느린 것인지 대기가 긴 것인지 이 값으로 구분한다.
 
 ## ⚠️ 단일 GPU Scale-out (자원 경합)
 

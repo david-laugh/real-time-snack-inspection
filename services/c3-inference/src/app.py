@@ -178,6 +178,7 @@ def create_app(
 
     @app.post("/infer")
     async def infer(request: Request) -> JSONResponse:
+        received_at_ms = int(time.time() * 1000)  # before body read / threadpool: C2 -> C3 hop ends here
         header_trace = _trace_from_headers(request)
         if not predictor.is_ready:
             return error_response("model_not_ready", f"model status: {state.status}", 503, header_trace)
@@ -197,7 +198,7 @@ def create_app(
             log.warning("trace header/body mismatch headers=%s body=%s", mismatched, trace)
 
         try:
-            result, timings, decisions = await run_in_threadpool(pipeline.run, frame)
+            result, timings, decisions = await run_in_threadpool(pipeline.run, frame, received_at_ms)
         except InferenceError as exc:
             return error_response(exc.code, exc.message, exc.http_status, trace)
         except Exception as exc:
@@ -222,6 +223,7 @@ def create_app(
                     "inference_container_id": settings.inference_container_id,
                     "detections": len(result.detections),
                     "timings_ms": timings,
+                    "latency_breakdown_ms": result.latency_breakdown_ms.model_dump() if result.latency_breakdown_ms else None,
                     "decisions": [
                         {"object_id": d.object_id, "status": d.status.value, "reason": dec.reason, **dec.features}
                         for d, dec in zip(result.detections, decisions)

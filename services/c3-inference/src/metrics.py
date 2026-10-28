@@ -9,6 +9,9 @@ from typing import Any, Deque, Dict, Optional
 import numpy as np
 
 STAGES = (
+    # Time a request waited for this replica's SAM2 predictor (queueing, not compute).
+    # total_inference_ms includes it; total - lock_wait = service time.
+    "lock_wait_ms",
     "decode_ms",
     "encoder_ms",
     "segmentation_ms",
