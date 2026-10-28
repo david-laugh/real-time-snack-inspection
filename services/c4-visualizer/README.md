@@ -4,9 +4,49 @@
 **Port:** 8003
 
 과자 크랙 검사 결과를 실시간으로 시각화하는 대시보드 서비스.
-C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라우저에 실시간 push합니다.
+
+**역할:**
+- Detection 결과 실시간 표시 (WebSocket push)
+- 영상 위에 mask / bbox / 불량 마킹 overlay (TODO)
+- 모니터링: Processed FPS, latency (E2E P50/P95), defect count
+- End-to-End latency 계산 (`now - captured_at_ms`)
 
 ---
+
+## 구현 현황
+
+- [x] Dashboard 프레임워크 선정 → FastAPI + vanilla JS (WebSocket 실시간)
+- [x] Docker `command`를 실제 entrypoint로 교체 → `uvicorn src.main:app`
+- [x] 실시간 통계 대시보드 (총 검사/양품/불량/불량률/FPS/Latency P50·P95)
+- [x] 불량 확인 뷰어 (`/viewer`) — 테이블 + 상세 패널
+- [x] 원형도(Circularity) 기반 양품/불량 판정
+- [x] WebSocket 브로드캐스트 (`/ws/dashboard`)
+- [ ] Overlay 렌더링 — 영상 위에 mask/bbox/불량 마킹 (현재는 pass/fail 배지만 표시)
+- [ ] 구간별 Latency 모니터링 (C1/C2/C3 개별) — 현재 E2E만 표시
+- [ ] frame drop 감지 및 모니터링
+- [ ] 메트릭 집계 및 `benchmark/results/`로 CSV export
+
+## Open Issues
+
+1. **원본 프레임 수신 경로 미정** — Overlay를 그리려면 원본 이미지가 필요.
+   현재 후보: (a) C1이 C4로 프레임 미러링, (b) detection-result에 frame 참조 URL 포함
+2. **C3 replica 결과 순서 문제** — C3가 여러 대일 때 결과가 `frame_id` 순서와 다르게 도착할 수 있음.
+   → `frame_id` 기준 재정렬 또는 late frame drop 정책 필요
+
+---
+
+## Interface
+
+| 방향 | Endpoint | Payload / 설명 |
+|------|----------|----------------|
+| C3 → C4 | `POST /results` | [`detection-result.schema.json`](../../shared/schemas/detection-result.schema.json) |
+| Browser → C4 | `GET /` | 메인 대시보드 (port 8003) |
+| Browser → C4 | `GET /viewer` | 불량 확인 뷰어 |
+| Browser → C4 | `WS /ws/dashboard` | 실시간 WebSocket (inspection_result, stats, camera_frame) |
+| Browser → C4 | `GET /api/stats` | 통계 JSON |
+| Browser → C4 | `GET /api/inspections` | 검사 이력 |
+| Browser → C4 | `GET /api/defects` | 불량 목록 |
+| — | `GET /healthz` | 헬스체크 |
 
 ## 아키텍처
 
