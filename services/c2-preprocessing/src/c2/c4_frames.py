@@ -11,6 +11,7 @@ C4에서 좌표를 변환할 필요가 없다.
 - preprocess_*_at_ms, width/height/prompts/image_b64는 C3로 보낸 processed-frame 값을 그대로 쓴다.
   JPEG를 다시 인코딩하지 않는다.
 - C3 전송과 동시에 보내고 응답을 기다리지 않는다. 그래야 이미지가 C3 결과보다 먼저 C4에 도착한다.
+- prompts가 0개라 C3로 보내지 않은 프레임(skipped_empty)도 보낸다. 이 프레임에는 C3 결과가 오지 않는다.
 - 메인 경로(C3 전송)와 분리된다. 별도 httpx 클라이언트를 쓰고, 동시 전송 한도(C2_C4_MAX_INFLIGHT)가 차 있으면
   그 프레임은 보내지 않고 c4_skipped로 센다. 타임아웃은 짧게(C2_C4_TIMEOUT_S).
 """

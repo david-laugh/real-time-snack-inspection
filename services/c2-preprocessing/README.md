@@ -17,7 +17,7 @@
 | C2 → C4 | HTTP `POST http://c4-visualizer:8003/api/camera/frame` (C3 전송과 동시, best-effort) | `{trace_id, session_id, frame_id, gateway_received_at_ms, preprocess_started_at_ms, preprocess_finished_at_ms, width, height, prompts, image_b64}` (10개 필드) |
 | (디버깅) → C2 | HTTP `POST /preprocess` | frame-envelope JSON. MQTT와 같은 처리 함수를 쓰며 `/infer` 결과까지 기다린다 |
 | — | `GET /healthz` | `{"status": "ok" \| "degraded", "mqtt": {"connected": …}}` |
-| — | `GET /stats` | 이벤트 누적 수, MQTT 수신 수, 처리 중(`inflight`)·대기(`pending_sessions`) 수, `c4_sent` / `c4_skipped` / `c4_error` |
+| — | `GET /stats` | 이벤트 누적 수(`skipped_empty` 포함), MQTT 수신 수, 처리 중(`inflight`)·대기(`pending_sessions`) 수, `skip_empty` 설정, `c4_sent` / `c4_skipped` / `c4_error` |
 
 - MQTT에는 HTTP 헤더가 없으므로 `trace_id` / `frame_id` / `session_id`는 본문에서 읽는다. `/infer`로 보낼 때는
   `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id` 헤더로 전파한다.
@@ -27,7 +27,7 @@
 `POST /preprocess` 응답
 | 코드 | 의미 |
 |---|---|
-| 200 | 전처리 후 `/infer` 전달 성공. `{trace_id, frame_id, num_prompts, preprocess_ms, infer_status}` |
+| 200 | 전처리 후 `/infer` 전달 성공. `{trace_id, frame_id, num_prompts, preprocess_ms, infer_status}`. prompts가 0개라 `/infer`로 보내지 않았으면(`skipped_empty`) `infer_status: null` |
 | 422 | frame-envelope 스키마 위반, `image_b64` 누락·디코딩 실패, 미지원 `format`(`raw_*`) |
 | 502 | `/infer` 타임아웃, 연결 실패, 4xx/5xx |
 
@@ -38,6 +38,7 @@ paho 네트워크 스레드: 수신 → JSON 파싱만 → 이벤트 루프로 �
             ├ 같은 세션의 새 프레임이 오면 보관 중이던 것은 버림 → dropped_stale
             └ captured_at_ms 기준 C2_MAX_FRAME_AGE_MS(500) 초과 → dropped_old (보관할 때, 꺼낼 때 모두 확인)
 워커 C2_MAX_INFLIGHT(4)개: 꺼내기 → 전처리(스레드풀) → /infer 전달 → forwarded / error / timeout
+                          └ prompts 0개(C2_SKIP_EMPTY) → /infer 생략 → skipped_empty
 ```
 - 들어오는 속도가 처리 속도보다 빠르면 큐가 쌓이지 않고 오래된 프레임부터 버려진다. 따라서 지연이 누적되지 않는다.
   (30fps 발행 + `/infer` 200ms 지연 테스트: 90프레임 중 약 58개 전달, 32개 dropped_stale, 도착 시점 나이 최대 72ms)
@@ -64,7 +65,8 @@ X-Trace-Id / X-Frame-Id / X-Session-Id
     processed-frame과 같은 값. 이미지는 **같은 JPEG 문자열을 재사용**한다(다시 인코딩하지 않는다)
   - C4는 이 시각들로 C1·C2 구간 지연을 C3 결과 없이도 계산할 수 있다. `gateway_received_at_ms`는 C1 시계,
     `preprocess_*`는 C2 시계라서 서로 다른 호스트에서 돌면 시계 차이만큼 오차가 생긴다
-- C3로 보내는 프레임만 보낸다. `dropped_stale` / `dropped_old`, 입력 오류 프레임은 보내지 않는다. `prompts`가 0개여도 보낸다(영상이 멈춰 보이지 않게).
+- 전처리를 마친 프레임을 보낸다. `dropped_stale` / `dropped_old`, 입력 오류 프레임은 보내지 않는다. `prompts`가 0개여도 보낸다(영상이 멈춰 보이지 않게).
+  0개 프레임은 기본(`C2_SKIP_EMPTY=true`)으로 C3로 보내지 않으므로(`skipped_empty`) **C3 결과가 오지 않는다.** C4는 이 프레임의 C3 결과를 기다리지 않아야 한다.
 - C3 전송과 **동시에** 보내고 응답을 기다리지 않는다. 그래서 대개 이미지가 C3 결과보다 먼저 C4에 도착한다(순서 보장은 아님).
 - 메인 경로(C3 전송)와 분리돼 있다. 별도 HTTP 클라이언트를 쓰고, 동시 전송 한도 `C2_C4_MAX_INFLIGHT`(2)가 차 있으면 그 프레임은
   보내지 않고 `c4_skipped`로 센다. 타임아웃은 `C2_C4_TIMEOUT_S`(1.0초)이고 재시도하지 않는다.
@@ -79,6 +81,7 @@ X-Trace-Id / X-Frame-Id / X-Session-Id
 | event | 의미 |
 |---|---|
 | `forwarded` | `/infer` 전달 성공 |
+| `skipped_empty` | prompts가 0개라 `/infer`로 보내지 않음(`C2_SKIP_EMPTY=true`). C4로는 보낸다. `preprocess_ms`는 기록하고 `infer_rtt_ms`는 빈 값 |
 | `dropped_stale` | 처리 전에 같은 세션의 새 프레임이 와서 버림 |
 | `dropped_old` | `captured_at_ms` 기준 `C2_MAX_FRAME_AGE_MS` 초과 |
 | `error` | 잘못된 메시지(JSON·스키마·디코딩) 또는 `/infer` 실패(연결 실패, 4xx/5xx) |
@@ -127,6 +130,7 @@ X-Trace-Id / X-Frame-Id / X-Session-Id
 | `C2_MQTT_CLIENT_ID` | (빈 값) | 비우면 `c2-preprocessing-<hostname>` |
 | `C2_MQTT_KEEPALIVE_S` | `30` | |
 | `C2_MQTT_RECONNECT_MIN_S` / `_MAX_S` | `1` / `10` | 재접속 대기 시간 범위 |
+| `C2_SKIP_EMPTY` | `true` | prompts가 0개인 프레임을 `/infer`로 보내지 않고 C4로만 보낸다(`skipped_empty`). `false`면 0개여도 `/infer`로 보낸다 |
 | `C2_MAX_INFLIGHT` | `4` | 워커 수 = 동시 처리·전달 수. C3 복제본 수 이상 권장 |
 | `C2_MAX_FRAME_AGE_MS` | `500` | 이보다 오래된 프레임은 버림(`captured_at_ms` 기준). `0`이면 끔 |
 | `C2_EVENT_LOG` | (빈 값) | 프레임 이벤트 CSV 경로. 비우면 기록 안 함 |
@@ -228,14 +232,14 @@ docker rm -f mqtt-test-broker && docker network rm c2-test-net
 | 테스트 | 내용 |
 |---|---|
 | `test_detect.py` | reference와 동일 결과, fixture 정확도(recall 1.0, 평균 IoU ≥ 0.95), 0.5배/1.8배/90도 회전 불변성, 1024 리사이즈 파이프라인, EMA |
-| `test_preprocess_api.py` | `/infer` mock. 전송 메시지의 스키마 통과, 공통 필드·헤더 전파, 오류 코드 |
+| `test_preprocess_api.py` | `/infer` mock. 전송 메시지의 스키마 통과, 공통 필드·헤더 전파, 오류 코드, prompts 0개 프레임 `skipped_empty`(/infer 미전송, CSV·/stats 기록), `C2_SKIP_EMPTY` 설정 |
 | `test_latency.py` | 프레임당 처리 시간 (목표 < 33 ms) |
 | `test_phone_frames.py` | 폰 촬영 프레임 5장의 기대 개수와 위치 (원본, 1024 리사이즈, 576/720px 저해상도 입력) |
 | `test_concurrency.py` | 처리 중에도 이벤트 루프 응답, 동시 요청 병렬 처리, EMA 스레드 안전성, 워밍업 |
 | `test_frame_slots.py` | 세션별 최신 1장 보관, `dropped_stale` / `dropped_old`, 이벤트 CSV |
 | `test_mqtt_integration.py` | 실제 mosquitto: 발행 → 수신 → 가짜 `/infer` 도착, 30fps + `/infer` 200ms에서 지연 누적 없음·drop 기록, 오래된/잘못된 메시지, 연결 끊김 후 재접속, 호스트 `localhost:1883` 거부, drop된 프레임은 C4로 가지 않음 |
 | `test_settings_mqtt.py` | MQTT 설정 우선순위 (`C2_MQTT_*` → 공용 `MQTT_*` → 기본값, 빈 값 처리) |
-| `test_c4_frames.py` | C4 본문이 합의된 10개 필드인지, JPEG 크기, C3 요청과 trace_id·preprocess 시각·prompts·이미지 일치, `gateway_received_at_ms`가 입력 envelope 값과 같은지, 가짜 C4 검증 동작, prompts 0개 전송, 입력 오류 프레임 미전송, C4 지연(2초)·다운에도 C3 처리량·지연 유지, C4 연결 실패 중 이벤트 루프 막힘 없음(sniffio 회귀), URL 빈 값이면 끔 |
+| `test_c4_frames.py` | C4 본문이 합의된 10개 필드인지, JPEG 크기, C3 요청과 trace_id·preprocess 시각·prompts·이미지 일치, `gateway_received_at_ms`가 입력 envelope 값과 같은지, 가짜 C4 검증 동작, prompts 0개 전송(`C2_SKIP_EMPTY` true면 C4로만, false면 C3·C4 모두), 입력 오류 프레임 미전송, C4 지연(2초)·다운에도 C3 처리량·지연 유지, C4 연결 실패 중 이벤트 루프 막힘 없음(sniffio 회귀), URL 빈 값이면 끔 |
 | `test_fake_infer.py` | 가짜 `/infer` 검증 동작, C2 → 가짜 `/infer` 연결 |
 | `test_schema_sync.py` | `schemas/` 사본이 `shared/schemas` 원본과 같은지 |
 
