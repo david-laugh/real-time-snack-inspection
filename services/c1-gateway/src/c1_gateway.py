@@ -435,7 +435,33 @@ def cmd_stub(a):
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse
 
-    st = {"bad": 0, "ok": 0}
+    st = {"bad": 0, "ok": 0, "image_ok": 0, "image_bad": 0, "saved": 0, "last_image": None}
+    if a.save_dir:
+        os.makedirs(a.save_dir, exist_ok=True)
+
+    def check_image(env):
+        """image_b64가 실제 JPEG인지, 크기가 envelope의 source_width/height와 같은지 확인."""
+        from PIL import Image
+        b64 = env.get("image_b64")
+        if not b64:
+            return None, "image_b64 없음"
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception:
+            return None, "base64 디코딩 실패"
+        if raw[:2] != b"\xff\xd8":
+            return None, "JPEG 시작 바이트(FF D8) 아님"
+        try:
+            im = Image.open(io.BytesIO(raw))
+            im.load()
+        except Exception as e:
+            return None, f"이미지 열기 실패: {e}"
+        if im.format != "JPEG":
+            return None, f"형식이 JPEG 아님: {im.format}"
+        if (im.width, im.height) != (env["source_width"], env["source_height"]):
+            return None, (f"크기 불일치: 실제 {im.width}x{im.height}, "
+                          f"envelope {env['source_width']}x{env['source_height']}")
+        return raw, None
 
     @asynccontextmanager
     async def lifespan(_):
@@ -458,7 +484,8 @@ def cmd_stub(a):
 
     @app.get("/healthz")
     async def healthz():
-        return {"status": "ok", "service": "c2-stub", **{k: st[k] for k in ("ok", "bad")}}
+        return {"status": "ok", "service": "c2-stub",
+                **{k: st[k] for k in ("ok", "bad", "image_ok", "image_bad", "saved", "last_image")}}
 
     @app.post("/preprocess")
     async def preprocess(request: Request):
@@ -470,6 +497,19 @@ def cmd_stub(a):
             st["bad"] += 1
             return JSONResponse({"error": "contract violation", "missing": missing,
                                  "extra": extra, "header_trace_match": hdr_ok}, status_code=422)
+        raw, why = await asyncio.to_thread(check_image, env)
+        if why:
+            st["image_bad"] += 1
+            print(f"[stub C2] 이미지 오류 frame {env['frame_id']}: {why}", file=sys.stderr)
+            return JSONResponse({"error": "image check failed", "detail": why}, status_code=422)
+        st["image_ok"] += 1
+        st["last_image"] = {"session_id": env["session_id"], "frame_id": env["frame_id"],
+                            "size": f"{env['source_width']}x{env['source_height']}", "bytes": len(raw)}
+        if a.save_dir and env["frame_id"] % a.save_every == 0:
+            name = f"{env['session_id']}_{env['frame_id']:06d}.jpg"
+            with open(os.path.join(a.save_dir, name), "wb") as fp:
+                fp.write(raw)
+            st["saved"] += 1
         async with st["sem"]:
             started = now_ms()
             await asyncio.sleep(max(0.0, random.gauss(a.delay_ms, a.jitter_ms)) / 1000.0)
@@ -480,7 +520,8 @@ def cmd_stub(a):
         return {"ok": True, "trace_id": env["trace_id"], "frame_id": env["frame_id"]}
 
     print(f"[stub C2] :{a.port}/preprocess  delay={a.delay_ms}±{a.jitter_ms}ms  workers={a.workers}"
-          + (f"  → C4 {a.c4}" if a.c4 else ""))
+          + (f"  → C4 {a.c4}" if a.c4 else "")
+          + (f"  이미지 저장: {a.save_dir} ({a.save_every}장마다)" if a.save_dir else ""))
     uvicorn.run(app, host=a.host, port=a.port, log_level="warning")
 
 
@@ -778,6 +819,8 @@ def main():
     t.add_argument("--jitter-ms", type=float, default=10)
     t.add_argument("--workers", type=int, default=1, help="동시 처리 수")
     t.add_argument("--c4", default="", help="가짜 detection-result를 보낼 C4 주소 (예: http://localhost:8003)")
+    t.add_argument("--save-dir", default="", help="받은 이미지를 JPEG로 저장할 폴더 (눈으로 확인용)")
+    t.add_argument("--save-every", type=int, default=10, help="N번째 프레임마다 한 장 저장")
     t.set_defaults(fn=cmd_stub)
 
     g = sub.add_parser("loadgen", help="부하 생성 / 벤치마크")
