@@ -7,15 +7,17 @@
 - OpenCV 기반 resize(긴 변 기준) + 컨베이어 영역(ROI) 판정
 - 과자 후보 bbox 생성 → SAM2 prompt(`prompts[]`)로 변환
 - `processed-frame` 메시지를 Nginx Inference LB(`/infer`)로 전달
+- 같은 프레임의 리사이즈 이미지 + prompts를 C4로 전달 (C4가 C3 결과를 그 위에 그림)
 
 ## Interface
 | 방향 | 프로토콜 / Endpoint | Payload |
 |---|---|---|
 | C1 → C2 | **MQTT** 구독 `{MQTT_TOPIC_PREFIX}/frames/+` = `psf/v1/frames/+` (QoS 0, 브로커 `mqtt-broker:1883`). C1은 `{prefix}/frames/{session_id}`로 발행 | [`frame-envelope`](../../shared/schemas/frame-envelope.schema.json) JSON (`image_b64` JPEG) |
 | C2 → Nginx | HTTP `POST http://nginx-inference-lb:8080/infer` | [`processed-frame`](../../shared/schemas/processed-frame.schema.json) JSON |
+| C2 → C4 | HTTP `POST http://c4-visualizer:8003/api/camera/frame` (C3 전송과 동시, best-effort) | `{trace_id, session_id, frame_id, width, height, prompts, image_b64}` |
 | (디버깅) → C2 | HTTP `POST /preprocess` | frame-envelope JSON. MQTT와 같은 처리 함수를 쓰며 `/infer` 결과까지 기다린다 |
 | — | `GET /healthz` | `{"status": "ok" \| "degraded", "mqtt": {"connected": …}}` |
-| — | `GET /stats` | 이벤트 누적 수, MQTT 수신 수, 처리 중(`inflight`)·대기(`pending_sessions`) 수 |
+| — | `GET /stats` | 이벤트 누적 수, MQTT 수신 수, 처리 중(`inflight`)·대기(`pending_sessions`) 수, `c4_sent` / `c4_skipped` / `c4_error` |
 
 - MQTT에는 HTTP 헤더가 없으므로 `trace_id` / `frame_id` / `session_id`는 본문에서 읽는다. `/infer`로 보낼 때는
   `X-Trace-Id`, `X-Frame-Id`, `X-Session-Id` 헤더로 전파한다.
@@ -43,6 +45,27 @@ paho 네트워크 스레드: 수신 → JSON 파싱만 → 이벤트 루프로 �
 - `captured_at_ms`는 C1이 서버 시계 기준으로 보정해 보낸다(`/cam`의 시계 차이 측정). 보정되지 않은 클라이언트 시계를 쓰면
   나이 판정이 틀어지므로, 그런 경우에는 `C2_MAX_FRAME_AGE_MS=0`으로 끈다.
 
+### C4 프레임 전송 (`C2_C4_FRAME_URL`)
+C4와 합의한 인터페이스다. C4는 `trace_id`로 이 이미지와 C3 결과(bbox, mask)를 짝지어 그린다. C3 결과는 C2가 리사이즈한
+이미지 기준 좌표이므로 C4에서 좌표를 변환할 필요가 없다.
+```
+POST http://c4-visualizer:8003/api/camera/frame
+Content-Type: application/json
+X-Trace-Id / X-Frame-Id / X-Session-Id
+{"trace_id": "…", "session_id": "…", "frame_id": 297, "width": 576, "height": 1024,
+ "prompts": [{"candidate_id": "c0", "type": "box", "bbox": [429.0, 591.0, 525.0, 681.0]}, …],
+ "image_b64": "/9j/4AAQ…"}
+```
+- 본문은 정확히 이 7개 필드다. `width` / `height` / `prompts` / `image_b64`는 C3로 보내는 processed-frame과 같은 값이고,
+  이미지는 **같은 JPEG 문자열을 재사용**한다(다시 인코딩하지 않는다).
+- C3로 보내는 프레임만 보낸다. `dropped_stale` / `dropped_old`, 입력 오류 프레임은 보내지 않는다. `prompts`가 0개여도 보낸다(영상이 멈춰 보이지 않게).
+- C3 전송과 **동시에** 보내고 응답을 기다리지 않는다. 그래서 대개 이미지가 C3 결과보다 먼저 C4에 도착한다(순서 보장은 아님).
+- 메인 경로(C3 전송)와 분리돼 있다. 별도 HTTP 클라이언트를 쓰고, 동시 전송 한도 `C2_C4_MAX_INFLIGHT`(2)가 차 있으면 그 프레임은
+  보내지 않고 `c4_skipped`로 센다. 타임아웃은 `C2_C4_TIMEOUT_S`(1.0초)이고 재시도하지 않는다.
+  C4가 2초씩 지연되거나 꺼져 있어도 C3 전달 처리량·지연이 C4를 끈 경우와 같은 것을 테스트로 확인했다.
+- `/stats`의 `c4_sent` / `c4_skipped` / `c4_error`로 확인한다. 이벤트 CSV에는 실패(`c4_error`)만 남긴다.
+- `C2_C4_FRAME_URL`을 빈 값으로 두면 기능이 꺼진다.
+
 ### 이벤트 로그 (`C2_EVENT_LOG`)
 프레임마다 한 줄씩 CSV로 남긴다. 컬럼은 C1의 `c1_events.csv`와 맞췄다:
 `trace_id, session_id, frame_id, captured_at_ms, gateway_received_at_ms, source(mqtt|http), event, event_at_ms, preprocess_ms, infer_rtt_ms, detail`
@@ -54,6 +77,7 @@ paho 네트워크 스레드: 수신 → JSON 파싱만 → 이벤트 루프로 �
 | `dropped_old` | `captured_at_ms` 기준 `C2_MAX_FRAME_AGE_MS` 초과 |
 | `error` | 잘못된 메시지(JSON·스키마·디코딩) 또는 `/infer` 실패(연결 실패, 4xx/5xx) |
 | `timeout` | `/infer` 타임아웃(`C2_INFER_TIMEOUT_S`) |
+| `c4_error` | C4 프레임 전송 실패. CSV에만 기록하고, 누적 수는 `/stats`의 `c4_error`에 있다(프레임 이벤트 집계와 분리) |
 
 ## 처리 흐름
 1. 입력을 frame-envelope 스키마로 검증
@@ -100,6 +124,9 @@ paho 네트워크 스레드: 수신 → JSON 파싱만 → 이벤트 루프로 �
 | `C2_MAX_INFLIGHT` | `4` | 워커 수 = 동시 처리·전달 수. C3 복제본 수 이상 권장 |
 | `C2_MAX_FRAME_AGE_MS` | `500` | 이보다 오래된 프레임은 버림(`captured_at_ms` 기준). `0`이면 끔 |
 | `C2_EVENT_LOG` | (빈 값) | 프레임 이벤트 CSV 경로. 비우면 기록 안 함 |
+| `C2_C4_FRAME_URL` | `http://c4-visualizer:8003/api/camera/frame` | C4 프레임 전송 주소. **빈 값이면 끔** |
+| `C2_C4_MAX_INFLIGHT` | `2` | C4 동시 전송 한도. 차 있으면 그 프레임은 보내지 않음(`c4_skipped`) |
+| `C2_C4_TIMEOUT_S` | `1.0` | C4 전송 타임아웃(초) |
 | `LOG_LEVEL` | `INFO` | `DEBUG`이면 프레임별 지름·배율·ROI를 로그로 남긴다 |
 
 **MQTT 설정 우선순위:** `C2_MQTT_*` 값 → 공용 `MQTT_HOST` / `MQTT_PORT` / `MQTT_TOPIC_PREFIX`(C1과 공유, `.env`가 env_file로
@@ -149,6 +176,8 @@ C2는 공용 변수를 그대로 읽으므로 c2 블록에서는 **`command` 제
 ### 로컬 통합 테스트: 발행 → MQTT → C2 → 가짜 `/infer`
 - `dev/fake_infer.py`: Nginx/C3 대역. processed-frame을 스키마로 검증하고 로그만 남긴다. 통과하면 200, 위반이면 422로 응답한다.
   `--delay-ms`로 C3 추론 시간을 흉내 낼 수 있고, `GET /stats`는 받은 수와 도착 시점 프레임 나이(`now - captured_at_ms`)를 보여준다.
+- `dev/fake_c4.py`: C4 대역(`POST /api/camera/frame`, 기본 포트 8003). 합의된 7개 필드인지, JPEG 크기가 width/height와 같은지 검증한다(`--delay-ms` 지원).
+  C2에 `C2_C4_FRAME_URL=http://localhost:8003/api/camera/frame`을 주면 C4 전송까지 확인할 수 있다.
 - `dev/publish_frames.py`: C1 대역 발행기. 기본 `localhost:11883`이며, **호스트의 `localhost:1883`에는 발행을 거부한다.**
 
 compose override 예시 [`dev/docker-compose.override.yml`](dev/docker-compose.override.yml) (repo root에서).
@@ -156,7 +185,7 @@ compose override 예시 [`dev/docker-compose.override.yml`](dev/docker-compose.o
 ```bash
 docker build -t pocket-smart-factory/c2-preprocessing:dev services/c2-preprocessing
 docker compose -f docker-compose.yml -f services/c2-preprocessing/dev/docker-compose.override.yml \
-  up -d --no-deps c2-dev-broker fake-infer c2-preprocessing
+  up -d --no-deps c2-dev-broker fake-infer fake-c4 c2-preprocessing
 curl localhost:8001/healthz                                            # mqtt.connected: true
 python services/c2-preprocessing/dev/publish_frames.py --fps 30 --seconds 5
 curl localhost:8001/stats
@@ -198,8 +227,9 @@ docker rm -f mqtt-test-broker && docker network rm c2-test-net
 | `test_phone_frames.py` | 폰 촬영 프레임 5장의 기대 개수와 위치 (원본, 1024 리사이즈, 576/720px 저해상도 입력) |
 | `test_concurrency.py` | 처리 중에도 이벤트 루프 응답, 동시 요청 병렬 처리, EMA 스레드 안전성, 워밍업 |
 | `test_frame_slots.py` | 세션별 최신 1장 보관, `dropped_stale` / `dropped_old`, 이벤트 CSV |
-| `test_mqtt_integration.py` | 실제 mosquitto: 발행 → 수신 → 가짜 `/infer` 도착, 30fps + `/infer` 200ms에서 지연 누적 없음·drop 기록, 오래된/잘못된 메시지, 연결 끊김 후 재접속, 호스트 `localhost:1883` 거부 |
+| `test_mqtt_integration.py` | 실제 mosquitto: 발행 → 수신 → 가짜 `/infer` 도착, 30fps + `/infer` 200ms에서 지연 누적 없음·drop 기록, 오래된/잘못된 메시지, 연결 끊김 후 재접속, 호스트 `localhost:1883` 거부, drop된 프레임은 C4로 가지 않음 |
 | `test_settings_mqtt.py` | MQTT 설정 우선순위 (`C2_MQTT_*` → 공용 `MQTT_*` → 기본값, 빈 값 처리) |
+| `test_c4_frames.py` | C4 본문이 합의된 7개 필드인지, JPEG 크기, C3 요청과 trace_id·prompts·이미지 일치, prompts 0개 전송, 입력 오류 프레임 미전송, C4 지연(2초)·다운에도 C3 처리량·지연 유지, C4 연결 실패 중 이벤트 루프 막힘 없음(sniffio 회귀), URL 빈 값이면 끔 |
 | `test_fake_infer.py` | 가짜 `/infer` 검증 동작, C2 → 가짜 `/infer` 연결 |
 | `test_schema_sync.py` | `schemas/` 사본이 `shared/schemas` 원본과 같은지 |
 
@@ -209,6 +239,7 @@ src/c2/
   app.py       FastAPI 앱, 공통 처리 handle_frame(), /infer 전달(forward_to_infer), MQTT 워커
   mqtt_ingest.py  MQTT 구독·재접속(paho-mqtt), 세션별 최신 1장 보관(FrameSlots)
   events.py    프레임 이벤트 CSV, 누적 카운터
+  c4_frames.py C4로 리사이즈 프레임 전송 (동시 전송 한도, 메인 경로와 분리)
   config.py    환경변수 설정
   pipeline.py  resize → 검출 → processed-frame 생성, 세션별 지름 EMA
   detect.py    검출 로직 (reference에서 이식)
@@ -216,7 +247,7 @@ src/c2/
   schemas.py   jsonschema 검증
 schemas/       shared/schemas 사본 (컨테이너용)
 reference/     검증용 원본 스크립트 (이미지에 포함 안 함)
-dev/           개발 도구: fake_infer.py (가짜 /infer), publish_frames.py (dev 발행기), mosquitto.conf, docker-compose.override.yml
+dev/           개발 도구: fake_infer.py (가짜 /infer), fake_c4.py (가짜 C4), publish_frames.py (dev 발행기), mosquitto.conf, docker-compose.override.yml
 tests/         pytest + fixtures
 PROPOSALS.md   공유 파일(스키마/compose/.env) 변경 제안
 ```
@@ -230,7 +261,9 @@ PROPOSALS.md   공유 파일(스키마/compose/.env) 변경 제안
 - [x] 이미지 전송 방식 확정: frame-envelope `image_b64`(base64 JPEG) (C1 PR #1)
 - [ ] `raw_bgr` / `raw_rgb` 지원 (보내는 쪽이 생기면)
 - [ ] `/cam` 기본 해상도 상향 (PROPOSALS P7)
-- [ ] `scale` / `crop_offset` / `expected_diameter_px` 스키마 반영 후 출력에 추가, ROI crop 도입 (PROPOSALS P1, P2)
+- [x] C4로 리사이즈 프레임 + prompts 전송 (`scale` / `crop_offset` 불필요, PROPOSALS P1)
+- [ ] `expected_diameter_px` 스키마 반영 후 출력에 추가 (PROPOSALS P2)
+- [ ] api-contract에 C2 → C4 구간 반영 (PROPOSALS P8, Member A/D)
 - [x] C1 → C2 MQTT 전환, 세션별 최신 1장 + 나이 기준 drop, 이벤트 CSV (PROPOSALS P3 해결)
 - [ ] MQTT 토픽 구조·인증 C1과 확정 (`psf/v1/frames/+`의 `+` 의미, 운영 브로커 인증)
 - [x] 폰 촬영 프레임 fixture 추가 (`tests/fixtures/phone/`, 5장)
