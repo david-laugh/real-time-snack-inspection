@@ -63,12 +63,18 @@ class Settings(BaseSettings):
     # 프레임별 이벤트 CSV 경로. 비우면 기록 안 함.
     event_log: Optional[str] = None
 
+    # ---- C2 -> C4 리사이즈 프레임 전송 (C4가 C3 결과를 이 이미지 위에 그린다) ----
+    # 빈 값이면 기능 끔. C3 전송과 동시에 보내고 응답을 기다리지 않는다.
+    c4_frame_url: Optional[str] = "http://c4-visualizer:8003/api/camera/frame"
+    c4_max_inflight: int = 2          # C4 동시 전송 한도. 차 있으면 그 프레임은 보내지 않음(c4_skipped)
+    c4_timeout_s: float = 1.0
+
     output_image_format: Literal["jpeg", "png"] = "jpeg"
     jpeg_quality: int = 90
 
     validate_output: bool = True
 
-    @field_validator("expected_diameter_px", "mqtt_client_id", "event_log", "mqtt_host", "mqtt_port", "mqtt_topic",
+    @field_validator("expected_diameter_px", "mqtt_client_id", "event_log", "c4_frame_url", "mqtt_host", "mqtt_port", "mqtt_topic",
                      "shared_mqtt_host", "shared_mqtt_port", "shared_mqtt_topic_prefix", mode="before")
     @classmethod
     def _empty_is_none(cls, v):

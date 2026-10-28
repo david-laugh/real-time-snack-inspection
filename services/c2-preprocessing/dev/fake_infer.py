@@ -32,6 +32,7 @@ def create_app(delay_ms: float = 0.0) -> FastAPI:
     stats = Counter()
     last_frame = {}
     ages = deque(maxlen=200)          # (frame_id, 도착 시점 나이 ms)
+    app.state.trace_ids = deque(maxlen=1000)   # 받은 trace_id (테스트에서 C4로 간 프레임과 비교)
 
     @app.get("/healthz")
     async def healthz():
@@ -61,6 +62,7 @@ def create_app(delay_ms: float = 0.0) -> FastAPI:
         stats["received"] += 1
         last_frame[msg["session_id"]] = msg["frame_id"]
         ages.append((msg["frame_id"], received - msg["captured_at_ms"]))
+        app.state.trace_ids.append(msg["trace_id"])
         hdr = request.headers
         header_ok = (hdr.get("x-trace-id") == msg["trace_id"] and hdr.get("x-frame-id") == str(msg["frame_id"])
                      and hdr.get("x-session-id") == msg["session_id"])
