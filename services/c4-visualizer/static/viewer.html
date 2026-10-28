@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>불량 확인 뷰어 — C4</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #242836;
+  --border: #2e3345;
+  --text: #e8e6e1;
+  --text2: #9a98a0;
+  --accent: #6c5ce7;
+  --pass: #00b894;
+  --fail: #e17055;
+  --info: #74b9ff;
+  --radius: 12px;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; }
+
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 24px; border-bottom: 1px solid var(--border);
+}
+header h1 { font-size: 17px; font-weight: 600; }
+.nav-link {
+  font-size: 13px; color: var(--text2); text-decoration: none;
+  padding: 5px 12px; border-radius: 6px; transition: all .15s;
+}
+.nav-link:hover { color: var(--text); background: var(--surface2); }
+
+.content { max-width: 1200px; margin: 0 auto; padding: 20px 24px; }
+
+.tabs { display: flex; gap: 6px; margin-bottom: 18px; }
+.tab {
+  padding: 7px 16px; border-radius: 8px; font-size: 13px;
+  background: var(--surface); color: var(--text2); border: none; cursor: pointer;
+  transition: all .15s;
+}
+.tab:hover { color: var(--text); }
+.tab.active { background: var(--accent); color: #fff; }
+
+.table-wrap {
+  background: var(--surface); border-radius: var(--radius); overflow: hidden;
+}
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th {
+  text-align: left; padding: 10px 14px; font-weight: 500;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+  color: var(--text2); border-bottom: 1px solid var(--border);
+  background: var(--surface2);
+}
+td { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: var(--surface2); cursor: pointer; }
+tr.selected td { background: rgba(108,92,231,.1); }
+
+.status-badge { font-size: 11px; padding: 3px 8px; border-radius: 5px; font-weight: 600; }
+.sb-pass { background: rgba(0,184,148,.12); color: var(--pass); }
+.sb-fail { background: rgba(225,112,85,.12); color: var(--fail); }
+
+.empty-state { text-align: center; padding: 60px; color: var(--text2); font-size: 14px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>❌ 불량 확인 뷰어</h1>
+  <a href="/" class="nav-link">대시보드로</a>
+</header>
+
+<div class="content">
+  <div class="tabs">
+    <button class="tab active" data-filter="fail" onclick="setFilter('fail')">불량만</button>
+    <button class="tab" data-filter="all" onclick="setFilter('all')">전체</button>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Object ID</th>
+          <th>상태</th>
+          <th>불량 유형</th>
+          <th>Defect Score</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <div id="emptyState" class="empty-state" style="display:none;">데이터 없음</div>
+  </div>
+</div>
+
+<div class="detail-panel" id="detailPanel">
+  <button class="detail-close" onclick="closeDetail()">✕</button>
+  <div class="detail-body" id="detailBody"></div>
+</div>
+
+<script>
+let allData = [];
+let filter = 'fail';
+let selectedIdx = null;
+
+function setFilter(f) {
+  filter = f;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.filter === f));
+  loadData();
+}
+
+async function loadData() {
+  try {
+    const url = filter === 'fail' ? '/api/defects?limit=100' : '/api/inspections?limit=100';
+    const res = await fetch(url);
+    allData = await res.json();
+    render();
+  } catch (e) {}
+}
+
+function render() {
+  const tbody = document.getElementById('tbody');
+  const empty = document.getElementById('emptyState');
+
+  if (allData.length === 0) {
+    tbody.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+
+  tbody.innerHTML = allData.map((d, i) => {
+    const ok = d.status === 'normal';
+    return `<tr class="${i === selectedIdx ? 'selected' : ''}" onclick="showDetail(${i})">
+      <td>${d.item_id}</td>
+      <td><span class="status-badge ${ok ? 'sb-pass' : d.status === 'defect' ? 'sb-fail' : ''}">${ok ? '정상' : d.status === 'defect' ? '불량' : '판정 보류'}</span></td>
+      <td>${d.defect_type || '—'}</td>
+      <td>${d.defect_score != null ? (d.defect_score * 100).toFixed(1) + '%' : '-'}</td>
+    </tr>`;
+  }).join('');
+}
+
+function showDetail(idx) {
+  selectedIdx = idx;
+  render();
+  const d = allData[idx];
+  if (!d) return;
+
+  const ok = d.status === 'normal';
+  document.getElementById('detailBody').innerHTML = `
+    <h2>${d.item_id}</h2>
+
+    <div class="detail-grid">
+      <div class="detail-field">
+        <div class="fl">상태</div>
+        <div class="fv ${ok ? 'pass' : d.status === 'defect' ? 'fail' : ''}">${ok ? '✅ 정상' : d.status === 'defect' ? '❌ 불량' : '◌ 판정 보류'}</div>
+      </div>
+      <div class="detail-field">
+        <div class="fl">Defect Score</div>
+        <div class="fv">${d.defect_score != null ? (d.defect_score * 100).toFixed(1) + '%' : '-'}</div>
+      </div>
+    </div>
+
+    <div class="detail-field"><div class="fl">불량 유형</div><div class="fv">${d.defect_type || '—'}</div></div>
+
+    <div style="font-size:12px; color:var(--text2); margin: 16px 0 8px;">파이프라인 정보</div>
+    <div class="detail-grid">
+      <div class="detail-field">
+        <div class="fl">Trace ID</div>
+        <div class="fv" style="font-size:11px; word-break:break-all;">${d.trace_id || '-'}</div>
+      </div>
+      <div class="detail-field">
+        <div class="fl">Frame</div>
+        <div class="fv">#${d.frame_id != null ? d.frame_id : '-'}</div>
+      </div>
+      <div class="detail-field">
+        <div class="fl">Inference Latency</div>
+        <div class="fv">${d.inference_latency_ms ? d.inference_latency_ms + ' ms' : '-'}</div>
+      </div>
+      <div class="detail-field wide">
+        <div class="fl">Container</div>
+        <div class="fv" style="font-size:11px;">${d.container_id || '-'}</div>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('detailPanel').classList.add('open');
+}
+
+function closeDetail() {
+  document.getElementById('detailPanel').classList.remove('open');
+  selectedIdx = null;
+  render();
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeDetail();
+});
+
+loadData();
+</script>
+</body>
+</html>
