@@ -65,11 +65,30 @@ def frames():
             make_envelope(blank, frame_id=2, fmt="jpeg")]
 
 
+def test_fake_c4_rejects_wrong_fields_and_timestamps():
+    """가짜 C4의 검증 자체가 동작하는지 (필드 누락·추가, 시각 타입·순서)."""
+    img, _ = load_fixture()
+    ok, buf = cv2.imencode(".jpg", img)
+    good = {"trace_id": "t", "session_id": "s", "frame_id": 0, "gateway_received_at_ms": 100,
+            "preprocess_started_at_ms": 110, "preprocess_finished_at_ms": 120, "width": img.shape[1],
+            "height": img.shape[0], "prompts": [], "image_b64": base64.b64encode(buf.tobytes()).decode()}
+    assert check_frame(good) == []
+    assert check_frame({k: v for k, v in good.items() if k != "gateway_received_at_ms"})
+    assert check_frame({**good, "extra": 1})
+    assert check_frame({**good, "preprocess_started_at_ms": "110"})
+    assert check_frame({**good, "preprocess_finished_at_ms": 105})
+    assert check_frame({**good, "gateway_received_at_ms": 115}) == []   # C1/C2 시계 차이는 허용
+
+
 def test_c4_body_matches_agreed_format_and_c3_request():
     fake_c4 = create_fake_c4()
+    sent_envelopes = frames()
+    for i, e in enumerate(sent_envelopes):
+        e["gateway_received_at_ms"] += i * 7          # 프레임마다 다른 값이 그대로 전달되는지 확인
+    envelopes = {e["trace_id"]: e for e in sent_envelopes}
 
     async def scenario(client):
-        for e in frames():
+        for e in sent_envelopes:
             r = await client.post("/preprocess", json=e)
             assert r.status_code == 200, r.text
 
@@ -80,14 +99,18 @@ def test_c4_body_matches_agreed_format_and_c3_request():
 
     for sent in c3.bodies:
         body = c4_frames[sent["trace_id"]]
-        assert set(body) == set(C4_FIELDS)                      # 합의된 7개 필드만
+        assert set(body) == set(C4_FIELDS) and len(C4_FIELDS) == 10   # 합의된 10개 필드만
         assert check_frame(body) == []                          # JPEG 디코딩, 크기 = width x height
         raw = base64.b64decode(body["image_b64"])
         img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
         assert (img.shape[1], img.shape[0]) == (body["width"], body["height"])
         # 같은 프레임의 C3 요청과 같은 값, 이미지는 같은 JPEG(다시 인코딩하지 않음)
-        for k in ("trace_id", "session_id", "frame_id", "width", "height", "prompts"):
+        for k in ("trace_id", "session_id", "frame_id", "preprocess_started_at_ms", "preprocess_finished_at_ms",
+                  "width", "height", "prompts"):
             assert body[k] == sent[k], k
+        # gateway_received_at_ms는 processed-frame에 없으므로 입력 frame-envelope 값과 비교
+        assert body["gateway_received_at_ms"] == envelopes[body["trace_id"]]["gateway_received_at_ms"]
+        assert body["gateway_received_at_ms"] <= body["preprocess_started_at_ms"] <= body["preprocess_finished_at_ms"]
         assert body["image_b64"] == sent["image_b64"]
     assert [len(c4_frames[f"trace-{i:06d}"]["prompts"]) for i in range(3)] == [15, 15, 0]   # 0개도 보냄
 
