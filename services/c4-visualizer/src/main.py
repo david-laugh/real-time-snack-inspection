@@ -1,6 +1,10 @@
 """
-C4 Visualizer — 과자 크랙 검사 대시보드 + 모니터링
+C4 Visualizer — 과자 불량 검사 대시보드 + 파이프라인 모니터링
 Port 8003 | POST /results (C3 → C4) | POST /api/camera/frame (C2 → C4) | WS /ws/dashboard | GET / (UI)
+
+C4는 표시만 한다. 판정은 C3 결과(status/defect_type/defect_score)를, 지연은 C3의 latency_breakdown_ms와
+C2 camera_frame 시각을, drop은 C1 /api/metrics와 C2 /stats 카운터를 그대로 쓴다.
+쿠키 집계는 C3 판정을 프레임 간에 추적해 검사선 통과 시 1회 세는 것뿐이다(src/tracker.py, 다수결).
 """
 
 import asyncio
@@ -125,6 +129,7 @@ async def receive_result(result: DetectionResult):
             session_id=result.session_id,
             defect_type=det.defect_type,
             defect_score=det.defect_score,
+            bbox=det.bbox,
             inference_latency_ms=result.inference_latency_ms,
             container_id=result.inference_container_id,
         )

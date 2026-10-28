@@ -147,7 +147,9 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((stats['pass_count'], stats['fail_count'], stats['unknown_count']), (1,1,1))
         rows = main.store.get_recent()
         self.assertEqual({r['status'] for r in rows}, {'normal','defect','unknown'})
-        self.assertTrue(all(r['circularity'] is None for r in rows))
+        self.assertTrue(all('circularity' not in r for r in rows))  # C4 never re-judges
+        self.assertEqual(rows[0]['bbox'], [0, 0, 10, 10])
+        self.assertNotIn('circularity', main.store.export_detections_csv().splitlines()[0])
         self.assertEqual(main.store.get_defects()[0]['defect_type'], 'broken')
         self.assertIn('broken', main.store.export_detections_csv())
         event = next(c.args[0] for c in send.call_args_list if c.args[0]['type']=='frame_result')

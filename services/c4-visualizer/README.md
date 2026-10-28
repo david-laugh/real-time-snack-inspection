@@ -2,6 +2,8 @@
 
 C2의 리사이즈 이미지와 C3의 검사 결과를 매칭해 실시간 표시하는 FastAPI 대시보드입니다. 기본 포트는 8003입니다.
 
+**C4는 표시만 합니다.** 판정(정상/불량/판정 보류)은 C3 결과를, 구간 지연은 C3 `latency_breakdown_ms`와 C2 이미지 시각을, 손실은 C1 `/api/metrics`·C2 `/stats` 카운터를 그대로 사용합니다. C4가 bbox 등으로 다시 판정하거나 값을 추정해 채우지 않습니다.
+
 ## 통신 구조
 
 ```text
@@ -26,6 +28,17 @@ docker compose up -d --no-deps --build c4-visualizer
 
 브라우저: `http://localhost:8003/`, 상세 뷰어: `/viewer`.
 소스 변경 후에는 위 명령으로 이미지를 재빌드하고 브라우저를 새로고침합니다.
+
+**전체 체인 (C1 → MQTT → C2 → Nginx → C3 ×2 → C4)** — repo root, GPU 필요. C2 실행·C3 포트 공개는 C3 테스트 override(`services/c3-inference/dev/chain.override.yml`)가 맡고, C3 결과 수신처만 환경변수로 C4 컨테이너를 가리킵니다:
+
+```bash
+export C3_RESULTS_URL=http://c4-visualizer:8003/results MQTT_HOST_PORT=11884
+F="-f docker-compose.yml -f services/c3-inference/compose.gpu.yml -f services/c3-inference/dev/chain.override.yml"
+docker compose $F up -d --build c4-visualizer
+C2_MAX_INFLIGHT=3 docker compose $F up -d --build mqtt-broker c3-inference-1 c3-inference-2 nginx-inference-lb c2-preprocessing c1-gateway
+# 부하: 폰 /cam 접속, 또는 C1 loadgen
+docker compose $F exec c1-gateway python src/c1_gateway.py loadgen --source /frames --fps 30 --duration 30 --width 960
+```
 
 이 폴더의 `.env.example`에서 필요한 값을 **프로젝트 루트 `.env`**에 추가합니다. 루트 Compose가 값을 주입하므로 C4 별도 Compose 수정은 필요 없습니다. 기존 `.env`를 덮어쓰지 마세요. 로컬 Python 실행 시에는 셸 환경변수를 설정해야 하며 예시 파일은 자동 로드하지 않습니다.
 
@@ -76,11 +89,37 @@ docker compose up -d --no-deps --build c4-visualizer
 | `defect` | 불량 / `fail_count` |
 | `unknown` | 판정 보류 / `unknown_count` (정상·불량에 포함하지 않음) |
 
-`defect_type`(예: `broken`)과 `defect_score`도 검사 피드, 상세 뷰어, CSV에 반영됩니다. `object_id`는 프레임 안에서만 유일하므로 세션·trace·프레임과 함께 해석해야 합니다. 기존 API/CSV 호환용 `circularity`, `area`, `perimeter`는 null이며, 화면은 불량 점수를 표시합니다.
+`defect_type`(예: `broken`)과 `defect_score`도 검사 피드, 상세 뷰어, CSV에 반영됩니다. `object_id`는 프레임 안에서만 유일하므로 세션·trace·프레임과 함께 해석해야 합니다. 과거 재판정용 필드(`circularity`, `area`, `perimeter`)는 API·CSV에서 제거했고, 대신 C3가 보낸 `bbox`를 그대로 기록합니다. 불량 점수 분포 차트의 점선은 C3 기준(`defect_score > 0.5` ⇔ 불량)입니다.
 
 ## 화면과 프레임 매칭
 
-성능 카드는 **Frame Drop / Latency 두 개**만 표시합니다. 세부 지표는 API 및 카드 툴팁으로 확인합니다.
+### 파이프라인 패널
+
+상단 통계 카드(총 검사·양품·불량·판정 보류·불량률) 아래에 **컨테이너를 박스로, 구간을 화살표로** 표시합니다.
+
+```text
+[📱 카메라] →업로드→ [C1 Gateway] →MQTT·C2 대기→ [C2 Preprocess] →HTTP·Nginx→ [C3 Inference ×N] →HTTP push→ [C4]
+```
+
+| 위치 | 표시 값 | 출처 |
+|---|---|---|
+| 카메라 | 세션 수 | C1 `/api/metrics` `sessions` |
+| C1 | 입력 fps, 수신, C1 드롭 | C1 `input_fps`, `counters.received/dropped` |
+| 화살표 업로드 | P50 (P95) | `gateway_received_at_ms − captured_at_ms` (C2 이미지 + C3 결과 trace 매칭) |
+| 화살표 C1→C2 | P50 (P95), **밀려서 버림** 누적·최근 비율 | `preprocess_started − gateway_received`; C2 `dropped_stale+old`, `drop_window.c2_drop_pct`. 이미지 시각이 없으면 `capture_to_preprocess`(촬영→C2 합계)로 표시 |
+| C2 | 전처리 P50, C3 전달 성공, 처리 중/최대 | C3 `latency_breakdown_ms.preprocess`; C2 `forwarded`, `inflight/max_inflight` |
+| 화살표 C2→C3 | P50 (P95), **실패(오류+timeout)** 누적·최근 비율 | C3 `c2_to_c3`; C2 `error+timeout`, `drop_window.c2_error_pct` |
+| C3 | 대기·추론 P50/P95, replica별 처리 프레임·`c3_total` P50 | C3 `c3_queue`, `c3_service`, 결과의 `inference_container_id` |
+| 화살표 C3→C4 | P50 (P95), **결과 미도착(추정)** | C4 수신 − `inference_finished_at_ms`; `drop_window.result_gap_estimate` |
+| C4 | 결과 프레임 수, 수신 fps, C2→C4 이미지 전송 실패 | C4 집계; C2 `c4_error+c4_skipped` |
+
+- 하단 막대: 구간별 P50을 순서대로 쌓아 **어느 구간이 지연을 차지하는지** 보여 줍니다. 범례 끝에 구간 합과 실측 E2E(촬영→C4 수신) P50/P95를 함께 표시합니다.
+- 박스의 점: 녹색 = 해당 출처에서 데이터를 받는 중, 회색·점선 = 미수신(카운터 조회 실패 또는 결과 없음).
+- 값이 없으면 `—`로 표시합니다. 0으로 채우지 않습니다. 손실이 0보다 크면 빨간색입니다.
+
+### 성능 카드와 카메라
+
+성능 카드는 **Frame Drop / Latency 두 개**입니다. 세부 구간은 위 파이프라인 패널에서 확인합니다.
 
 - 이미지와 결과는 `(session_id, trace_id, frame_id)`로 매칭합니다. 어느 쪽이 먼저 와도 처리합니다.
 - 브라우저 버퍼는 **최근 2초**입니다(안전 상한 300개). 2초 안에 짝이 오지 않으면 버립니다. 이미지가 없는 결과는 검사 피드·통계에는 반영하고, 카메라는 이전 매칭 화면을 유지합니다.
@@ -119,7 +158,7 @@ C3 `object_id`는 프레임 안에서만 유일하므로 같은 쿠키가 프레
 
 ### 드롭
 
-Frame Drop 카드의 큰 값은 **C2 기동 이후 dropped_stale + dropped_old 누적 수**입니다.
+Frame Drop 카드의 큰 값은 **C1 dropped + C2 dropped_stale + dropped_old 누적 수**(각 서비스 기동 이후)이며, 카드 아래에 C1·C2 각각의 값을 표시합니다.
 
 C1 `/api/metrics`와 C2 `/stats`를 1초마다 읽습니다. C1의 `counters.received/dropped`, C2의 `events.forwarded/skipped_empty/error/timeout`을 씁니다. 카드 아래 줄에 구간 drop률(C1·C2·전체 유실 추정)과 **C2 처리량 = forwarded + skipped_empty**(fps)를 표시합니다. C1 조회가 꺼져 있으면 구간 지표는 `수집 중`으로 남습니다. `received_frames`는 detection 개수가 아닌 결과 프레임 수이며 최근 5,000개 `(session_id, trace_id, frame_id)` 키 내 중복을 제외합니다.
 
@@ -142,12 +181,12 @@ C1 `/api/metrics`와 C2 `/stats`를 1초마다 읽습니다. C1의 `counters.rec
 |---|---|
 | `GET /healthz` | C4 자체 생존 확인 (upstream 연결 보장 아님) |
 | `GET /api/connections` | C1/C2 조회 활성·성공 여부, 마지막 이미지/결과 수신 시각, WS 접속 수 |
-| `GET /api/stats` | 객체 판정 수, 결과 프레임 FPS, 지연, C1/C2 카운터, 구간 유실 추정 |
+| `GET /api/stats` | 쿠키 판정 수(`detections`에 검출 단위 수), 결과 프레임 FPS, 지연, C1/C2 카운터(C1 `input_fps`·`sessions`, C2 `inflight`·`c4_*`·`skipped_empty` 포함), 구간 유실 추정, `c3_replicas`(replica별 프레임 수·지연), `tracking`(검사선 설정) |
 | `GET /api/inspections?limit=50` | 최근 검출 목록 (프레임별) |
 | `GET /api/defects?limit=50` | C3 status=defect 검출 목록 |
 | `GET /api/cookies?limit=50` | 검사선 통과로 집계된 쿠키 목록 (투표 수, 통과 frame_id 포함) |
 | `GET /api/export/csv` | **쿠키 CSV**: 쿠키 1개당 1행 (`inspection-cookies.csv`) |
-| `GET /api/export/detections.csv` | 검출 CSV: 프레임별 검출 1건당 1행 (이전 `/api/export/csv` 형식) |
+| `GET /api/export/detections.csv` | 검출 CSV: 프레임별 검출 1건당 1행 (C3 bbox 포함, circularity 등 재판정 필드 없음) |
 | `GET/POST /api/scan-line` | 검사선 조회 / 변경 `{"ratio": 0.34}` (0<ratio<1, 위반 시 422) |
 | `WS /ws/dashboard` | `stats`, `camera_frame`, `inspection_result`, `frame_result`, `cookie_counted`, `scan_line` |
 

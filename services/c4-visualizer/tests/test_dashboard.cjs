@@ -32,7 +32,7 @@ function dashboard() {
   vm.createContext(sandbox);
   const html = fs.readFileSync(path.join(__dirname, '../static/index.html'), 'utf8');
   const script = html.match(/<script>([\s\S]*?)<\/script>/)[1]
-    .replace(/renderCircChart\(\);\s*loadInitial\(\);\s*connect\(\);\s*$/, '');
+    .replace(/renderScoreChart\(\);\s*loadInitial\(\);\s*connect\(\);\s*$/, '');
   vm.runInContext(script, sandbox);
   return {run: code => vm.runInContext(code, sandbox), images, sandbox};
 }
@@ -201,4 +201,34 @@ test('per-frame latency and drop rates are shown', () => {
     drop_window:{seconds:5,c1_drop_pct:1.5,c2_drop_pct:20,overall_loss_pct_estimate:0,c2_processed_per_s:9.6}});`);
   assert.equal(d.run("id('pDropRates').textContent"), 'C1 1.5% · C2 20% · 전체 유실 0% (추정)');
   assert.equal(d.run("id('pC2Rate').textContent"), 'C2 처리 9.6 fps');
+});
+
+test('pipeline view shows each stage from C1/C2/C3 data without re-judging', () => {
+  const d = dashboard();
+  d.run(`updateStats({total:6,pass_count:4,fail_count:1,unknown_count:1,defect_rate:16.7,fps:30,received_frames:900,
+    c1_metrics:{received:910,dropped:0,input_fps:30,sessions:1},
+    c2_metrics:{dropped_stale:3,dropped_old:0,forwarded:900,error:1,timeout:0,inflight:1,max_inflight:3,c4_error:0,c4_skipped:0},
+    drop_window:{seconds:6,c2_drop_pct:0.3,c2_error_pct:0.1,result_gap_estimate:0},
+    c3_replicas:{'c3-inference-1':{frames:450,c3_total_p50_ms:43},'c3-inference-2':{frames:450,c3_total_p50_ms:44}},
+    latency:{upload:{p50_ms:50,p95_ms:60,samples:9},c1_c2:{p50_ms:3,p95_ms:4,samples:9},preprocess:{p50_ms:6,p95_ms:7,samples:9},
+      c2_c3:{p50_ms:2,p95_ms:3,samples:9},c3_queue:{p50_ms:0,p95_ms:0,samples:9},c3_service:{p50_ms:43,p95_ms:70,samples:9},
+      c3_c4:{p50_ms:2.5,p95_ms:3.5,samples:9},e2e:{p50_ms:110,p95_ms:140,samples:9}}});`);
+  const flow = d.run("id('pipeFlow').innerHTML");
+  for (const text of ['C1 Gateway', 'C2 Preprocess', 'C3 Inference ×2', 'C4 Visualizer', 'c3-inference-2', '밀려서 버림 3 · 0.3%', '실패(오류+timeout) 1 · 0.1%']) {
+    assert.ok(flow.includes(text), text);
+  }
+  assert.equal(d.run("id('sUnknown').textContent"), '1');
+  assert.match(d.run("id('pipeLegend').innerHTML"), /C3 추론 <b>43<\/b>/);
+  // no prompts/missing counters -> placeholders, not zeros
+  d.run(`updateStats({total:0,pass_count:0,fail_count:0,defect_rate:0,fps:0});`);
+  assert.match(d.run("id('pipeFlow').innerHTML"), /실패\(오류\+timeout\) —/);
+});
+
+test('pipeline C2 node shows prompt-less frames as handled, not lost', () => {
+  const d = dashboard();
+  d.run(`updateStats({total:0,pass_count:0,fail_count:0,defect_rate:0,fps:0,
+    c2_metrics:{dropped_stale:0,dropped_old:0,forwarded:60,skipped_empty:40,error:0,timeout:0}});`);
+  assert.match(d.run("id('pipeFlow').innerHTML"), /빈 프레임\(C3 생략\)<\/span><b class="">40<\/b>/);
+  d.run(`updateStats({total:0,pass_count:0,fail_count:0,defect_rate:0,fps:0});`);
+  assert.match(d.run("id('pipeFlow').innerHTML"), /빈 프레임\(C3 생략\)<\/span><b class="">—<\/b>/);
 });
