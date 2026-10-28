@@ -14,7 +14,7 @@
 |---|---|---|
 | C1 → C2 | **MQTT** 구독 `{MQTT_TOPIC_PREFIX}/frames/+` = `psf/v1/frames/+` (QoS 0, 브로커 `mqtt-broker:1883`). C1은 `{prefix}/frames/{session_id}`로 발행 | [`frame-envelope`](../../shared/schemas/frame-envelope.schema.json) JSON (`image_b64` JPEG) |
 | C2 → Nginx | HTTP `POST http://nginx-inference-lb:8080/infer` | [`processed-frame`](../../shared/schemas/processed-frame.schema.json) JSON |
-| C2 → C4 | HTTP `POST http://c4-visualizer:8003/api/camera/frame` (C3 전송과 동시, best-effort) | `{trace_id, session_id, frame_id, width, height, prompts, image_b64}` |
+| C2 → C4 | HTTP `POST http://c4-visualizer:8003/api/camera/frame` (C3 전송과 동시, best-effort) | `{trace_id, session_id, frame_id, gateway_received_at_ms, preprocess_started_at_ms, preprocess_finished_at_ms, width, height, prompts, image_b64}` (10개 필드) |
 | (디버깅) → C2 | HTTP `POST /preprocess` | frame-envelope JSON. MQTT와 같은 처리 함수를 쓰며 `/infer` 결과까지 기다린다 |
 | — | `GET /healthz` | `{"status": "ok" \| "degraded", "mqtt": {"connected": …}}` |
 | — | `GET /stats` | 이벤트 누적 수, MQTT 수신 수, 처리 중(`inflight`)·대기(`pending_sessions`) 수, `c4_sent` / `c4_skipped` / `c4_error` |
@@ -52,12 +52,18 @@ C4와 합의한 인터페이스다. C4는 `trace_id`로 이 이미지와 C3 결�
 POST http://c4-visualizer:8003/api/camera/frame
 Content-Type: application/json
 X-Trace-Id / X-Frame-Id / X-Session-Id
-{"trace_id": "…", "session_id": "…", "frame_id": 297, "width": 576, "height": 1024,
+{"trace_id": "…", "session_id": "…", "frame_id": 297,
+ "gateway_received_at_ms": 1793157016122, "preprocess_started_at_ms": 1793157016131,
+ "preprocess_finished_at_ms": 1793157016145, "width": 576, "height": 1024,
  "prompts": [{"candidate_id": "c0", "type": "box", "bbox": [429.0, 591.0, 525.0, 681.0]}, …],
  "image_b64": "/9j/4AAQ…"}
 ```
-- 본문은 정확히 이 7개 필드다. `width` / `height` / `prompts` / `image_b64`는 C3로 보내는 processed-frame과 같은 값이고,
-  이미지는 **같은 JPEG 문자열을 재사용**한다(다시 인코딩하지 않는다).
+- 본문은 정확히 이 **10개 필드**다.
+  - `gateway_received_at_ms`: 입력 frame-envelope의 값(C1 수신 시각, C1 시계)을 그대로 전달
+  - `preprocess_started_at_ms` / `preprocess_finished_at_ms`, `width` / `height` / `prompts` / `image_b64`: C3로 보내는
+    processed-frame과 같은 값. 이미지는 **같은 JPEG 문자열을 재사용**한다(다시 인코딩하지 않는다)
+  - C4는 이 시각들로 C1·C2 구간 지연을 C3 결과 없이도 계산할 수 있다. `gateway_received_at_ms`는 C1 시계,
+    `preprocess_*`는 C2 시계라서 서로 다른 호스트에서 돌면 시계 차이만큼 오차가 생긴다
 - C3로 보내는 프레임만 보낸다. `dropped_stale` / `dropped_old`, 입력 오류 프레임은 보내지 않는다. `prompts`가 0개여도 보낸다(영상이 멈춰 보이지 않게).
 - C3 전송과 **동시에** 보내고 응답을 기다리지 않는다. 그래서 대개 이미지가 C3 결과보다 먼저 C4에 도착한다(순서 보장은 아님).
 - 메인 경로(C3 전송)와 분리돼 있다. 별도 HTTP 클라이언트를 쓰고, 동시 전송 한도 `C2_C4_MAX_INFLIGHT`(2)가 차 있으면 그 프레임은
@@ -176,7 +182,7 @@ C2는 공용 변수를 그대로 읽으므로 c2 블록에서는 **`command` 제
 ### 로컬 통합 테스트: 발행 → MQTT → C2 → 가짜 `/infer`
 - `dev/fake_infer.py`: Nginx/C3 대역. processed-frame을 스키마로 검증하고 로그만 남긴다. 통과하면 200, 위반이면 422로 응답한다.
   `--delay-ms`로 C3 추론 시간을 흉내 낼 수 있고, `GET /stats`는 받은 수와 도착 시점 프레임 나이(`now - captured_at_ms`)를 보여준다.
-- `dev/fake_c4.py`: C4 대역(`POST /api/camera/frame`, 기본 포트 8003). 합의된 7개 필드인지, JPEG 크기가 width/height와 같은지 검증한다(`--delay-ms` 지원).
+- `dev/fake_c4.py`: C4 대역(`POST /api/camera/frame`, 기본 포트 8003). 합의된 10개 필드인지, 시각 필드가 정수이고 `preprocess_started ≤ preprocess_finished`인지, JPEG 크기가 width/height와 같은지 검증한다(`--delay-ms` 지원).
   C2에 `C2_C4_FRAME_URL=http://localhost:8003/api/camera/frame`을 주면 C4 전송까지 확인할 수 있다.
 - `dev/publish_frames.py`: C1 대역 발행기. 기본 `localhost:11883`이며, **호스트의 `localhost:1883`에는 발행을 거부한다.**
 
@@ -229,7 +235,7 @@ docker rm -f mqtt-test-broker && docker network rm c2-test-net
 | `test_frame_slots.py` | 세션별 최신 1장 보관, `dropped_stale` / `dropped_old`, 이벤트 CSV |
 | `test_mqtt_integration.py` | 실제 mosquitto: 발행 → 수신 → 가짜 `/infer` 도착, 30fps + `/infer` 200ms에서 지연 누적 없음·drop 기록, 오래된/잘못된 메시지, 연결 끊김 후 재접속, 호스트 `localhost:1883` 거부, drop된 프레임은 C4로 가지 않음 |
 | `test_settings_mqtt.py` | MQTT 설정 우선순위 (`C2_MQTT_*` → 공용 `MQTT_*` → 기본값, 빈 값 처리) |
-| `test_c4_frames.py` | C4 본문이 합의된 7개 필드인지, JPEG 크기, C3 요청과 trace_id·prompts·이미지 일치, prompts 0개 전송, 입력 오류 프레임 미전송, C4 지연(2초)·다운에도 C3 처리량·지연 유지, C4 연결 실패 중 이벤트 루프 막힘 없음(sniffio 회귀), URL 빈 값이면 끔 |
+| `test_c4_frames.py` | C4 본문이 합의된 10개 필드인지, JPEG 크기, C3 요청과 trace_id·preprocess 시각·prompts·이미지 일치, `gateway_received_at_ms`가 입력 envelope 값과 같은지, 가짜 C4 검증 동작, prompts 0개 전송, 입력 오류 프레임 미전송, C4 지연(2초)·다운에도 C3 처리량·지연 유지, C4 연결 실패 중 이벤트 루프 막힘 없음(sniffio 회귀), URL 빈 값이면 끔 |
 | `test_fake_infer.py` | 가짜 `/infer` 검증 동작, C2 → 가짜 `/infer` 연결 |
 | `test_schema_sync.py` | `schemas/` 사본이 `shared/schemas` 원본과 같은지 |
 
