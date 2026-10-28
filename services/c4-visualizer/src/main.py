@@ -50,11 +50,6 @@ async def receive_result(result: DetectionResult):
     now_ms = int(time.time() * 1000)
     e2e = now_ms - result.captured_at_ms
 
-    if store._last_frame_id >= 0 and result.frame_id > store._last_frame_id + 1:
-        dropped = result.frame_id - store._last_frame_id - 1
-        logger.warning("frame drop detected: %d frames missing (frame %d → %d)",
-                       dropped, store._last_frame_id, result.frame_id)
-
     for det in result.detections:
         bbox = det.bbox
         w = abs(bbox[2] - bbox[0])

@@ -33,10 +33,7 @@ class InspectionStore:
         self._total = 0
         self._fail_count = 0
         self._latency_buf: deque[float] = deque(maxlen=200)
-        self._inference_latency_buf: deque[float] = deque(maxlen=200)
         self._fps_timestamps: deque[float] = deque(maxlen=60)
-        self._last_frame_id: int = -1
-        self._frame_drop_count: int = 0
 
     def add(self, rec: InspectionRecord):
         rec.timestamp = time.time()
@@ -45,14 +42,7 @@ class InspectionStore:
         if rec.status == "fail":
             self._fail_count += 1
         self._latency_buf.append(rec.e2e_latency_ms)
-        if rec.inference_latency_ms > 0:
-            self._inference_latency_buf.append(rec.inference_latency_ms)
         self._fps_timestamps.append(rec.timestamp)
-
-        if self._last_frame_id >= 0 and rec.frame_id > self._last_frame_id + 1:
-            self._frame_drop_count += rec.frame_id - self._last_frame_id - 1
-        if rec.frame_id > self._last_frame_id:
-            self._last_frame_id = rec.frame_id
 
     def get_recent(self, limit: int = 50) -> list[dict]:
         out = []
@@ -106,19 +96,10 @@ class InspectionStore:
         pass_count = self._total - self._fail_count
         defect_rate = round(self._fail_count / self._total * 100, 1) if self._total > 0 else 0.0
 
-        # E2E latency percentiles
+        # latency percentiles
         sorted_lat = sorted(self._latency_buf) if self._latency_buf else [0]
         p50 = sorted_lat[len(sorted_lat) // 2]
         p95 = sorted_lat[min(len(sorted_lat) - 1, int(len(sorted_lat) * 0.95))]
-
-        # Inference (C3) latency percentiles
-        sorted_inf = sorted(self._inference_latency_buf) if self._inference_latency_buf else [0]
-        inf_p50 = sorted_inf[len(sorted_inf) // 2]
-        inf_p95 = sorted_inf[min(len(sorted_inf) - 1, int(len(sorted_inf) * 0.95))]
-
-        # Network latency (E2E - inference)
-        net_p50 = max(0, p50 - inf_p50)
-        net_p95 = max(0, p95 - inf_p95)
 
         # processed FPS (from last 5 seconds)
         now = time.time()
@@ -133,10 +114,4 @@ class InspectionStore:
             "fps": round(fps, 1),
             "latency_p50_ms": round(p50, 1),
             "latency_p95_ms": round(p95, 1),
-            "inference_p50_ms": round(inf_p50, 1),
-            "inference_p95_ms": round(inf_p95, 1),
-            "network_p50_ms": round(net_p50, 1),
-            "network_p95_ms": round(net_p95, 1),
-            "frame_drop_count": self._frame_drop_count,
-            "last_frame_id": self._last_frame_id,
         }

@@ -49,7 +49,7 @@ header h1 span { color: var(--accent); }
 
 .stats-row {
   grid-column: 1 / -1;
-  display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
 }
 .stat-card {
   background: var(--surface); border-radius: var(--radius);
@@ -63,7 +63,7 @@ header h1 span { color: var(--accent); }
 
 .perf-row {
   grid-column: 1 / -1;
-  display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
 }
 .perf-card {
   background: var(--surface); border-radius: var(--radius);
@@ -190,10 +190,6 @@ header h1 span { color: var(--accent); }
       <div class="label">불량률</div>
       <div class="value" id="sRate">0%</div>
     </div>
-    <div class="stat-card">
-      <div class="label">Frame Drop</div>
-      <div class="value info" id="sDrop">0</div>
-    </div>
   </div>
 
   <div class="perf-row">
@@ -203,19 +199,14 @@ header h1 span { color: var(--accent); }
       <div class="unit">frames/sec</div>
     </div>
     <div class="perf-card">
-      <div class="label">E2E P50 / P95</div>
+      <div class="label">Latency P50</div>
       <div class="value" id="pP50">0</div>
-      <div class="unit">/ <span id="pP95">0</span> ms</div>
+      <div class="unit">ms (E2E)</div>
     </div>
     <div class="perf-card">
-      <div class="label">Inference P50 / P95</div>
-      <div class="value" id="pInfP50">0</div>
-      <div class="unit">/ <span id="pInfP95">0</span> ms (C3)</div>
-    </div>
-    <div class="perf-card">
-      <div class="label">Network P50 / P95</div>
-      <div class="value" id="pNetP50">0</div>
-      <div class="unit">/ <span id="pNetP95">0</span> ms (C1→C4)</div>
+      <div class="label">Latency P95</div>
+      <div class="value" id="pP95">0</div>
+      <div class="unit">ms (E2E)</div>
     </div>
   </div>
 
@@ -314,16 +305,6 @@ function updateStats(s) {
   id('pFps').textContent = s.fps || '0';
   id('pP50').textContent = s.latency_p50_ms || '0';
   id('pP95').textContent = s.latency_p95_ms || '0';
-  id('pInfP50').textContent = s.inference_p50_ms || '0';
-  id('pInfP95').textContent = s.inference_p95_ms || '0';
-  id('pNetP50').textContent = s.network_p50_ms || '0';
-  id('pNetP95').textContent = s.network_p95_ms || '0';
-
-  // frame drop
-  const dropEl = id('sDrop');
-  const drops = s.frame_drop_count || 0;
-  dropEl.textContent = drops;
-  dropEl.className = 'value ' + (drops > 0 ? 'fail' : 'pass');
 
   const passRate = s.total > 0 ? (s.pass_count / s.total) : 1;
   const C = 327;

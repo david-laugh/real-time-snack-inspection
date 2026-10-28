@@ -9,7 +9,7 @@ C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라�
 **역할:**
 - Detection 결과 실시간 표시 (WebSocket push)
 - 영상 위에 bbox / 불량 마킹 overlay (canvas 기반)
-- 모니터링: Processed FPS, latency (E2E / Inference / Network, P50/P95), defect count, frame drop
+- 모니터링: Processed FPS, E2E latency (P50/P95), defect count
 - End-to-End latency 계산 지점 (`now - captured_at_ms`)
 
 ---
@@ -29,8 +29,6 @@ C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라�
 
 | 기능 | 설명 | 관련 파일 |
 |------|------|-----------|
-| **구간별 Latency 모니터링** | E2E뿐 아니라 Inference(C3), Network(C1→C4) 구간을 분리해 P50/P95 표시 | `store.py`, `index.html` |
-| **Frame Drop 감지** | `frame_id` 갭을 실시간 감지, 대시보드 카드에 누적 drop 수 표시 + 서버 WARNING 로그 | `store.py`, `main.py`, `index.html` |
 | **불량 확인 뷰어** (`/viewer`) | 불량 항목 테이블 + 행 클릭 시 슬라이드인 상세 패널 (원형도 게이지, 파이프라인 정보) | `viewer.html` |
 | **REST API 확장** | `/api/stats`, `/api/inspections`, `/api/defects`, `/api/export/csv` 4개 엔드포인트 추가 | `main.py` |
 | **양품률 도넛 차트** | SVG 기반 실시간 양품/불량 비율 도넛 차트 | `index.html` |
@@ -45,7 +43,7 @@ C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라�
    > 현재는 `camera_frame` WebSocket 이벤트로 base64 이미지를 수신하면 표시하는 구조까지 준비되어 있음.
 2. **C3 replica 결과 순서 문제** — C3가 여러 대일 때 결과가 `frame_id` 순서와 다르게 도착할 수 있음.
    → `frame_id` 기준 재정렬 또는 late frame drop 정책 필요.
-   > 현재는 순서 무관하게 도착 순으로 처리하되, frame drop 카운터로 갭을 모니터링.
+   > 현재는 순서 무관하게 도착 순으로 처리.
 
 ---
 
@@ -79,38 +77,19 @@ Circularity = 4π × area / perimeter²
 ### 2. Latency 계산 구조
 
 ```
-시점            C1 캡처  ─── 네트워크 ───  C3 추론 시작  ── 추론 ──  C3 추론 종료  ─── 네트워크 ───  C4 수신
-타임스탬프      captured_at_ms            inference_started_at_ms   inference_finished_at_ms       now (C4)
-                │                                                                                    │
-                └────────────────────── E2E Latency = now - captured_at_ms ──────────────────────────┘
-                                          │                          │
-                                          └─ Inference Latency (C3) ─┘
-                │                                                                                    │
-                └── Network Latency ≈ E2E - Inference (C1→C2→C3 + C3→C4 전송 포함) ────────────────┘
+시점            C1 캡처  ──────────────────────────────────────────────────────  C4 수신
+타임스탬프      captured_at_ms                                                  now (C4)
+                │                                                                │
+                └────────────── E2E Latency = now - captured_at_ms ─────────────┘
 ```
 
 | 지표 | 산출 방법 | 설명 |
 |------|-----------|------|
 | **E2E Latency** | `현재시각(ms) - captured_at_ms` | 카메라 캡처 → C4 수신 전체 |
-| **Inference Latency** | `inference_latency_ms` (C3이 측정) | C3 모델 추론 시간만 |
-| **Network Latency** | `E2E - Inference` (근사) | 파이프라인 전송 + 전처리 시간 |
 
-각 지표는 최근 200건 기준 **P50 (중앙값)** 과 **P95**를 계산합니다.
+최근 200건 기준 **P50 (중앙값)** 과 **P95**를 계산합니다.
 
-### 3. Frame Drop 감지
-
-```python
-# store.py — add() 호출 시마다
-if last_frame_id >= 0 and new_frame_id > last_frame_id + 1:
-    drop_count += new_frame_id - last_frame_id - 1
-```
-
-- `frame_id`는 순차 증가한다고 가정 (C1이 부여)
-- 예: frame 2 → frame 5 도착 시 → **3건 drop** (frame 3, 4 누락)
-- 서버 로그에 `WARNING: frame drop detected: 2 frames missing (frame 2 → 5)` 출력
-- 대시보드에 누적 drop 수 실시간 표시 (0이면 녹색, 1+ 이면 빨간색)
-
-### 4. FPS 계산
+### 3. FPS 계산
 
 ```python
 # store.py — get_stats()
@@ -121,7 +100,7 @@ fps = len(recent) / 5.0
 
 `_fps_timestamps` 링 버퍼(최대 60건)에 각 레코드의 처리 시각을 저장하고, 최근 5초 윈도우의 처리량으로 FPS를 산출합니다.
 
-### 5. BBox Overlay 렌더링
+### 4. BBox Overlay 렌더링
 
 프론트엔드 `index.html`에서 HTML Canvas로 구현:
 
@@ -132,7 +111,7 @@ fps = len(recent) / 5.0
 - 오래된 bbox는 투명도 점진 감소 (fade-out)
 - 카메라 이미지가 있으면 좌표를 이미지 비율에 맞게 스케일링
 
-### 6. 인메모리 저장소
+### 5. 인메모리 저장소
 
 `InspectionStore` — SQLite 없이 메모리에서 최근 N건만 유지하는 경량 구조.
 
@@ -140,7 +119,6 @@ fps = len(recent) / 5.0
 |------|-----------|------|
 | `_records` | 500건 | 검사 이력 (deque, FIFO) |
 | `_latency_buf` | 200건 | E2E latency percentile 계산 |
-| `_inference_latency_buf` | 200건 | Inference latency percentile 계산 |
 | `_fps_timestamps` | 60건 | FPS 산출용 타임스탬프 |
 
 컨테이너 재시작 시 데이터는 초기화됩니다 (stateless).
@@ -200,7 +178,7 @@ C3 Inference에서 detection 결과를 수신합니다.
 | `schema_version` | string | O | 스키마 버전 (기본 `"1.0.0"`) |
 | `trace_id` | string | O | 파이프라인 추적 ID (C1에서 발급) |
 | `session_id` | string | O | 세션 ID |
-| `frame_id` | int | O | 프레임 번호 (순차 증가, frame drop 감지에 사용) |
+| `frame_id` | int | O | 프레임 번호 (순차 증가) |
 | `captured_at_ms` | int | O | C1 캡처 시각 (Unix ms) — E2E latency 계산 기준 |
 | `inference_container_id` | string | O | C3 replica 식별자 (예: `c3-inference-1`) |
 | `inference_started_at_ms` | int | O | C3 추론 시작 시각 (Unix ms) |
@@ -225,13 +203,12 @@ C3 Inference에서 detection 결과를 수신합니다.
 
 **처리 흐름:**
 1. E2E latency 계산: `현재시각(ms) - captured_at_ms`
-2. Frame drop 감지: 이전 `frame_id`와 갭 확인
-3. 각 detection마다:
+2. 각 detection마다:
    - bbox에서 area, perimeter 계산
    - circularity 산출 → pass/fail 판정
    - `InspectionStore`에 기록
    - WebSocket으로 `inspection_result` 이벤트 브로드캐스트
-4. 전체 통계 재계산 → WebSocket으로 `stats` 이벤트 브로드캐스트
+3. 전체 통계 재계산 → WebSocket으로 `stats` 이벤트 브로드캐스트
 
 ---
 
@@ -249,13 +226,7 @@ C3 Inference에서 detection 결과를 수신합니다.
   "defect_rate": 5.3,
   "fps": 12.4,
   "latency_p50_ms": 85.0,
-  "latency_p95_ms": 142.0,
-  "inference_p50_ms": 50.0,
-  "inference_p95_ms": 78.0,
-  "network_p50_ms": 35.0,
-  "network_p95_ms": 64.0,
-  "frame_drop_count": 2,
-  "last_frame_id": 152
+  "latency_p95_ms": 142.0
 }
 ```
 
@@ -268,12 +239,6 @@ C3 Inference에서 detection 결과를 수신합니다.
 | `fps` | float | 최근 5초 기준 처리 FPS |
 | `latency_p50_ms` | float | E2E latency 중앙값 (ms) |
 | `latency_p95_ms` | float | E2E latency P95 (ms) |
-| `inference_p50_ms` | float | C3 inference latency 중앙값 (ms) |
-| `inference_p95_ms` | float | C3 inference latency P95 (ms) |
-| `network_p50_ms` | float | 네트워크 latency 중앙값 (ms) |
-| `network_p95_ms` | float | 네트워크 latency P95 (ms) |
-| `frame_drop_count` | int | 누적 frame drop 수 |
-| `last_frame_id` | int | 마지막 처리된 frame_id |
 
 ---
 
@@ -492,8 +457,8 @@ docker compose --profile scale-out up --build
 
 | 영역 | 표시 항목 |
 |------|-----------|
-| **상단 통계 카드 (5개)** | 총 검사, 양품, 불량, 불량률, Frame Drop |
-| **성능 카드 (4개)** | 처리 FPS, E2E P50/P95, Inference P50/P95, Network P50/P95 |
+| **상단 통계 카드 (4개)** | 총 검사, 양품, 불량, 불량률 |
+| **성능 카드 (3개)** | 처리 FPS, E2E Latency P50, E2E Latency P95 |
 | **카메라 피드** | 원본 이미지 + canvas bbox overlay (pass=녹색, fail=빨간색) |
 | **검사 결과 피드** | 최근 60건 실시간 스크롤 목록 (아이템 ID, 원형도, latency) |
 | **양품률 도넛 차트** | SVG 기반 pass/fail 비율 시각화 |
@@ -561,36 +526,6 @@ curl -X POST http://localhost:8003/results \
   }'
 ```
 
-### Frame Drop 테스트 (frame 3~4 건너뛰기)
-
-```bash
-curl -X POST http://localhost:8003/results \
-  -H "Content-Type: application/json" \
-  -d '{
-    "schema_version": "1.0.0",
-    "trace_id": "test-trace-003",
-    "session_id": "test-session",
-    "frame_id": 5,
-    "captured_at_ms": 1730000002000,
-    "inference_container_id": "c3-inference-1",
-    "inference_started_at_ms": 1730000002050,
-    "inference_finished_at_ms": 1730000002110,
-    "inference_latency_ms": 60.0,
-    "detections": [
-      {
-        "object_id": "snack-003",
-        "bbox": [150, 150, 280, 280],
-        "status": "normal",
-        "defect_type": null,
-        "defect_score": 0.01,
-        "mask": null
-      }
-    ]
-  }'
-```
-
-> frame_id를 2 → 5로 보내면 서버 로그에 `WARNING: frame drop detected: 2 frames missing (frame 2 → 5)` 출력, 대시보드 Frame Drop 카드에 2 표시.
-
 > **Windows PowerShell**에서는 `curl` 대신 아래처럼 사용:
 > ```powershell
 > Invoke-RestMethod -Uri http://localhost:8003/results -Method Post -ContentType "application/json" -Body '{ ... }'
@@ -641,6 +576,5 @@ uvicorn src.main:app --host 0.0.0.0 --port 8003 --reload
 | curl 후 대시보드에 안 뜸 | 브라우저 탭이 WS 연결 전 | 브라우저를 먼저 열고 WS 연결(연결됨) 확인 후 curl |
 | `docker compose up` 에러 | Docker Desktop 미실행 | Docker Desktop 실행 후 재시도 |
 | port 8003 already in use | 다른 프로세스가 포트 사용 중 | `.env`에서 `C4_PORT=8004` 등으로 변경 |
-| Frame Drop 카드가 빨간색 | 프레임이 순서 없이 도착하거나 누락 | C1~C3 파이프라인 상태 확인, 네트워크 지연 점검 |
 | CSV 다운로드가 빈 파일 | 아직 detection 결과가 없음 | curl로 테스트 데이터를 먼저 전송 |
 | bbox overlay가 안 보임 | 카메라 이미지 없이 좌표만 수신 | Open Issue #1 — 프레임 수신 경로 구현 후 표시 |
