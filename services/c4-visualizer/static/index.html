@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>C4 Visualizer</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #242836;
+  --border: #2e3345;
+  --text: #e8e6e1;
+  --text2: #9a98a0;
+  --accent: #6c5ce7;
+  --pass: #00b894;
+  --fail: #e17055;
+  --info: #74b9ff;
+  --radius: 12px;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; }
+
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 24px; border-bottom: 1px solid var(--border);
+}
+header h1 { font-size: 17px; font-weight: 600; }
+header h1 span { color: var(--accent); }
+.header-right { display: flex; align-items: center; gap: 12px; }
+.nav-link {
+  font-size: 13px; color: var(--text2); text-decoration: none;
+  padding: 5px 12px; border-radius: 6px; transition: all .15s;
+}
+.nav-link:hover { color: var(--text); background: var(--surface2); }
+.conn-badge {
+  font-size: 11px; padding: 4px 10px; border-radius: 20px;
+  background: var(--surface2); color: var(--text2);
+}
+.conn-badge.on { background: rgba(0,184,148,.15); color: var(--pass); }
+
+.layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto auto auto 1fr;
+  gap: 14px; padding: 18px 24px;
+  max-width: 1400px; margin: 0 auto;
+}
+
+.stats-row {
+  grid-column: 1 / -1;
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+}
+.stat-card {
+  background: var(--surface); border-radius: var(--radius);
+  padding: 14px 18px; text-align: center;
+}
+.stat-card .label { font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 4px; }
+.stat-card .value { font-size: 26px; font-weight: 700; }
+.stat-card .value.pass { color: var(--pass); }
+.stat-card .value.fail { color: var(--fail); }
+.stat-card .value.info { color: var(--info); }
+
+.perf-row {
+  grid-column: 1 / -1;
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px;
+}
+.perf-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px 24px;
+}
+.perf-heading, .perf-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.perf-card .label { font-size: 13px; font-weight: 600; color: var(--text); }
+.perf-tag { font-size: 10px; font-weight: 600; color: var(--text2); background: var(--surface2); padding: 4px 8px; border-radius: 5px; }
+.perf-reading { display: flex; align-items: baseline; gap: 8px; margin: 12px 0; }
+.perf-card .value { font-size: 34px; line-height: 1.15; font-weight: 650; letter-spacing: -1px; font-variant-numeric: tabular-nums; color: var(--info); }
+.perf-card .value.empty { color: var(--text2); }
+.perf-card .value.clear { color: var(--pass); }
+.perf-card .value.warning { color: var(--fail); }
+.perf-card .unit, .perf-footer { font-size: 11px; color: var(--text2); }
+.perf-footer { min-height: 16px; }
+@media (max-width: 560px) {
+  .perf-row { grid-template-columns: 1fr; }
+  .perf-card { padding: 18px 20px; }
+}
+
+.camera-panel {
+  background: var(--surface); border-radius: var(--radius);
+  overflow: hidden; display: flex; flex-direction: column;
+}
+.panel-hdr {
+  padding: 12px 18px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 13px; font-weight: 500;
+}
+.camera-feed {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  background: #000; min-height: 340px; position: relative;
+}
+.camera-feed img { position: absolute; width: 100%; height: 100%; object-fit: contain; }
+.cam-placeholder { color: var(--text2); text-align: center; font-size: 13px; }
+.cam-placeholder .icon { font-size: 40px; margin-bottom: 10px; opacity: .3; }
+.det-overlay {
+  position: absolute; top: 10px; right: 10px;
+  padding: 6px 14px; border-radius: 8px; font-size: 13px; font-weight: 600;
+  transition: opacity .3s;
+}
+.det-overlay.pass { background: rgba(0,184,148,.2); color: var(--pass); }
+.det-overlay.fail { background: rgba(225,112,85,.2); color: var(--fail); }
+
+.bbox-canvas {
+  position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+  pointer-events: none; z-index: 1;
+}
+
+.feed-panel {
+  background: var(--surface); border-radius: var(--radius);
+  display: flex; flex-direction: column; max-height: 490px;
+}
+.feed-list { flex: 1; overflow-y: auto; padding: 6px; }
+.feed-item {
+  display: grid; grid-template-columns: 36px 1fr auto;
+  align-items: center; gap: 10px;
+  padding: 8px 10px; border-radius: 8px; transition: background .15s;
+}
+.feed-item:hover { background: var(--surface2); }
+.feed-dot {
+  width: 36px; height: 36px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center; font-size: 16px;
+}
+.feed-dot.pass { background: rgba(0,184,148,.12); }
+.feed-dot.fail { background: rgba(225,112,85,.12); }
+.feed-info .id { font-size: 13px; font-weight: 500; }
+.feed-info .detail { font-size: 11px; color: var(--text2); margin-top: 1px; }
+.feed-badge { font-size: 11px; padding: 3px 8px; border-radius: 5px; font-weight: 600; }
+.fb-pass { background: rgba(0,184,148,.12); color: var(--pass); }
+.fb-unknown, .feed-dot.unknown { background: rgba(150,160,180,.12); color: var(--text2); }
+.fb-fail { background: rgba(225,112,85,.12); color: var(--fail); }
+
+.chart-row {
+  grid-column: 1 / -1;
+  display: grid; grid-template-columns: 1fr 2fr; gap: 14px;
+}
+.chart-card {
+  background: var(--surface); border-radius: var(--radius); padding: 18px;
+}
+.chart-card .panel-hdr { padding: 0 0 12px; border: none; }
+
+.donut-wrap { width: 130px; height: 130px; margin: 0 auto; position: relative; }
+.donut-wrap svg { width: 100%; height: 100%; }
+.donut-center {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  text-align: center;
+}
+.donut-center .pct { font-size: 24px; font-weight: 700; }
+.donut-center .lbl { font-size: 11px; color: var(--text2); }
+
+.circ-chart { display: flex; align-items: flex-end; gap: 3px; height: 100px; }
+.circ-bar { flex: 1; border-radius: 3px 3px 0 0; min-height: 2px; transition: height .3s; }
+.circ-labels { display: flex; justify-content: space-between; font-size: 10px; color: var(--text2); margin-top: 4px; }
+.circ-threshold { position: relative; height: 100px; margin-bottom: -100px; pointer-events: none; }
+.circ-threshold .line {
+  position: absolute; left: 0; right: 0;
+  border-top: 1px dashed var(--fail); opacity: .5;
+}
+.circ-threshold .tag {
+  position: absolute; right: 0; font-size: 10px; color: var(--fail);
+  transform: translateY(-100%); opacity: .7;
+}
+
+.feed-list::-webkit-scrollbar { width: 4px; }
+.feed-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>C4 <span>Visualizer</span> — 크랙 검사</h1>
+  <div class="header-right">
+    <a href="/api/export/csv" class="nav-link" download>CSV 내보내기</a>
+    <a href="/viewer" class="nav-link">불량 뷰어</a>
+    <div class="conn-badge" id="connBadge">연결 끊김</div>
+  </div>
+</header>
+
+<div class="layout">
+
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="label">총 검사</div>
+      <div class="value" id="sTotal">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">양품</div>
+      <div class="value pass" id="sPass">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">불량</div>
+      <div class="value fail" id="sFail">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">불량률</div>
+      <div class="value" id="sRate">0%</div>
+    </div>
+  </div>
+
+  <div class="perf-row">
+    <div class="perf-card">
+      <div class="perf-heading"><span class="label">Frame Drop</span><span class="perf-tag">C2</span></div>
+      <div class="perf-reading"><span class="value empty" id="pDrop">—</span><span class="unit">frames</span></div>
+      <div class="perf-footer"><span>C2 시작 이후 누적</span><span id="pDropStatus">수신 대기</span></div>
+    </div>
+    <div class="perf-card" title="캡처부터 C4 결과 수신까지 · 최근 200개 프레임 · 호스트 간 시계 동기화 필요">
+      <div class="perf-heading"><span class="label">Latency</span><span class="perf-tag">E2E</span></div>
+      <div class="perf-reading"><span class="value empty" id="pE2e">—</span><span class="unit">ms</span></div>
+      <div class="perf-footer"><span id="pLatencyLabel">수신 · P50</span><span id="pLatencyTail">수신 대기</span></div>
+    </div>
+  </div>
+
+  <div class="camera-panel">
+    <div class="panel-hdr">
+      <span>카메라 피드</span>
+      <span id="camStatus" style="font-size:11px; color:var(--text2);">대기</span>
+    </div>
+    <div class="camera-feed" id="camFeed">
+      <canvas class="bbox-canvas" id="bboxCanvas"></canvas>
+      <div class="cam-placeholder" id="camPlaceholder">
+        <div class="icon">📷</div>
+        <div>C3 Inference 결과 대기 중</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="feed-panel">
+    <div class="panel-hdr">
+      <span>검사 결과</span>
+      <span style="font-size:11px; color:var(--text2);" id="feedCnt">0건</span>
+    </div>
+    <div class="feed-list" id="feedList">
+      <div style="text-align:center; padding:40px; color:var(--text2); font-size:13px;">대기 중…</div>
+    </div>
+  </div>
+
+  <div class="chart-row">
+    <div class="chart-card">
+      <div class="panel-hdr"><span>양품률</span></div>
+      <div class="donut-wrap">
+        <svg viewBox="0 0 130 130">
+          <circle cx="65" cy="65" r="52" fill="none" stroke="#2e3345" stroke-width="13"/>
+          <circle cx="65" cy="65" r="52" fill="none" stroke="#00b894" stroke-width="13"
+                  stroke-dasharray="327 327" stroke-dashoffset="0"
+                  id="dPass" transform="rotate(-90 65 65)" stroke-linecap="round"/>
+          <circle cx="65" cy="65" r="52" fill="none" stroke="#e17055" stroke-width="13"
+                  stroke-dasharray="327 327" stroke-dashoffset="327"
+                  id="dFail" transform="rotate(-90 65 65)" stroke-linecap="round"/>
+        </svg>
+        <div class="donut-center">
+          <div class="pct" id="dPct">–</div>
+          <div class="lbl">양품률</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chart-card">
+      <div class="panel-hdr">
+        <span>불량 점수 분포</span>
+        <span style="font-size:11px; color:var(--text2);">C3 Defect Score</span>
+      </div>
+      <div style="position:relative;">
+        <div class="circ-threshold" id="threshLine"></div>
+        <div class="circ-chart" id="circChart"></div>
+        <div class="circ-labels"><span>0.0</span><span>0.5</span><span>1.0</span></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let ws;
+let items = [];
+const BINS = 20;
+let circHist = new Array(BINS).fill(0);
+let bboxOverlays = [];
+const pendingFrames = new Map();
+const MAX_PENDING_FRAMES = 30;
+let arrivalSequence = 0;
+let selectedSequence = -1;
+let displayGeneration = 0;
+let currentFrame = null;
+const displayLatencies = [];
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/dashboard`);
+  ws.onopen = () => { id('connBadge').textContent = '연결됨'; id('connBadge').classList.add('on'); };
+  ws.onclose = () => { id('connBadge').textContent = '연결 끊김'; id('connBadge').classList.remove('on'); setTimeout(connect, 2000); };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'stats') updateStats(msg.data);
+    else if (msg.type === 'inspection_result') addResult(msg.data);
+    else if (msg.type === 'camera_frame') updateCamera(msg.data);
+    else if (msg.type === 'frame_result') updateFrameResult(msg.data);
+  };
+}
+
+function statusView(status) {
+  return status === 'normal' ? {css:'pass', label:'정상', icon:'✅', rgb:[0,184,148]} :
+    status === 'defect' ? {css:'fail', label:'불량', icon:'❌', rgb:[225,112,85]} :
+    {css:'unknown', label:'판정 보류', icon:'◌', rgb:[150,160,180]};
+}
+
+function id(x) { return document.getElementById(x); }
+
+function updateStats(s) {
+  id('sTotal').textContent = s.total.toLocaleString();
+  id('sPass').textContent = s.pass_count.toLocaleString();
+  id('sFail').textContent = s.fail_count.toLocaleString();
+  const r = s.defect_rate;
+  const el = id('sRate');
+  el.textContent = r + '%';
+  el.className = 'value ' + (r <= 3 ? 'pass' : 'fail');
+
+  showLatency(s.latency?.e2e);
+  id('pE2e').title = Object.entries(s.latency || {}).filter(([name]) =>
+    ['capture_to_preprocess','preprocess','c2_to_c3','c3_queue','c3_service','c3_total','c3_c4'].includes(name))
+    .map(([name, sample]) => `${name}: ${sample.p50_ms == null ? '—' : sample.p50_ms + ' ms'} (P50)`).join('\n');
+  const c2 = s.c2_metrics;
+  const drops = c2 ? c2.dropped_stale + c2.dropped_old : null;
+  id('pDrop').textContent = drops == null ? '—' : drops.toLocaleString();
+  id('pDrop').className = 'value ' + (drops == null ? 'empty' : drops === 0 ? 'clear' : 'warning');
+  id('pDropStatus').textContent = drops == null ? '수신 대기' : '실시간';
+  const window = s.drop_window;
+  id('pDrop').title = window ? `최근 ${window.seconds}초 · 전체 유실 추정 ${window.overall_loss_pct_estimate ?? '—'}% · C2 오류 ${window.c2_error_pct ?? '—'}% (처리 중 프레임 포함 가능)` : 'C2 누적 드롭 · 구간 비교 데이터 수집 중';
+
+  const passRate = s.total > 0 ? (s.pass_count / s.total) : 1;
+  const C = 327;
+  id('dPass').setAttribute('stroke-dasharray', `${passRate * C} ${C}`);
+  id('dFail').setAttribute('stroke-dasharray', `${(s.total > 0 ? s.fail_count / s.total : 0) * C} ${C}`);
+  id('dFail').setAttribute('stroke-dashoffset', `${-passRate * C}`);
+  id('dPct').textContent = s.total > 0 ? Math.round(passRate * 100) + '%' : '—';
+  id('dPct').title = `판정 보류 ${s.unknown_count || 0}건 (정상/불량에 포함하지 않음)`;
+}
+
+function showLatency(receivedSample) {
+  const values = [...displayLatencies].sort((a,b) => a-b);
+  const sample = values.length ? {p50_ms:values[Math.ceil(values.length*.5)-1], p95_ms:values[Math.ceil(values.length*.95)-1]} : receivedSample;
+  const available = sample?.p50_ms != null;
+  id('pE2e').textContent = available ? sample.p50_ms.toLocaleString() : '—';
+  id('pE2e').className = 'value' + (available ? '' : ' empty');
+  id('pLatencyLabel').textContent = values.length ? '표시 · P50' : '수신 · P50';
+  id('pLatencyTail').textContent = sample?.p95_ms != null ? `P95  ${sample.p95_ms.toLocaleString()} ms` : '수신 대기';
+}
+
+function addResult(d) {
+  items.unshift(d);
+  if (items.length > 100) items.pop();
+  id('feedCnt').textContent = items.length + '건';
+  renderFeed();
+
+  const bin = Math.min(BINS - 1, Math.floor((d.defect_score || 0) * BINS));
+  circHist[bin]++;
+  renderCircChart();
+
+
+}
+
+function renderFeed() {
+  id('feedList').innerHTML = items.slice(0, 60).map(d => {
+    const view = statusView(d.status);
+    return `<div class="feed-item">
+      <div class="feed-dot ${view.css}">${view.icon}</div>
+      <div class="feed-info">
+        <div class="id">${d.item_id}</div>
+        <div class="detail">불량 점수 ${(d.defect_score || 0).toFixed(3)} · ${d.defect_type || '—'}</div>
+      </div>
+      <div class="feed-badge fb-${view.css}">${view.label}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderCircChart() {
+  const max = Math.max(1, ...circHist);
+
+  const bars = circHist.map((v, i) => {
+    const h = Math.max(2, (v / max) * 100);
+    const color = 'var(--info)';
+    return `<div class="circ-bar" style="height:${h}px; background:${color};" title="${(i/BINS).toFixed(2)}~${((i+1)/BINS).toFixed(2)}: ${v}건"></div>`;
+  }).join('');
+  id('circChart').innerHTML = bars;
+
+
+}
+
+function drawBboxOverlays() {
+  const canvas = id('bboxCanvas');
+  const feed = id('camFeed');
+  const rect = feed.getBoundingClientRect();
+  canvas.width = rect.width;
+  canvas.height = rect.height;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!currentFrame || bboxOverlays.length === 0) return;
+
+  const scale = Math.min(canvas.width / currentFrame.width, canvas.height / currentFrame.height);
+  const scaleX = scale, scaleY = scale;
+  const offX = (canvas.width - currentFrame.width * scale) / 2;
+  const offY = (canvas.height - currentFrame.height * scale) / 2;
+
+  bboxOverlays.forEach(b => {
+    const alpha = 1;
+    const color = statusView(b.status).rgb.join(',');
+    if (b.maskCanvas) {
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(b.maskCanvas, offX, offY, currentFrame.width * scale, currentFrame.height * scale);
+    }
+    const x1 = b.bbox[0] * scaleX + offX;
+    const y1 = b.bbox[1] * scaleY + offY;
+    const x2 = b.bbox[2] * scaleX + offX;
+    const y2 = b.bbox[3] * scaleY + offY;
+    const w = x2 - x1;
+    const h = y2 - y1;
+
+    ctx.strokeStyle = `rgba(${color},${alpha})`;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x1, y1, w, h);
+
+    ctx.fillStyle = `rgba(${color},${alpha * 0.15})`;
+    if (!b.maskCanvas) ctx.fillRect(x1, y1, w, h);
+
+    const label = `${b.item_id} ${statusView(b.status).label}`;
+    ctx.font = '11px Segoe UI, system-ui, sans-serif';
+    const tm = ctx.measureText(label);
+    ctx.fillStyle = `rgba(${color},${alpha * 0.85})`;
+    ctx.fillRect(x1, y1 - 16, tm.width + 8, 16);
+    ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+    ctx.fillText(label, x1 + 4, y1 - 4);
+  });
+}
+
+// C3 encodes alternating background/foreground runs in row-major order.
+function decodeMask(mask, width, height, status) {
+  if (!mask || mask.encoding !== 'rle' || mask.width !== width || mask.height !== height) return null;
+  const counts = mask.data?.counts;
+  if (mask.data?.order !== 'row-major' || !Array.isArray(counts)) return null;
+  const pixels = width * height;
+  if (!Number.isSafeInteger(pixels) || pixels <= 0 || pixels > 16777216) return null;
+  let total = 0;
+  for (const count of counts) {
+    if (!Number.isSafeInteger(count) || count < 0 || count > pixels - total) return null;
+    total += count;
+  }
+  if (total !== pixels) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  const rgba = ctx.createImageData(width, height);
+  const color = statusView(status).rgb;
+  let offset = 0;
+  counts.forEach((count, run) => {
+    const end = offset + count;
+    if (run % 2 === 1) {
+      for (let pixel = offset; pixel < end; pixel++) {
+        const i = pixel * 4;
+        rgba.data[i] = color[0];
+        rgba.data[i + 1] = color[1];
+        rgba.data[i + 2] = color[2];
+        rgba.data[i + 3] = 96;
+      }
+    }
+    offset = end;
+  });
+  ctx.putImageData(rgba, 0, 0);
+  return canvas;
+}
+
+function frameEntry(d) {
+  if (!d.trace_id || !d.session_id || !Number.isInteger(d.frame_id)) return null;
+  const key = JSON.stringify([d.session_id, d.trace_id, d.frame_id]);
+  if (!pendingFrames.has(key)) pendingFrames.set(key, {});
+  while (pendingFrames.size > MAX_PENDING_FRAMES) pendingFrames.delete(pendingFrames.keys().next().value);
+  return pendingFrames.get(key);
+}
+
+function presentFrame(entry) {
+  if (!entry.image) return;
+  const matched = Array.isArray(entry.detections);
+  if (matched && entry.sequence < selectedSequence) return;
+  if (!matched && (currentFrame || selectedSequence >= 0)) return;
+  if (matched) selectedSequence = entry.sequence;
+  const generation = ++displayGeneration;
+  const img = new Image();
+  img.onload = () => {
+    if (generation !== displayGeneration) return;
+    const d = entry.image;
+    // Reject a broken coordinate contract instead of stretching a mask onto it.
+    if (img.naturalWidth !== d.width || img.naturalHeight !== d.height) return;
+    const feed = id('camFeed');
+    const previous = feed.querySelector('img');
+    if (previous) previous.remove();
+    feed.appendChild(img);
+    id('camPlaceholder').style.display = 'none';
+    currentFrame = d;
+    bboxOverlays = (entry.detections || []).map(b => ({
+      ...b, maskCanvas: decodeMask(b.mask, d.width, d.height, b.status),
+    }));
+    drawBboxOverlays();
+    const displayedLatency = Date.now() - entry.captured_at_ms;
+    if (matched && entry.captured_at_ms > 0 && displayedLatency >= 0) {
+      displayLatencies.push(displayedLatency);
+      if (displayLatencies.length > 200) displayLatencies.shift();
+      showLatency();
+    }
+    id('camStatus').textContent = matched ? `프레임 ${d.frame_id} · 결과 수신` : '이미지 수신 · 결과 대기';
+  };
+  const frame = entry.image.frame;
+  img.src = frame.startsWith('data:') ? frame : 'data:image/jpeg;base64,' + frame;
+}
+
+function updateCamera(d) {
+  if (!d.frame || !Number.isInteger(d.width) || !Number.isInteger(d.height) || d.width <= 0 || d.height <= 0) return;
+  const entry = frameEntry(d);
+  if (!entry) return;
+  entry.image = d;
+  entry.sequence = ++arrivalSequence;
+  presentFrame(entry);
+}
+
+function updateFrameResult(d) {
+  const entry = frameEntry(d);
+  if (!entry) return;
+  entry.detections = d.detections;
+  entry.captured_at_ms = d.captured_at_ms;
+  if (!entry.image) id('camStatus').textContent = `결과 ${d.frame_id} 수신 · 이미지 대기/누락 (이전 화면 유지)`;
+  presentFrame(entry);
+}
+
+new ResizeObserver(drawBboxOverlays).observe(id('camFeed'));
+
+async function loadInitial() {
+  try {
+    const [sr, ir] = await Promise.all([fetch('/api/stats'), fetch('/api/inspections?limit=100')]);
+    const stats = await sr.json();
+    const list = await ir.json();
+    updateStats(stats);
+    items = list;
+    id('feedCnt').textContent = list.length + '건';
+    renderFeed();
+    circHist = new Array(BINS).fill(0);
+    list.forEach(d => {
+      const bin = Math.min(BINS - 1, Math.floor((d.defect_score || 0) * BINS));
+      circHist[bin]++;
+    });
+    renderCircChart();
+  } catch (e) {}
+}
+
+renderCircChart();
+loadInitial();
+connect();
+</script>
+</body>
+</html>
