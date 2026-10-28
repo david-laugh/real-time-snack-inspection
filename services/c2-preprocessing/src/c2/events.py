@@ -2,6 +2,7 @@
 
 이벤트
   forwarded      전처리 후 /infer 전달 성공
+  skipped_empty  prompts가 0개라 /infer로 보내지 않음 (C2_SKIP_EMPTY=true). C4 전송은 그대로 한다
   dropped_stale  처리 전에 같은 세션의 새 프레임이 와서 버림 (세션별 최신 1장만 보관)
   dropped_old    captured_at_ms 기준 C2_MAX_FRAME_AGE_MS보다 오래돼서 버림
   error          입력 오류(JSON/스키마/디코딩) 또는 /infer 실패(연결 실패, 4xx/5xx)
@@ -18,7 +19,7 @@ from typing import Optional
 
 from .pipeline import now_ms
 
-EVENTS = ("forwarded", "dropped_stale", "dropped_old", "error", "timeout")
+EVENTS = ("forwarded", "skipped_empty", "dropped_stale", "dropped_old", "error", "timeout")
 
 
 class EventLog:

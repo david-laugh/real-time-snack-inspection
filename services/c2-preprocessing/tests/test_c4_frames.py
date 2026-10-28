@@ -115,6 +115,33 @@ def test_c4_body_matches_agreed_format_and_c3_request():
     assert [len(c4_frames[f"trace-{i:06d}"]["prompts"]) for i in range(3)] == [15, 15, 0]   # 0개도 보냄
 
 
+@pytest.mark.parametrize("skip_empty", [True, False])
+def test_empty_frame_goes_to_c4_only(skip_empty):
+    """prompts 0개 프레임: C2_SKIP_EMPTY=true면 C4로만, false면 C3와 C4 모두로 보낸다."""
+    fake_c4 = create_fake_c4()
+
+    async def scenario(client):
+        for e in frames():
+            r = await client.post("/preprocess", json=e)
+            assert r.status_code == 200, r.text
+        return r.json()                                  # 마지막(빈) 프레임의 응답
+
+    last, stats, c3 = asyncio.run(run({"skip_empty": skip_empty}, scenario, c4_app=fake_c4))
+    empty = fake_c4.state.frames["trace-000002"]
+    assert empty["prompts"] == [] and check_frame(empty) == []
+    assert stats["c4_sent"] == 3
+    sent_to_c3 = [b["trace_id"] for b in c3.bodies]
+    if skip_empty:
+        assert sent_to_c3 == ["trace-000000", "trace-000001"]
+        assert last["infer_status"] is None and last["num_prompts"] == 0
+        assert stats["events"]["skipped_empty"] == 1 and stats["events"]["forwarded"] == 2
+    else:
+        assert sent_to_c3 == ["trace-000000", "trace-000001", "trace-000002"]
+        assert last["infer_status"] == 200
+        assert stats["events"]["skipped_empty"] == 0 and stats["events"]["forwarded"] == 3
+    assert stats["skip_empty"] is skip_empty
+
+
 def test_disabled_when_url_empty():
     calls = []
 
@@ -127,7 +154,7 @@ def test_disabled_when_url_empty():
             assert (await client.post("/preprocess", json=e)).status_code == 200
 
     _, stats, c3 = asyncio.run(run({"c4_frame_url": ""}, scenario, c4_transport=httpx.MockTransport(c4_handler)))
-    assert calls == [] and len(c3.bodies) == 3
+    assert calls == [] and len(c3.bodies) == 2          # prompts 0개 프레임은 /infer로 가지 않음
     assert stats["c4_enabled"] is False and stats["c4_sent"] == 0
 
 
