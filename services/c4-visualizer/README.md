@@ -37,7 +37,7 @@ C3 Inference에서 보내온 detection 결과를 받아 WebSocket으로 브라�
 
 ## Open Issues (미해결)
 
-1. **C2 전송 연동 필요** — C4의 `POST /api/camera/frame` 수신·중계는 구현 완료. C2는 C3에 보내는 것과 같은 리사이즈 이미지와 prompts를 같은 시점에 C4로 비동기 전송합니다. C3 요청 경로에서 C4 응답을 기다리지 않습니다. C2 송신 구현은 C2 담당 범위입니다.
+1. **C2 전송 연동 필요** — C4의 `POST /api/camera/frame` 수신·중계는 구현 완료. C2는 C3에 보내는 것과 같은 리사이즈 이미지와 prompts를 같은 시점에 C4로 비동기 전송합니다. C3 요청 경로에서 C4 응답을 기다리지 않습니다. 최신 main의 PR #8/#9에 C2 송신 구현이 반영돼 있습니다.
 2. **결과 지연/역순 도착** — 브라우저는 `(session_id, trace_id, frame_id)`로 이미지와 결과를 짝짓고, 최대 30개 프레임을 보관합니다. 짝이 맞는 결과를 표시한 뒤에는 다음 짝이 완성될 때까지 현재 화면을 유지합니다. 이미 선택한 이미지보다 먼저 수신된 이미지의 늦은 결과는 표시하지 않습니다. 버퍼에서 제거된 프레임은 표시하지 못할 수 있습니다.
 
 ---
@@ -81,7 +81,9 @@ Circularity = 4π × area / perimeter²
 | C3 추론 P50/P95 | `inference_latency_ms` |
 | C3 → C4 P50/P95 | C4 결과 수신 시각 − `inference_finished_at_ms` |
 | C3 이전 전체 P50/P95 | `inference_started_at_ms` − `captured_at_ms` (전송·대기·전처리 포함) |
-| C1 → C2 / C2 → C3 | **미수집**: 현행 C3 결과에 구간별 시각이 없어 분리 계산 불가 |
+| C1 → C2 (`c1_c2`) | C2 전처리 시작 − C1 게이트웨이 수신 (전송 및 C2 대기 포함) |
+| C2 전처리 (`preprocess`) | C2 전처리 종료 − 시작 |
+| C2 → C3 (`c2_c3`) | C3 추론 시작 − C2 전처리 종료 (LB 및 대기 포함) |
 | C2 Frame Drop | C2 `/stats`의 `events.dropped_stale + events.dropped_old` |
 | 화면용 이미지 전송 누락 | C2 `/stats`의 `c4_skipped + c4_error` (PR #8 적용 시 제공) |
 
@@ -91,7 +93,7 @@ C4는 별도 백그라운드 작업으로 C2 `/stats`를 조회합니다 (요청
 
 - `C4_C2_STATS_URL`: 기본 `http://c2-preprocessing:8001/stats`; 로컬 실행에서는 접근 가능한 C2 URL로 지정합니다. 빈 문자열이면 C2 조회를 끕니다.
 - 기존 C2 `/stats`도 지원합니다. PR #8 이전에는 C2 드롭을 제공하고 화면용 이미지 누락 카운터는 API에서 null로 반환합니다.
-- C1→C2 및 C2→C3 개별 지연을 수집하려면 담당 서비스와 송·수신 시각 전달 계약을 추가로 합의해야 합니다. 이번 작업은 C4만 수정합니다.
+- main PR #9의 C2 타임스탬프 3개와 C3 결과를 동일 세션/trace/frame 키로 매칭하여 구간 지연을 계산합니다. 도착 순서와 무관하며 이미지 메타데이터는 최대 500개, 결과 샘플은 200개를 보관합니다. 이미지가 누락되거나 구형 7필드 형식이면 해당 구간 값은 null입니다. UI는 Frame Drop/Latency 두 카드로 유지합니다.
 
 ### 3. BBox / RLE Mask Overlay 렌더링
 
@@ -357,6 +359,9 @@ C2 Preprocessing이 C3에 보내는 것과 동일한 리사이즈 프레임 데�
   "trace_id": "trace-abc-123",
   "session_id": "m-ab12cd",
   "frame_id": 297,
+  "gateway_received_at_ms": 1730000000010,
+  "preprocess_started_at_ms": 1730000000020,
+  "preprocess_finished_at_ms": 1730000000030,
   "width": 576,
   "height": 1024,
   "prompts": [
@@ -506,7 +511,7 @@ docker run -p 8003:8003 c4-visualizer
 docker compose up --build
 ```
 
-> C1~C3는 아직 placeholder(`sleep infinity`)이므로 C4만 실제로 동작합니다.
+> C1~C3도 구현돼 있습니다. 단, 현재 main에는 C3 결과를 C4 `/results`로 전달하는 송신 경로가 없어 전체 결과 연동은 담당 서비스의 추가 구현이 필요합니다.
 
 ### 방법 3: Scale-out 프로필 (C3 3대)
 
@@ -664,3 +669,63 @@ C4 Python 의존성이 설치된 환경에서 수신 핸들러/이벤트 테스�
 cd services/c4-visualizer
 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
+
+
+## 현재 main 통신 계약과 실행 설정 (PR #8/#9 반영)
+
+```text
+C1 --MQTT--> C2 --HTTP /infer--> Nginx --> C3
+             |                           |
+             +--HTTP /api/camera/frame--> C4
+                                         ^
+C3 결과는 현재 C2 HTTP 요청에 대한 응답으로만 반환됨
+C4 --HTTP GET /stats--> C2
+C4 --WebSocket /ws/dashboard--> Browser
+```
+
+**남은 연동 공백:** C3는 `/infer` 응답만 반환하고 C2는 상태 코드만 사용합니다. 어느 쪽도 C4 `/results`에 POST하지 않습니다. C4는 수신 API를 이미 제공하지만, 환경변수만으로 없는 송신 코드를 활성화할 수는 없습니다. C2가 응답 본문을 C4로 전달하거나 C3가 별도 POST하도록 담당자와 합의해야 합니다. 결과가 없으면 마스크와 E2E Latency는 대기 상태입니다. C4에서 이미지를 다시 C3로 보내 이중 추론하지 않습니다.
+
+### 설정 위치
+
+C4 설정 예시는 이 폴더의 `.env.example`에 있습니다. Docker Compose 실행 시 필요한 줄을 **프로젝트 루트 `.env`**에 추가합니다. 기존 `.env`를 덮어쓰지 마세요. 루트 Compose의 `env_file`이 C4에도 값을 전달하므로 Compose 수정은 필요 없습니다.
+
+| 설정 | 기본값 | 의미 |
+|---|---|---|
+| `C4_PORT` | `8003` | Compose의 호스트 공개 포트. 컨테이너 내부는 8003 고정 |
+| `C4_C2_STATS_URL` | `http://c2-preprocessing:8001/stats` | C2 통계 조회 URL. 빈 문자열이면 끔 |
+| `C4_C2_STATS_TIMEOUT_S` | `1` | 조회 timeout (양의 초) |
+| `C4_C2_STATS_INTERVAL_S` | `2` | 조회 완료 후 대기 간격 (양의 초) |
+
+연동 상대의 **기존 설정** (C4 소스에서 설정하는 값이 아님):
+
+| 담당 | 설정 / 주소 | 확인 사항 |
+|---|---|---|
+| C2 | `C2_C4_FRAME_URL=http://c4-visualizer:8003/api/camera/frame` | main의 기본값. 이미지와 3개 시각을 포함한 10필드 전송 |
+| C2 | `C2_C4_TIMEOUT_S=1.0`, `C2_C4_MAX_INFLIGHT=2` | 실패/한도 초과 시 화면용 이미지만 누락될 수 있음 |
+| C3 | `C3_RETURN_MASK=true` | RLE 마스크를 결과에 포함 (기본 true) |
+| C1/C2 | `MQTT_HOST=mqtt-broker`, `MQTT_PORT=1883`, `MQTT_TOPIC_PREFIX=psf/v1` | C4는 MQTT를 사용하지 않음 |
+| 호스트 MQTT 도구 | `localhost:11883` | Compose 외부용 브로커 포트. 컨테이너 내부 1883과 구분 |
+
+C4는 구형 7필드 프레임도 수신합니다. 추가 필드는 `gateway_received_at_ms`, `preprocess_started_at_ms`, `preprocess_finished_at_ms`이며 Unix milliseconds입니다. C4→브라우저 중계에도 보존합니다.
+
+### 로컬 실행 / 컨테이너 실행
+
+- 동일 Compose 네트워크: 위 기본 URL 사용. `localhost`는 각 컨테이너 자신이므로 상대 서비스에 사용하지 않습니다.
+- C4만 로컬 Python으로 실행: `$env:C4_C2_STATS_URL='http://접근가능한-C2주소:포트/stats'` 설정 후 실행합니다. 루트 Compose는 C2 8001을 호스트에 공개하지 않으므로 `localhost:8001`로 자동 접근되지는 않습니다.
+- 별도 PC의 C2/C3에서 C4에 연결: C4 호스트의 접근 가능한 IP와 공개 포트로 수신 URL을 지정해야 합니다.
+- C4 단독 UI 확인: `$env:C4_C2_STATS_URL=''`로 조회를 끌 수 있습니다.
+
+```bash
+docker compose up -d --no-deps --build c4-visualizer
+```
+
+### 연결 진단
+
+`GET /api/connections`는 C2 통계 조회 활성/성공 여부, 마지막 이미지·결과 수신 시각, WebSocket 접속 수를 반환합니다. 미수신 시각은 null입니다. `/healthz`는 C4 자체 생존 확인용이므로 upstream 연결 성공을 뜻하지 않습니다.
+
+```bash
+curl http://localhost:8003/api/connections
+curl http://localhost:8003/api/stats
+```
+
+`camera.last_received_at_ms`만 갱신되고 `results.last_received_at_ms`가 null이면 이미지 경로는 연결됐지만 결과 전달 경로를 확인해야 합니다. 모든 호스트의 시계를 동기화해야 구간별 지연을 비교할 수 있습니다.

@@ -4,7 +4,6 @@ Port 8003 | POST /results (C3 → C4) | WS /ws/dashboard | GET / (UI)
 """
 
 import asyncio
-import os
 import time
 from contextlib import asynccontextmanager, suppress
 from urllib.request import urlopen
@@ -20,17 +19,17 @@ from fastapi.staticfiles import StaticFiles
 
 from src.models import CameraFrame, DetectionResult
 from src.metrics import PipelineMetrics
+from src.config import C2_STATS_URL, C2_STATS_TIMEOUT_S, C2_STATS_INTERVAL_S
 from src.store import InspectionStore, InspectionRecord
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("c4")
 
 metrics = PipelineMetrics()
-C2_STATS_URL = os.getenv("C4_C2_STATS_URL", "http://c2-preprocessing:8001/stats")
 
 
 def fetch_c2_stats():
-    with urlopen(C2_STATS_URL, timeout=1) as response:
+    with urlopen(C2_STATS_URL, timeout=C2_STATS_TIMEOUT_S) as response:
         return json.load(response)
 
 
@@ -46,7 +45,7 @@ async def poll_metrics():
             except Exception:
                 metrics.c2_available = False
         await broadcast({"type": "stats", "data": dashboard_stats()})
-        await asyncio.sleep(2)
+        await asyncio.sleep(C2_STATS_INTERVAL_S)
 
 
 @asynccontextmanager
@@ -152,7 +151,8 @@ async def receive_result(result: DetectionResult):
 @app.post("/api/camera/frame")
 async def receive_camera_frame(frame: CameraFrame):
     """C2 → C4: relay the same resized image and prompts sent to C3."""
-    data = frame.model_dump()
+    metrics.record_camera(frame)
+    data = frame.model_dump(exclude_none=True)
     data["frame"] = data.pop("image_b64")
     await broadcast({"type": "camera_frame", "data": data})
     return {"status": "ok"}
@@ -182,6 +182,19 @@ async def export_csv():
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=inspection-results.csv"},
     )
+
+
+@app.get("/api/connections")
+async def connections():
+    """Observed connectivity; absence of input is not proof that upstream is down."""
+    return {
+        "c2_stats": {"enabled": bool(C2_STATS_URL), "available": metrics.c2_available,
+                     "last_success_at_ms": metrics.c2_updated_at_ms},
+        "camera": {"last_received_at_ms": metrics.last_camera_at_ms},
+        "results": {"last_received_at_ms": metrics.last_result_at_ms},
+        "websocket_clients": len(ws_clients),
+        "mqtt_required": False,
+    }
 
 
 @app.get("/healthz")

@@ -12,6 +12,9 @@ class CameraFrame(BaseModel):
     frame_id: int
     width: int = Field(gt=0)
     height: int = Field(gt=0)
+    gateway_received_at_ms: int | None = Field(default=None, ge=0)
+    preprocess_started_at_ms: int | None = Field(default=None, ge=0)
+    preprocess_finished_at_ms: int | None = Field(default=None, ge=0)
     prompts: list[dict]
     image_b64: str = Field(min_length=1)
 

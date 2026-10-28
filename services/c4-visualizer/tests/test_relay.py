@@ -31,6 +31,22 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data, dict(trace_id='t', session_id='s', frame_id=1,
                                    width=3, height=2, prompts=[], frame='jpeg'))
 
+    async def test_main_ten_field_camera_contract(self):
+        frame = CameraFrame(trace_id='t', session_id='s', frame_id=1,
+            width=3, height=2, prompts=[], image_b64='jpeg',
+            gateway_received_at_ms=100, preprocess_started_at_ms=110,
+            preprocess_finished_at_ms=120)
+        with patch.object(main, 'broadcast', new_callable=AsyncMock) as send:
+            await main.receive_camera_frame(frame)
+        data = send.call_args.args[0]['data']
+        self.assertEqual(data['gateway_received_at_ms'], 100)
+        self.assertEqual(data['preprocess_started_at_ms'], 110)
+        self.assertEqual(data['preprocess_finished_at_ms'], 120)
+        connections = await main.connections()
+        self.assertIsNotNone(connections['camera']['last_received_at_ms'])
+        self.assertIsNone(connections['results']['last_received_at_ms'])
+        self.assertFalse(connections['mqtt_required'])
+
     async def test_result_preserves_mask_and_emits_empty_frames(self):
         mask = dict(encoding='rle', width=3, height=2,
                     data=dict(order='row-major', counts=[0, 2, 4]))

@@ -62,3 +62,30 @@ class MetricsTests(unittest.TestCase):
             m.record(result(i), 1120)
         self.assertEqual(len(m.samples), 200)
         self.assertEqual(len(m.seen), 5000)
+
+
+    def test_camera_timestamps_join_in_both_orders(self):
+        for camera_first in (True, False):
+            m = PipelineMetrics()
+            camera = SimpleNamespace(session_id='s', trace_id='t1', frame_id=1,
+                gateway_received_at_ms=1010, preprocess_started_at_ms=1020,
+                preprocess_finished_at_ms=1030)
+            if camera_first:
+                m.record_camera(camera)
+                m.record(result(), 1120)
+            else:
+                m.record(result(), 1120)
+                m.record_camera(camera)
+            latency = m.get_stats()['latency']
+            for name in ('c1_c2', 'preprocess', 'c2_c3'):
+                self.assertEqual(latency[name]['p50_ms'], 10)
+            m.record_camera(camera)
+            self.assertEqual(m.get_stats()['latency']['c1_c2']['samples'], 1)
+
+    def test_camera_timing_never_joins_other_session(self):
+        m = PipelineMetrics()
+        m.record(result(), 1120)
+        m.record_camera(SimpleNamespace(session_id='other', trace_id='t1', frame_id=1,
+            gateway_received_at_ms=1010, preprocess_started_at_ms=1020,
+            preprocess_finished_at_ms=1030))
+        self.assertIsNone(m.get_stats()['latency']['c1_c2']['p50_ms'])
