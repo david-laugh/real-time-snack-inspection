@@ -1,8 +1,7 @@
 # C1 Gateway dependencies
-fastapi==0.115.6
-uvicorn[standard]==0.32.1
-httpx==0.28.1
-qrcode[pil]==8.0
-pillow==11.0.0
-# loadgen 서브커맨드용 (컨테이너 실행에는 uvicorn[standard]에 포함됨)
-websockets==14.1
+fastapi>=0.115
+uvicorn[standard]>=0.32
+httpx>=0.28
+qrcode[pil]>=8.0
+pillow>=11.0
+websockets>=14.0
